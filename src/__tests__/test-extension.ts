@@ -5,6 +5,7 @@ import {
   isRateLimitError,
   isServerOverloadedError,
   retryAfterHeaderMs,
+  sanitiseSystemPrompt,
   streamWithLimitsRetry,
   waitForRateLimit,
 } from "../index.js";
@@ -55,6 +56,19 @@ async function collect(stream: AsyncIterable<AssistantMessageEvent>) {
   const events: AssistantMessageEvent[] = [];
   for await (const event of stream) events.push(event);
   return events;
+}
+
+section("prompt sanitisation");
+{
+  const raw = [
+    "You are pi, a coding agent.",
+    "Keep this useful instruction.",
+    "Internal docs mention @mariozechner/pi-coding-agent and should be removed.",
+  ].join("\n\n");
+  const sanitised = sanitiseSystemPrompt(raw);
+  ok("removes Pi identity sentence", !sanitised.includes("You are pi"));
+  ok("removes paragraphs with Pi internals", !sanitised.includes("@mariozechner/pi-coding-agent"));
+  ok("keeps unrelated instructions", sanitised.includes("Keep this useful instruction."));
 }
 
 section("retryable detection");

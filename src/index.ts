@@ -13,6 +13,18 @@ import {
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
+const CLAUDE_CODE_IDENTITY =
+  "You are Claude Code, Anthropic's official CLI for Claude.";
+
+const PI_REMOVAL_ANCHORS = [
+  "pi-coding-agent",
+  "@mariozechner/pi-coding-agent",
+  "badlogic/pi-mono",
+] as const;
+
+const PI_IDENTITY_SENTENCE_PATTERN =
+  /(?:^|\n)\s*You are pi\b[^.!?\n]*(?:[.!?](?=\s|$)|(?=\n|$))/gi;
+
 const DEFAULT_RATE_LIMIT_WAIT_MS = 30 * 60 * 1_000; // 30 minutes
 const DEFAULT_OVERLOADED_WAIT_MS = 5 * 60 * 1_000; // 5 minutes
 
@@ -33,6 +45,34 @@ let restoreFetch: (() => void) | undefined;
 let ambientStatusCleanup: (() => void) | undefined;
 let activeProviderRequests = 0;
 const wrappedApis = new Set<Api>();
+
+// ─── Anthropic subscription prompt sanitisation ──────────────────────────────
+
+export function sanitiseSystemPrompt(raw: string): string {
+  const paragraphs = raw.split(/\n\n+/);
+  const filtered = paragraphs.filter((p) =>
+    !PI_REMOVAL_ANCHORS.some((anchor) => p.includes(anchor)),
+  );
+
+  return filtered
+    .join("\n\n")
+    .replace(PI_IDENTITY_SENTENCE_PATTERN, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+/**
+ * Returns true if Anthropic OAuth is configured for this session, regardless
+ * of which model is currently active. This handles cases where a synthetic or
+ * temporary model (e.g. a subagent/resume provider) is active at
+ * before_agent_start time, even though the session will ultimately use an
+ * Anthropic subscription model.
+ */
+function isAnthropicOAuthSession(ctx: ExtensionContext): boolean {
+  return ctx.modelRegistry.isUsingOAuth(
+    { provider: "anthropic" } as Parameters<typeof ctx.modelRegistry.isUsingOAuth>[0],
+  );
+}
 
 // ─── Retryable error detection ────────────────────────────────────────────────
 
@@ -470,7 +510,7 @@ function registerWrappedApi(pi: ExtensionAPI, api: Api): void {
 // ─── Extension entry point ────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-  pi.on("before_agent_start", (_event, ctx) => {
+  pi.on("before_agent_start", (event, ctx) => {
     sharedCtx = ctx;
 
     // Some extensions may register providers after this extension loads. Wrap
@@ -479,5 +519,18 @@ export default function (pi: ExtensionAPI) {
       registerWrappedApi(pi, model.api);
     }
     if (ctx.model) registerWrappedApi(pi, ctx.model.api);
+
+    // Anthropic subscription/OAuth requests identify as Claude Code, not Pi.
+    // Check the session-wide Anthropic OAuth configuration rather than only the
+    // current model: resumed/subagent sessions can temporarily expose a
+    // synthetic active model during before_agent_start.
+    if (!isAnthropicOAuthSession(ctx)) return;
+
+    const sanitised = sanitiseSystemPrompt(event.systemPrompt);
+    return {
+      systemPrompt: sanitised
+        ? `${CLAUDE_CODE_IDENTITY}\n\n${sanitised}`
+        : CLAUDE_CODE_IDENTITY,
+    };
   });
 }
