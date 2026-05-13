@@ -1,0 +1,49 @@
+{
+  "name": "oira666_pi-limits-wait",
+  "version": "0.2.4",
+  "description": "Extension for PI that allows to automatically wait for limits to reset and retry the request",
+  "type": "module",
+  "license": "MIT",
+  "files": [
+    "src",
+    "!src/__tests__",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/gee666/pi-limits-wait.git"
+  },
+  "bugs": {
+    "url": "https://github.com/gee666/pi-limits-wait/issues"
+  },
+  "homepage": "https://github.com/gee666/pi-limits-wait#readme",
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "tsx src/__tests__/test-extension.ts",
+    "pack:check": "npm pack --dry-run",
+    "prepublishOnly": "npm run check && npm test && npm run pack:check"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "dependencies": {},
+  "peerDependencies": {
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@mariozechner/pi-ai": "^0.66.1",
+    "@mariozechner/pi-coding-agent": "^0.66.1",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  }
+}
