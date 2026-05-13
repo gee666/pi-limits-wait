@@ -201,11 +201,21 @@ export function waitForRetry(
     let unsubInput: (() => void) | undefined;
     try {
       unsubInput = ctx?.ui.onTerminalInput((data) => {
-        if (!done && (data === "\r" || data === "\n")) {
+        if (done) return undefined;
+
+        if (data === "\r" || data === "\n") {
           cleanup();
           resolve("skipped");
           return { consume: true };
         }
+
+        if (data === "\x1b") {
+          cleanup();
+          resolve("aborted");
+          return { consume: true };
+        }
+
+        return undefined;
       });
     } catch { /* UI unavailable */ }
 
