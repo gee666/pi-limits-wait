@@ -1,4 +1,5 @@
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { SettingsManager, type ExtensionAPI, type ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
 import {
   createAssistantMessageEventStream,
   getApiProviders,
@@ -27,9 +28,11 @@ const PI_IDENTITY_SENTENCE_PATTERN =
 
 const DEFAULT_RATE_LIMIT_WAIT_MS = 30 * 60 * 1_000; // 30 minutes
 const DEFAULT_OVERLOADED_WAIT_MS = 5 * 60 * 1_000; // 5 minutes
+const SETTINGS_KEY = "oira666_pi-subagents";
 
 /** Key used with ctx.ui.setStatus() for the countdown line. */
 const STATUS_KEY = "limits-wait";
+const MODELS_STATUS_KEY = "limits-wait-models";
 
 type RetryReason = "rate-limit" | "overloaded";
 
@@ -38,13 +41,39 @@ type RetryableError = {
   waitMs: number;
 };
 
+type ConfiguredModel = {
+  provider: string;
+  modelname: string;
+  reasoningEffort?: ThinkingLevel;
+};
+
+type FallbackModel = {
+  model: Model<Api>;
+  reasoningEffort?: ThinkingLevel;
+};
+
+type RateLimitMemory = {
+  reason: RetryReason;
+  limitedAt: number;
+  deadline: number;
+};
+
 // ─── Shared UI context ────────────────────────────────────────────────────────
 
 let sharedCtx: ExtensionContext | undefined;
+let extensionApi: ExtensionAPI | undefined;
 let restoreFetch: (() => void) | undefined;
 let ambientStatusCleanup: (() => void) | undefined;
+let modelStatusCleanup: (() => void) | undefined;
 let activeProviderRequests = 0;
 const wrappedApis = new Set<Api>();
+const builtinStreamSimpleByApi = new Map<Api, StreamSimpleFn>();
+let fallbackModels: FallbackModel[] = [];
+let primaryModel: Model<Api> | undefined;
+let primaryThinkingLevel: ThinkingLevel | undefined;
+let suppressNextModelSelect = false;
+let settingsSignature: string | undefined;
+const rateLimitMemory = new Map<string, RateLimitMemory>();
 
 // ─── Anthropic subscription prompt sanitisation ──────────────────────────────
 
@@ -72,6 +101,229 @@ function isAnthropicOAuthSession(ctx: ExtensionContext): boolean {
   return ctx.modelRegistry.isUsingOAuth(
     { provider: "anthropic" } as Parameters<typeof ctx.modelRegistry.isUsingOAuth>[0],
   );
+}
+
+// ─── Optional fallback model settings ────────────────────────────────────────
+
+function modelKey(model: Pick<Model<Api>, "provider" | "id">): string {
+  return `${model.provider}/${model.id}`;
+}
+
+function formatModel(model: Pick<Model<Api>, "provider" | "id">): string {
+  return `${model.provider}/${model.id}`;
+}
+
+function isThinkingLevel(value: unknown): value is ThinkingLevel {
+  return ["off", "minimal", "low", "medium", "high", "xhigh"].includes(String(value));
+}
+
+function parseConfiguredModels(raw: unknown): ConfiguredModel[] {
+  const source = raw && typeof raw === "object" && Array.isArray((raw as { try_models?: unknown }).try_models)
+    ? (raw as { try_models: unknown[] }).try_models
+    : [];
+
+  const models: ConfiguredModel[] = [];
+  for (const item of source) {
+    if (!item || typeof item !== "object") continue;
+    const record = item as Record<string, unknown>;
+    const provider = typeof record.provider === "string" ? record.provider.trim() : "";
+    const modelname =
+      typeof record.modelname === "string" ? record.modelname.trim()
+      : typeof record.modelName === "string" ? record.modelName.trim()
+      : typeof record.model === "string" ? record.model.trim()
+      : "";
+    const reasoning = record["reasoning effort"] ?? record.reasoningEffort ?? record.reasoning_effort;
+    if (!provider || !modelname) continue;
+    models.push({
+      provider,
+      modelname,
+      reasoningEffort: isThinkingLevel(reasoning) ? reasoning : undefined,
+    });
+  }
+  return models;
+}
+
+function loadFallbackSettings(ctx: ExtensionContext): void {
+  fallbackModels = [];
+
+  try {
+    const settingsManager = SettingsManager.create(ctx.cwd);
+    const globalSettings = settingsManager.getGlobalSettings() as Record<string, unknown>;
+    const projectSettings = settingsManager.getProjectSettings() as Record<string, unknown>;
+    const globalConfig = globalSettings[SETTINGS_KEY];
+    const projectConfig = projectSettings[SETTINGS_KEY];
+    const config = {
+      ...(globalConfig && typeof globalConfig === "object" && !Array.isArray(globalConfig) ? globalConfig : {}),
+      ...(projectConfig && typeof projectConfig === "object" && !Array.isArray(projectConfig) ? projectConfig : {}),
+    };
+    const content = JSON.stringify(config);
+    const shouldNotify = settingsSignature !== content;
+    settingsSignature = content;
+
+    const configured = parseConfiguredModels(config);
+    if (configured.length === 0) return;
+
+    const warnings: string[] = [];
+    const seen = new Set<string>();
+
+    for (const entry of configured) {
+      const model = ctx.modelRegistry.find(entry.provider, entry.modelname);
+      if (!model) {
+        warnings.push(`missing ${entry.provider}/${entry.modelname}`);
+        continue;
+      }
+      if (!ctx.modelRegistry.hasConfiguredAuth(model)) {
+        warnings.push(`no auth ${entry.provider}/${entry.modelname}`);
+        continue;
+      }
+      const key = modelKey(model);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      fallbackModels.push({ model, reasoningEffort: entry.reasoningEffort });
+    }
+
+    const lines = fallbackModels.map((entry, index) =>
+      `${index + 1}. ${formatModel(entry.model)}${entry.reasoningEffort ? ` (${entry.reasoningEffort})` : ""}`,
+    );
+    const message = lines.length > 0
+      ? `Loaded ${SETTINGS_KEY}.try_models:\n${lines.join("\n")}`
+      : `Loaded ${SETTINGS_KEY}.try_models, but no usable fallback models were found.`;
+    if (shouldNotify) {
+      ctx.ui.notify(warnings.length > 0 ? `${message}\nSkipped: ${warnings.join(", ")}` : message, warnings.length > 0 ? "warning" : "info");
+    }
+  } catch (err) {
+    ctx.ui.notify(`Could not load ${SETTINGS_KEY}.try_models: ${err instanceof Error ? err.message : String(err)}`, "warning");
+  }
+}
+
+function fallbackEnabled(): boolean {
+  return fallbackModels.length > 0;
+}
+
+function getPrimaryModel(current: Model<Api>): Model<Api> {
+  return primaryModel ?? current;
+}
+
+function candidateOrder(current: Model<Api>): FallbackModel[] {
+  const primary = getPrimaryModel(current);
+  const order: FallbackModel[] = [{ model: primary, reasoningEffort: primaryThinkingLevel }];
+  const seen = new Set([modelKey(primary)]);
+  for (const entry of fallbackModels) {
+    const key = modelKey(entry.model);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    order.push(entry);
+  }
+  return order;
+}
+
+function activeLimit(model: Model<Api>): RateLimitMemory | undefined {
+  const entry = rateLimitMemory.get(modelKey(model));
+  if (!entry) return undefined;
+  if (Date.now() >= entry.deadline) {
+    rateLimitMemory.delete(modelKey(model));
+    return undefined;
+  }
+  return entry;
+}
+
+function formatDuration(ms: number): string {
+  const totalSecs = Math.max(0, Math.ceil(ms / 1_000));
+  const hours = Math.floor(totalSecs / 3_600);
+  const mins = Math.floor((totalSecs % 3_600) / 60);
+  const secs = (totalSecs % 60).toString().padStart(2, "0");
+  return hours > 0 ? `${hours}h ${mins}m ${secs}s` : `${mins}m ${secs}s`;
+}
+
+function updateRateLimitedModelsStatus(): void {
+  const ctx = sharedCtx;
+  if (!ctx) return;
+  const now = Date.now();
+  const lines: string[] = [];
+  for (const [key, entry] of rateLimitMemory) {
+    if (now >= entry.deadline) {
+      rateLimitMemory.delete(key);
+      continue;
+    }
+    lines.push(`${key}: ${formatDuration(entry.deadline - now)}`);
+  }
+  if (lines.length === 0) {
+    modelStatusCleanup?.();
+    return;
+  }
+  ctx.ui.setStatus(MODELS_STATUS_KEY, `🚦 Limited: ${lines.join(" | ")}`);
+}
+
+function ensureRateLimitedModelsStatus(): void {
+  if (modelStatusCleanup) return;
+  updateRateLimitedModelsStatus();
+  const ticker = setInterval(updateRateLimitedModelsStatus, 1_000);
+  modelStatusCleanup = () => {
+    clearInterval(ticker);
+    modelStatusCleanup = undefined;
+    sharedCtx?.ui.setStatus(MODELS_STATUS_KEY, undefined);
+  };
+}
+
+function rememberRateLimit(model: Model<Api>, retryable: RetryableError): void {
+  const deadline = Date.now() + retryable.waitMs;
+  rateLimitMemory.set(modelKey(model), { reason: retryable.reason, limitedAt: Date.now(), deadline });
+  sharedCtx?.ui.notify(`${formatModel(model)} ${reasonLabel(retryable.reason).toLowerCase()} for ${formatDuration(retryable.waitMs)}.`, "warning");
+  ensureRateLimitedModelsStatus();
+}
+
+function nextAvailableCandidate(current: Model<Api>): FallbackModel | undefined {
+  return candidateOrder(current).find((entry) => !activeLimit(entry.model));
+}
+
+function earliestCandidateDeadline(current: Model<Api>): number | undefined {
+  const deadlines = candidateOrder(current)
+    .map((entry) => activeLimit(entry.model)?.deadline)
+    .filter((deadline): deadline is number => typeof deadline === "number");
+  return deadlines.length > 0 ? Math.min(...deadlines) : undefined;
+}
+
+function initialAttempt(model: Model<Api>): FallbackModel {
+  const configured = fallbackModels.find((entry) => modelKey(entry.model) === modelKey(model));
+  const current = configured ?? { model, reasoningEffort: primaryThinkingLevel };
+  if (!fallbackEnabled() || !activeLimit(model)) return current;
+  return nextAvailableCandidate(model) ?? current;
+}
+
+async function optionsForModel(
+  originalModel: Model<Api>,
+  target: FallbackModel,
+  options?: SimpleStreamOptions,
+): Promise<SimpleStreamOptions | undefined> {
+  const level = target.reasoningEffort ?? primaryThinkingLevel;
+  const reasoning = level && level !== "off" ? level : undefined;
+  if (modelKey(originalModel) === modelKey(target.model)) {
+    return reasoning ? { ...options, reasoning } : options;
+  }
+  const auth = await sharedCtx?.modelRegistry.getApiKeyAndHeaders(target.model);
+  if (!auth?.ok) throw new Error(auth ? auth.error : "Model registry is unavailable.");
+  return {
+    ...options,
+    ...(reasoning ? { reasoning } : {}),
+    apiKey: auth.apiKey,
+    headers: auth.headers || options?.headers ? { ...auth.headers, ...options?.headers } : undefined,
+  } as SimpleStreamOptions;
+}
+
+async function switchPiModel(entry: FallbackModel): Promise<void> {
+  const pi = extensionApi;
+  if (!pi) return;
+  const current = sharedCtx?.model;
+  if (current && modelKey(current) === modelKey(entry.model)) return;
+  suppressNextModelSelect = true;
+  const ok = await pi.setModel(entry.model);
+  if (!ok) {
+    suppressNextModelSelect = false;
+    return;
+  }
+  const level = entry.reasoningEffort ?? primaryThinkingLevel;
+  if (level) pi.setThinkingLevel(level);
+  sharedCtx?.ui.notify(`Switched to ${formatModel(entry.model)}${level ? ` (${level})` : ""}.`, "info");
 }
 
 // ─── Retryable error detection ────────────────────────────────────────────────
@@ -363,6 +615,7 @@ export function streamWithLimitsRetry(
 
   void (async () => {
     let committed = false;
+    let attempt: FallbackModel = initialAttempt(model);
 
     const flush = (buffer: AssistantMessageEvent[]) => {
       for (const event of buffer) output.push(event);
@@ -377,7 +630,15 @@ export function streamWithLimitsRetry(
 
       try {
         try {
-          const inner = delegate(model, context, options);
+          const attemptOptions = fallbackEnabled()
+            ? await optionsForModel(model, attempt, options)
+            : options;
+          const attemptDelegate = attempt.model.api === model.api
+            ? delegate
+            : builtinStreamSimpleByApi.get(attempt.model.api)
+              ?? getApiProviders().find((provider) => provider.api === attempt.model.api)?.streamSimple;
+          if (!attemptDelegate) throw new Error(`No stream handler registered for API ${attempt.model.api}.`);
+          const inner = attemptDelegate(attempt.model, context, attemptOptions);
           for await (const event of inner) {
             if (!committed) {
               if (event.type === "error") {
@@ -389,7 +650,7 @@ export function streamWithLimitsRetry(
                 if (buffer.length > 0) {
                   flush(buffer);
                 } else {
-                  output.push({ type: "start", partial: freshMessage(model) });
+                  output.push({ type: "start", partial: freshMessage(attempt.model) });
                   committed = true;
                 }
                 output.push(event);
@@ -403,10 +664,11 @@ export function streamWithLimitsRetry(
               }
 
               // First non-start, non-error event means this attempt is real.
+              if (fallbackEnabled()) await switchPiModel(attempt);
               if (buffer.length > 0) {
                 flush(buffer);
               } else {
-                output.push({ type: "start", partial: freshMessage(model) });
+                output.push({ type: "start", partial: freshMessage(attempt.model) });
                 committed = true;
               }
               output.push(event);
@@ -430,10 +692,10 @@ export function streamWithLimitsRetry(
           if (!retryable) {
             if (!committed) {
               // Synthetic start+error so the stream protocol stays valid.
-              output.push({ type: "start", partial: freshMessage(model) });
+              output.push({ type: "start", partial: freshMessage(attempt.model) });
               committed = true;
             }
-            const error = freshMessage(model);
+            const error = freshMessage(attempt.model);
             error.stopReason = options?.signal?.aborted ? "aborted" : "error";
             error.errorMessage = errMsg;
             output.push({
@@ -458,11 +720,11 @@ export function streamWithLimitsRetry(
           if (buffer.length > 0) {
             flush(buffer);
           } else {
-            output.push({ type: "start", partial: freshMessage(model) });
+            output.push({ type: "start", partial: freshMessage(attempt.model) });
             committed = true;
           }
         }
-        const error = freshMessage(model);
+        const error = freshMessage(attempt.model);
         error.stopReason = "error";
         error.errorMessage = "Provider stream ended without a terminal event.";
         output.push({ type: "error", reason: "error", error });
@@ -470,13 +732,40 @@ export function streamWithLimitsRetry(
         return;
       }
 
+      if (fallbackEnabled() && retryable.reason === "rate-limit") {
+        rememberRateLimit(attempt.model, retryable);
+        const next = nextAvailableCandidate(attempt.model);
+        if (next) {
+          attempt = next;
+          continue;
+        }
+
+        const deadline = earliestCandidateDeadline(attempt.model);
+        const waitMs = deadline ? Math.max(0, deadline - Date.now()) : retryable.waitMs;
+        const waitResult = await waitForRetry(retryable.reason, waitMs, options?.signal);
+        if (waitResult === "aborted") {
+          if (!committed) {
+            output.push({ type: "start", partial: freshMessage(attempt.model) });
+            committed = true;
+          }
+          const error = freshMessage(attempt.model);
+          error.stopReason = "aborted";
+          error.errorMessage = `Request aborted during ${reasonLabel(retryable.reason).toLowerCase()} wait.`;
+          output.push({ type: "error", reason: "aborted", error });
+          output.end();
+          return;
+        }
+        attempt = nextAvailableCandidate(attempt.model) ?? { model: getPrimaryModel(attempt.model), reasoningEffort: primaryThinkingLevel };
+        continue;
+      }
+
       const waitResult = await waitForRetry(retryable.reason, retryable.waitMs, options?.signal);
       if (waitResult === "aborted") {
         if (!committed) {
-          output.push({ type: "start", partial: freshMessage(model) });
+          output.push({ type: "start", partial: freshMessage(attempt.model) });
           committed = true;
         }
-        const error = freshMessage(model);
+        const error = freshMessage(attempt.model);
         error.stopReason = "aborted";
         error.errorMessage = `Request aborted during ${reasonLabel(retryable.reason).toLowerCase()} wait.`;
         output.push({ type: "error", reason: "aborted", error });
@@ -499,6 +788,7 @@ function registerWrappedApi(pi: ExtensionAPI, api: Api): void {
   const builtinStreamSimple = getApiProviders().find((provider) => provider.api === api)?.streamSimple;
   if (!builtinStreamSimple) return;
 
+  builtinStreamSimpleByApi.set(api, builtinStreamSimple);
   wrappedApis.add(api);
   pi.registerProvider(`limits-wait-${api}`, {
     api,
@@ -510,8 +800,22 @@ function registerWrappedApi(pi: ExtensionAPI, api: Api): void {
 // ─── Extension entry point ────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
+  extensionApi = pi;
+
+  pi.on("model_select", (event) => {
+    if (suppressNextModelSelect) {
+      suppressNextModelSelect = false;
+      return;
+    }
+    primaryModel = event.model;
+    primaryThinkingLevel = pi.getThinkingLevel();
+  });
+
   pi.on("before_agent_start", (event, ctx) => {
     sharedCtx = ctx;
+    primaryModel ??= ctx.model;
+    primaryThinkingLevel ??= pi.getThinkingLevel();
+    loadFallbackSettings(ctx);
 
     // Some extensions may register providers after this extension loads. Wrap
     // any APIs that exist by the time an agent starts too.

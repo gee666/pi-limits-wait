@@ -1,6 +1,6 @@
 {
   "name": "oira666_pi-limits-wait",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Extension for PI that allows to automatically wait for limits to reset and retry the request",
   "type": "module",
   "license": "MIT",
