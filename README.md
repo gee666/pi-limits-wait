@@ -27,7 +27,7 @@ Restart Pi or run `/reload` after installing.
 
 By default, if you do not configure fallback models, the extension behaves exactly as before: it waits for the current model's limit to reset and retries.
 
-To enable automatic model fallback, add `oira666_pi-subagents.try_models` to Pi's normal `settings.json`.
+To enable automatic model fallback, add `oira666_pi-limits-wait.try_models` to Pi's normal `settings.json`.
 
 Pi settings can be global or project-local:
 
@@ -42,7 +42,7 @@ Example:
 
 ```json
 {
-  "oira666_pi-subagents": {
+  "oira666_pi-limits-wait": {
     "try_models": [
       {
         "provider": "anthropic",
@@ -69,7 +69,7 @@ Fallback behavior:
 1. Pi starts with the normal default or user-selected model.
 2. If that model is rate-limited, the extension tries models in this order:
    - the original default/user-selected model;
-   - then every model from `oira666_pi-subagents.try_models`, top to bottom.
+   - then every model from `oira666_pi-limits-wait.try_models`, top to bottom.
 3. The first model that responds without a rate-limit becomes the active Pi model for the rest of the session/task.
 4. If that model later becomes rate-limited too, the extension starts again from the same ordered list.
 5. Rate-limit reset times are remembered only in memory, so known-limited models are skipped until their countdown expires. This memory is cleared when Pi restarts.

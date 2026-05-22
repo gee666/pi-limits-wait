@@ -28,7 +28,7 @@ const PI_IDENTITY_SENTENCE_PATTERN =
 
 const DEFAULT_RATE_LIMIT_WAIT_MS = 30 * 60 * 1_000; // 30 minutes
 const DEFAULT_OVERLOADED_WAIT_MS = 5 * 60 * 1_000; // 5 minutes
-const SETTINGS_KEY = "oira666_pi-subagents";
+const SETTINGS_KEY = "oira666_pi-limits-wait";
 
 /** Key used with ctx.ui.setStatus() for the countdown line. */
 const STATUS_KEY = "limits-wait";
