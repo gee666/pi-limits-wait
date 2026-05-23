@@ -1,7 +1,9 @@
 import type { Api, AssistantMessageEvent, Context, Model, SimpleStreamOptions } from "@mariozechner/pi-ai";
 import { createAssistantMessageEventStream } from "@mariozechner/pi-ai";
 import {
+  __configureFallbackModelsForTests,
   getRetryableError,
+  isAuthenticationRefreshError,
   isRateLimitError,
   isServerOverloadedError,
   retryAfterHeaderMs,
@@ -27,8 +29,8 @@ function section(title: string) {
   console.log(`\n── ${title} ${"─".repeat(Math.max(0, 60 - title.length))}`);
 }
 
-function mockModel(): Model<Api> {
-  return { provider: "test-provider", id: "test-model", api: "anthropic-messages" } as Model<Api>;
+function mockModel(id = "test-model", provider = "test-provider"): Model<Api> {
+  return { provider, id, api: "anthropic-messages" } as Model<Api>;
 }
 
 function startEvent(): AssistantMessageEvent {
@@ -75,8 +77,10 @@ section("retryable detection");
 ok("detects 429", isRateLimitError("HTTP 429 Too Many Requests"));
 ok("detects rate_limit", isRateLimitError("rate_limit_error"));
 ok("detects server_is_overloaded", isServerOverloadedError("server_is_overloaded"));
-ok("does not match unauthorized", !isRateLimitError("HTTP 401 Unauthorized") && !isServerOverloadedError("HTTP 401 Unauthorized"));
+ok("detects refreshable authentication errors", isAuthenticationRefreshError('Error: 401 {"type":"error","error":{"type":"authentication_error","message":"Invalid authentication credentials"}}'));
+ok("does not retry generic unauthorized", !isRateLimitError("HTTP 401 Unauthorized") && !isServerOverloadedError("HTTP 401 Unauthorized") && !isAuthenticationRefreshError("HTTP 401 Unauthorized"));
 ok("classifies overloaded", getRetryableError("server_is_overloaded")?.reason === "overloaded");
+ok("uses retry delay on overloaded", getRetryableError("server_is_overloaded retry-after 0.01")?.waitMs === 10);
 {
   const past = new Headers({ "retry-after": new Date(Date.now() - 10_000).toUTCString() });
   ok("past retry-after date parses as zero", retryAfterHeaderMs(past) === 0);
@@ -121,10 +125,37 @@ section("streamWithLimitsRetry");
       ? streamFrom([startEvent(), errorEvent("server_is_overloaded retry-after 0.01")])
       : streamFrom([startEvent(), doneEvent()]);
   };
-  const ctrl = new AbortController();
-  setTimeout(() => ctrl.abort(), 20);
-  const events = await collect(streamWithLimitsRetry(delegate, mockModel(), {} as Context, { signal: ctrl.signal } as SimpleStreamOptions));
-  ok("overloaded wait can be aborted", calls === 1 && events.at(-1)?.type === "error" && (events.at(-1) as { reason?: string })?.reason === "aborted");
+  const events = await collect(streamWithLimitsRetry(delegate, mockModel(), {} as Context, {} as SimpleStreamOptions));
+  ok("overloaded retry honors retry-after and succeeds", calls === 2 && events.at(-1)?.type === "done", `calls=${calls}, last=${events.at(-1)?.type}`);
+}
+{
+  let calls = 0;
+  const delegate = () => {
+    calls++;
+    return calls === 1
+      ? streamFrom([startEvent(), errorEvent('Error: 401 {"type":"error","error":{"type":"authentication_error","message":"Invalid authentication credentials"}} retry-after 0.01')])
+      : streamFrom([startEvent(), doneEvent()]);
+  };
+  const events = await collect(streamWithLimitsRetry(delegate, mockModel(), {} as Context, {} as SimpleStreamOptions));
+  ok("retries refreshable authentication error then succeeds", calls === 2 && events.at(-1)?.type === "done", `calls=${calls}, last=${events.at(-1)?.type}`);
+}
+{
+  const primary = mockModel("primary");
+  const fallback = mockModel("fallback");
+  __configureFallbackModelsForTests(
+    [{ model: fallback }],
+    { modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fallback-key", headers: {} }) }, ui: { notify: () => undefined, setStatus: () => undefined } } as unknown as Parameters<typeof __configureFallbackModelsForTests>[1],
+  );
+  const seen: string[] = [];
+  const delegate = (model: Model<Api>) => {
+    seen.push(model.id);
+    return model.id === "primary"
+      ? streamFrom([startEvent(), errorEvent("HTTP 400 Bad Request")])
+      : streamFrom([startEvent(), doneEvent()]);
+  };
+  const events = await collect(streamWithLimitsRetry(delegate, primary, {} as Context, {} as SimpleStreamOptions));
+  ok("tries fallback model after any non-retryable error", seen.join(",") === "primary,fallback" && events.at(-1)?.type === "done", `seen=${seen.join(",")}, last=${events.at(-1)?.type}`);
+  __configureFallbackModelsForTests([]);
 }
 {
   const delegate = () => streamFrom([errorEvent("HTTP 401 Unauthorized")]);

@@ -28,13 +28,14 @@ const PI_IDENTITY_SENTENCE_PATTERN =
 
 const DEFAULT_RATE_LIMIT_WAIT_MS = 30 * 60 * 1_000; // 30 minutes
 const DEFAULT_OVERLOADED_WAIT_MS = 5 * 60 * 1_000; // 5 minutes
+const DEFAULT_NON_RETRYABLE_FREEZE_MS = 60 * 60 * 1_000; // 1 hour
 const SETTINGS_KEY = "oira666_pi-limits-wait";
 
 /** Key used with ctx.ui.setStatus() for the countdown line. */
 const STATUS_KEY = "limits-wait";
 const MODELS_STATUS_KEY = "limits-wait-models";
 
-type RetryReason = "rate-limit" | "overloaded";
+type RetryReason = "rate-limit" | "overloaded" | "authentication" | "model-frozen";
 
 type RetryableError = {
   reason: RetryReason;
@@ -47,7 +48,7 @@ type ConfiguredModel = {
   reasoningEffort?: ThinkingLevel;
 };
 
-type FallbackModel = {
+export type FallbackModel = {
   model: Model<Api>;
   reasoningEffort?: ThinkingLevel;
 };
@@ -74,6 +75,7 @@ let primaryThinkingLevel: ThinkingLevel | undefined;
 let suppressNextModelSelect = false;
 let settingsSignature: string | undefined;
 const rateLimitMemory = new Map<string, RateLimitMemory>();
+const nonRetryableFailureMemory = new Map<string, { failedAt: number; deadline: number; errorMessage: string }>();
 
 // ─── Anthropic subscription prompt sanitisation ──────────────────────────────
 
@@ -247,6 +249,13 @@ function updateRateLimitedModelsStatus(): void {
     }
     lines.push(`${key}: ${formatDuration(entry.deadline - now)}`);
   }
+  for (const [key, entry] of nonRetryableFailureMemory) {
+    if (now >= entry.deadline) {
+      nonRetryableFailureMemory.delete(key);
+      continue;
+    }
+    lines.push(`${key}: frozen ${formatDuration(entry.deadline - now)}`);
+  }
   if (lines.length === 0) {
     modelStatusCleanup?.();
     return;
@@ -272,13 +281,34 @@ function rememberRateLimit(model: Model<Api>, retryable: RetryableError): void {
   ensureRateLimitedModelsStatus();
 }
 
+function activeNonRetryableFailure(model: Model<Api>): { failedAt: number; deadline: number; errorMessage: string } | undefined {
+  const entry = nonRetryableFailureMemory.get(modelKey(model));
+  if (!entry) return undefined;
+  if (Date.now() >= entry.deadline) {
+    nonRetryableFailureMemory.delete(modelKey(model));
+    return undefined;
+  }
+  return entry;
+}
+
+function hasNonRetryableFailure(model: Model<Api>): boolean {
+  return Boolean(activeNonRetryableFailure(model));
+}
+
 function nextAvailableCandidate(current: Model<Api>): FallbackModel | undefined {
-  return candidateOrder(current).find((entry) => !activeLimit(entry.model));
+  return candidateOrder(current).find((entry) => !activeLimit(entry.model) && !hasNonRetryableFailure(entry.model));
+}
+
+function rememberNonRetryableFailure(model: Model<Api>, errorMessage: string): void {
+  const deadline = Date.now() + DEFAULT_NON_RETRYABLE_FREEZE_MS;
+  nonRetryableFailureMemory.set(modelKey(model), { failedAt: Date.now(), deadline, errorMessage });
+  sharedCtx?.ui.notify(`${formatModel(model)} failed; freezing it for ${formatDuration(DEFAULT_NON_RETRYABLE_FREEZE_MS)} and trying another configured model if available.`, "warning");
+  ensureRateLimitedModelsStatus();
 }
 
 function earliestCandidateDeadline(current: Model<Api>): number | undefined {
   const deadlines = candidateOrder(current)
-    .map((entry) => activeLimit(entry.model)?.deadline)
+    .map((entry) => activeLimit(entry.model)?.deadline ?? activeNonRetryableFailure(entry.model)?.deadline)
     .filter((deadline): deadline is number => typeof deadline === "number");
   return deadlines.length > 0 ? Math.min(...deadlines) : undefined;
 }
@@ -286,7 +316,7 @@ function earliestCandidateDeadline(current: Model<Api>): number | undefined {
 function initialAttempt(model: Model<Api>): FallbackModel {
   const configured = fallbackModels.find((entry) => modelKey(entry.model) === modelKey(model));
   const current = configured ?? { model, reasoningEffort: primaryThinkingLevel };
-  if (!fallbackEnabled() || !activeLimit(model)) return current;
+  if (!fallbackEnabled() || (!activeLimit(model) && !hasNonRetryableFailure(model))) return current;
   return nextAvailableCandidate(model) ?? current;
 }
 
@@ -348,6 +378,18 @@ export function isServerOverloadedError(msg: string): boolean {
     lower.includes("server_is_overloaded") ||
     lower.includes("server is overloaded") ||
     lower.includes("overloaded_error")
+  );
+}
+
+export function isAuthenticationRefreshError(msg: string): boolean {
+  const lower = msg.toLowerCase();
+  return (
+    /(?:^|\D)401(?:\D|$)/.test(msg) &&
+    (
+      lower.includes("authentication_error") ||
+      lower.includes("invalid authentication credentials") ||
+      lower.includes("invalid authentication")
+    )
   );
 }
 
@@ -416,7 +458,10 @@ export function retryAfterHeaderMs(headers: Headers): number | undefined {
 
 export function getRetryableError(msg: string): RetryableError | undefined {
   if (isServerOverloadedError(msg)) {
-    return { reason: "overloaded", waitMs: DEFAULT_OVERLOADED_WAIT_MS };
+    return { reason: "overloaded", waitMs: parseRetryDelayMs(msg) ?? DEFAULT_OVERLOADED_WAIT_MS };
+  }
+  if (isAuthenticationRefreshError(msg)) {
+    return { reason: "authentication", waitMs: parseRetryDelayMs(msg) ?? DEFAULT_RATE_LIMIT_WAIT_MS };
   }
   if (isRateLimitError(msg)) {
     return { reason: "rate-limit", waitMs: rateLimitWaitMs(msg) };
@@ -427,7 +472,10 @@ export function getRetryableError(msg: string): RetryableError | undefined {
 // ─── Countdown UI ─────────────────────────────────────────────────────────────
 
 function reasonLabel(reason: RetryReason): string {
-  return reason === "overloaded" ? "Server overloaded" : "Rate limited";
+  if (reason === "overloaded") return "Server overloaded";
+  if (reason === "authentication") return "Authentication refresh pending";
+  if (reason === "model-frozen") return "Model frozen after error";
+  return "Rate limited";
 }
 
 function statusText(reason: RetryReason, deadline: number, allowSkip: boolean): string {
@@ -580,6 +628,20 @@ type StreamSimpleFn = (
   options?: SimpleStreamOptions,
 ) => AssistantMessageEventStream;
 
+export function __configureFallbackModelsForTests(
+  models: FallbackModel[],
+  ctx?: ExtensionContext,
+): void {
+  fallbackModels = models;
+  sharedCtx = ctx;
+  primaryModel = undefined;
+  primaryThinkingLevel = undefined;
+  rateLimitMemory.clear();
+  nonRetryableFailureMemory.clear();
+  ambientStatusCleanup?.();
+  modelStatusCleanup?.();
+}
+
 function freshMessage(model: Model<Api>): AssistantMessage {
   return {
     role: "assistant",
@@ -627,6 +689,7 @@ export function streamWithLimitsRetry(
       installFetchRateLimitObserver();
       const buffer: AssistantMessageEvent[] = [];
       let retryable: RetryableError | undefined;
+      let nonRetryableError: { message: string; event?: AssistantMessageEvent } | undefined;
 
       try {
         try {
@@ -646,7 +709,12 @@ export function streamWithLimitsRetry(
                 retryable = !options?.signal?.aborted ? getRetryableError(errMsg) : undefined;
                 if (retryable) break;
 
-                // Non-retryable error: ensure start came first, then forward error.
+                if (fallbackEnabled()) {
+                  nonRetryableError = { message: errMsg, event };
+                  break;
+                }
+
+                // Non-retryable error without fallbacks: ensure start came first, then forward error.
                 if (buffer.length > 0) {
                   flush(buffer);
                 } else {
@@ -690,6 +758,9 @@ export function streamWithLimitsRetry(
           const errMsg = err instanceof Error ? err.message : String(err);
           retryable = !options?.signal?.aborted ? getRetryableError(errMsg) : undefined;
           if (!retryable) {
+            if (fallbackEnabled() && !options?.signal?.aborted) {
+              nonRetryableError = { message: errMsg };
+            } else {
             if (!committed) {
               // Synthetic start+error so the stream protocol stays valid.
               output.push({ type: "start", partial: freshMessage(attempt.model) });
@@ -705,6 +776,7 @@ export function streamWithLimitsRetry(
             });
             output.end();
             return;
+            }
           }
         }
       } finally {
@@ -713,6 +785,45 @@ export function streamWithLimitsRetry(
           clearAmbientRetryStatus();
           restoreFetch?.();
         }
+      }
+
+      if (nonRetryableError) {
+        if (fallbackEnabled() && !committed) {
+          rememberNonRetryableFailure(attempt.model, nonRetryableError.message);
+          const next = nextAvailableCandidate(attempt.model);
+          if (next) {
+            attempt = next;
+            continue;
+          }
+
+          const deadline = earliestCandidateDeadline(attempt.model);
+          if (deadline) {
+            const waitResult = await waitForRetry("model-frozen", Math.max(0, deadline - Date.now()), options?.signal);
+            if (waitResult !== "aborted") {
+              attempt = nextAvailableCandidate(attempt.model) ?? { model: getPrimaryModel(attempt.model), reasoningEffort: primaryThinkingLevel };
+              continue;
+            }
+          }
+        }
+
+        if (!committed) {
+          if (buffer.length > 0) {
+            flush(buffer);
+          } else {
+            output.push({ type: "start", partial: freshMessage(attempt.model) });
+            committed = true;
+          }
+        }
+        if (nonRetryableError.event) {
+          output.push(nonRetryableError.event);
+        } else {
+          const error = freshMessage(attempt.model);
+          error.stopReason = "error";
+          error.errorMessage = nonRetryableError.message;
+          output.push({ type: "error", reason: "error", error });
+        }
+        output.end();
+        return;
       }
 
       if (!retryable) {
@@ -732,7 +843,7 @@ export function streamWithLimitsRetry(
         return;
       }
 
-      if (fallbackEnabled() && retryable.reason === "rate-limit") {
+      if (fallbackEnabled()) {
         rememberRateLimit(attempt.model, retryable);
         const next = nextAvailableCandidate(attempt.model);
         if (next) {
