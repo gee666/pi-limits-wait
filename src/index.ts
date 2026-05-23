@@ -115,6 +115,16 @@ function formatModel(model: Pick<Model<Api>, "provider" | "id">): string {
   return `${model.provider}/${model.id}`;
 }
 
+function isInternalSyntheticModel(model: Pick<Model<Api>, "provider" | "id">): boolean {
+  return model.provider.startsWith("pi-") || model.id.startsWith("synthetic-");
+}
+
+function isFallbackEligibleModel(model: Model<Api>): boolean {
+  if (isInternalSyntheticModel(model)) return false;
+  const key = modelKey(model);
+  return primaryModel ? key === modelKey(primaryModel) || fallbackModels.some((entry) => modelKey(entry.model) === key) : true;
+}
+
 function isThinkingLevel(value: unknown): value is ThinkingLevel {
   return ["off", "minimal", "low", "medium", "high", "xhigh"].includes(String(value));
 }
@@ -677,7 +687,8 @@ export function streamWithLimitsRetry(
 
   void (async () => {
     let committed = false;
-    let attempt: FallbackModel = initialAttempt(model);
+    const allowFallback = fallbackEnabled() && isFallbackEligibleModel(model);
+    let attempt: FallbackModel = allowFallback ? initialAttempt(model) : { model, reasoningEffort: primaryThinkingLevel };
 
     const flush = (buffer: AssistantMessageEvent[]) => {
       for (const event of buffer) output.push(event);
@@ -693,7 +704,7 @@ export function streamWithLimitsRetry(
 
       try {
         try {
-          const attemptOptions = fallbackEnabled()
+          const attemptOptions = allowFallback
             ? await optionsForModel(model, attempt, options)
             : options;
           const attemptDelegate = attempt.model.api === model.api
@@ -709,7 +720,7 @@ export function streamWithLimitsRetry(
                 retryable = !options?.signal?.aborted ? getRetryableError(errMsg) : undefined;
                 if (retryable) break;
 
-                if (fallbackEnabled()) {
+                if (allowFallback) {
                   nonRetryableError = { message: errMsg, event };
                   break;
                 }
@@ -732,7 +743,7 @@ export function streamWithLimitsRetry(
               }
 
               // First non-start, non-error event means this attempt is real.
-              if (fallbackEnabled()) await switchPiModel(attempt);
+              if (allowFallback) await switchPiModel(attempt);
               if (buffer.length > 0) {
                 flush(buffer);
               } else {
@@ -758,7 +769,7 @@ export function streamWithLimitsRetry(
           const errMsg = err instanceof Error ? err.message : String(err);
           retryable = !options?.signal?.aborted ? getRetryableError(errMsg) : undefined;
           if (!retryable) {
-            if (fallbackEnabled() && !options?.signal?.aborted) {
+            if (allowFallback && !options?.signal?.aborted) {
               nonRetryableError = { message: errMsg };
             } else {
             if (!committed) {
@@ -788,7 +799,7 @@ export function streamWithLimitsRetry(
       }
 
       if (nonRetryableError) {
-        if (fallbackEnabled() && !committed) {
+        if (allowFallback && !committed) {
           rememberNonRetryableFailure(attempt.model, nonRetryableError.message);
           const next = nextAvailableCandidate(attempt.model);
           if (next) {
@@ -843,7 +854,7 @@ export function streamWithLimitsRetry(
         return;
       }
 
-      if (fallbackEnabled()) {
+      if (allowFallback) {
         rememberRateLimit(attempt.model, retryable);
         const next = nextAvailableCandidate(attempt.model);
         if (next) {
@@ -918,22 +929,23 @@ export default function (pi: ExtensionAPI) {
       suppressNextModelSelect = false;
       return;
     }
+    if (isInternalSyntheticModel(event.model)) return;
     primaryModel = event.model;
     primaryThinkingLevel = pi.getThinkingLevel();
   });
 
   pi.on("before_agent_start", (event, ctx) => {
     sharedCtx = ctx;
-    primaryModel ??= ctx.model;
+    if (!primaryModel && ctx.model && !isInternalSyntheticModel(ctx.model)) primaryModel = ctx.model;
     primaryThinkingLevel ??= pi.getThinkingLevel();
     loadFallbackSettings(ctx);
 
     // Some extensions may register providers after this extension loads. Wrap
     // any APIs that exist by the time an agent starts too.
     for (const model of ctx.modelRegistry.getAll()) {
-      registerWrappedApi(pi, model.api);
+      if (!isInternalSyntheticModel(model)) registerWrappedApi(pi, model.api);
     }
-    if (ctx.model) registerWrappedApi(pi, ctx.model.api);
+    if (ctx.model && !isInternalSyntheticModel(ctx.model)) registerWrappedApi(pi, ctx.model.api);
 
     // Anthropic subscription/OAuth requests identify as Claude Code, not Pi.
     // Check the session-wide Anthropic OAuth configuration rather than only the

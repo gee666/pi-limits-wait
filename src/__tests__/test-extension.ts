@@ -158,6 +158,22 @@ section("streamWithLimitsRetry");
   __configureFallbackModelsForTests([]);
 }
 {
+  const synthetic = mockModel("synthetic-tool-call", "pi-subagent-resume");
+  const fallback = mockModel("fallback");
+  __configureFallbackModelsForTests(
+    [{ model: fallback }],
+    { modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fallback-key", headers: {} }) }, ui: { notify: () => undefined, setStatus: () => undefined } } as unknown as Parameters<typeof __configureFallbackModelsForTests>[1],
+  );
+  const seen: string[] = [];
+  const delegate = (model: Model<Api>) => {
+    seen.push(`${model.provider}/${model.id}`);
+    return streamFrom([startEvent(), errorEvent("synthetic resume failed")]);
+  };
+  const events = await collect(streamWithLimitsRetry(delegate, synthetic, {} as Context, {} as SimpleStreamOptions));
+  ok("does not fallback/freeze internal synthetic models", seen.join(",") === "pi-subagent-resume/synthetic-tool-call" && events.at(-1)?.type === "error", `seen=${seen.join(",")}, last=${events.at(-1)?.type}`);
+  __configureFallbackModelsForTests([]);
+}
+{
   const delegate = () => streamFrom([errorEvent("HTTP 401 Unauthorized")]);
   const events = await collect(streamWithLimitsRetry(delegate, mockModel(), {} as Context, {} as SimpleStreamOptions));
   ok("non-retryable yielded error is preceded by start", events[0]?.type === "start" && events[1]?.type === "error");
