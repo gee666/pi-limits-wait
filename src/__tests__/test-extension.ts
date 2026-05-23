@@ -188,6 +188,11 @@ section("streamWithLimitsRetry");
   const events = await collect(streamWithLimitsRetry(delegate, mockModel(), {} as Context, {} as SimpleStreamOptions));
   ok("done-only stream is preceded by synthetic start", events[0]?.type === "start" && events[1]?.type === "done");
 }
+{
+  const delegate = async () => streamFrom([startEvent(), doneEvent()]);
+  const events = await collect(streamWithLimitsRetry(delegate, mockModel(), {} as Context, {} as SimpleStreamOptions));
+  ok("supports async provider streamSimple", events[0]?.type === "start" && events.at(-1)?.type === "done");
+}
 
 console.log(`\n${"═".repeat(64)}`);
 console.log(`Results: ${passed} passed, ${failed} failed`);

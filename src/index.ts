@@ -636,7 +636,7 @@ type StreamSimpleFn = (
   model: Model<Api>,
   context: Context,
   options?: SimpleStreamOptions,
-) => AssistantMessageEventStream;
+) => AssistantMessageEventStream | Promise<AssistantMessageEventStream>;
 
 export function __configureFallbackModelsForTests(
   models: FallbackModel[],
@@ -712,7 +712,7 @@ export function streamWithLimitsRetry(
             : builtinStreamSimpleByApi.get(attempt.model.api)
               ?? getApiProviders().find((provider) => provider.api === attempt.model.api)?.streamSimple;
           if (!attemptDelegate) throw new Error(`No stream handler registered for API ${attempt.model.api}.`);
-          const inner = attemptDelegate(attempt.model, context, attemptOptions);
+          const inner = await attemptDelegate(attempt.model, context, attemptOptions);
           for await (const event of inner) {
             if (!committed) {
               if (event.type === "error") {
