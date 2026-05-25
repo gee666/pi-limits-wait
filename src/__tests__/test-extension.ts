@@ -242,7 +242,7 @@ section("streamWithLimitsRetry");
       : streamFrom([startEvent(), doneEvent()]);
   };
   const events = await collect(streamWithLimitsRetry(delegate, primary, {} as Context, {} as SimpleStreamOptions));
-  ok("does not freeze or fallback on unclassified non-retryable errors", seen.join(",") === "primary" && events.at(-1)?.type === "error" && notifications.every((message) => !message.includes("freezing it")), `seen=${seen.join(",")}, last=${events.at(-1)?.type}, notifications=${notifications.join(";")}`);
+  ok("freezes failed model and tries fallback on unclassified non-retryable errors", seen.join(",") === "primary,fallback" && events.at(-1)?.type === "done" && notifications.some((message) => message.includes("HTTP 400 Bad Request") && message.includes("freezing it")), `seen=${seen.join(",")}, last=${events.at(-1)?.type}, notifications=${notifications.join(";")}`);
   __configureFallbackModelsForTests([]);
 }
 {
