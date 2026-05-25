@@ -158,6 +158,27 @@ section("streamWithLimitsRetry");
   __configureFallbackModelsForTests([]);
 }
 {
+  const primary = mockModel("primary");
+  const fallback = mockModel("fallback");
+  const notifications: string[] = [];
+  __configureFallbackModelsForTests(
+    [{ model: fallback }],
+    { modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fallback-key", headers: {} }) }, ui: { notify: (message: string) => notifications.push(message), setStatus: () => undefined } } as unknown as Parameters<typeof __configureFallbackModelsForTests>[1],
+  );
+  const ctrl = new AbortController();
+  ctrl.abort();
+  const seen: string[] = [];
+  const delegate = (model: Model<Api>) => {
+    seen.push(model.id);
+    return streamFrom([startEvent(), errorEvent("Operation aborted")]);
+  };
+  const events = await collect(streamWithLimitsRetry(delegate, primary, {} as Context, { signal: ctrl.signal } as SimpleStreamOptions));
+  const last = events.at(-1);
+  const abortReason = last?.type === "error" ? last.reason : "n/a";
+  ok("abort error does not freeze or try fallback", seen.join(",") === "primary" && last?.type === "error" && last.reason === "aborted" && notifications.length === 0, `seen=${seen.join(",")}, reason=${abortReason}, notifications=${notifications.join(";")}`);
+  __configureFallbackModelsForTests([]);
+}
+{
   const synthetic = mockModel("synthetic-tool-call", "pi-subagent-resume");
   const fallback = mockModel("fallback");
   __configureFallbackModelsForTests(

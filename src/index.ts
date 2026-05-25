@@ -316,6 +316,25 @@ function rememberNonRetryableFailure(model: Model<Api>, errorMessage: string): v
   ensureRateLimitedModelsStatus();
 }
 
+function isAbortMessage(msg: string): boolean {
+  const lower = msg.toLowerCase();
+  return (
+    lower.includes("operation aborted") ||
+    lower.includes("request aborted") ||
+    lower.includes("aborterror") ||
+    /\baborted\b/.test(lower)
+  );
+}
+
+function isAbortErrorEvent(event: AssistantMessageEvent, signal?: AbortSignal): boolean {
+  if (signal?.aborted) return true;
+  if (event.type !== "error") return false;
+  const reason = "reason" in event ? String(event.reason) : "";
+  const stopReason = event.error.stopReason ? String(event.error.stopReason) : "";
+  const message = event.error.errorMessage ?? "";
+  return reason === "aborted" || stopReason === "aborted" || isAbortMessage(message);
+}
+
 function earliestCandidateDeadline(current: Model<Api>): number | undefined {
   const deadlines = candidateOrder(current)
     .map((entry) => activeLimit(entry.model)?.deadline ?? activeNonRetryableFailure(entry.model)?.deadline)
@@ -717,7 +736,23 @@ export function streamWithLimitsRetry(
             if (!committed) {
               if (event.type === "error") {
                 const errMsg = event.error.errorMessage ?? "";
-                retryable = !options?.signal?.aborted ? getRetryableError(errMsg) : undefined;
+
+                if (isAbortErrorEvent(event, options?.signal)) {
+                  if (buffer.length > 0) {
+                    flush(buffer);
+                  } else {
+                    output.push({ type: "start", partial: freshMessage(attempt.model) });
+                    committed = true;
+                  }
+                  const error = freshMessage(attempt.model);
+                  error.stopReason = "aborted";
+                  error.errorMessage = errMsg || "Operation aborted";
+                  output.push({ type: "error", reason: "aborted", error });
+                  output.end();
+                  return;
+                }
+
+                retryable = getRetryableError(errMsg);
                 if (retryable) break;
 
                 if (allowFallback) {
@@ -767,26 +802,27 @@ export function streamWithLimitsRetry(
           }
         } catch (err) {
           const errMsg = err instanceof Error ? err.message : String(err);
-          retryable = !options?.signal?.aborted ? getRetryableError(errMsg) : undefined;
+          const aborted = Boolean(options?.signal?.aborted) || isAbortMessage(errMsg);
+          retryable = !aborted ? getRetryableError(errMsg) : undefined;
           if (!retryable) {
-            if (allowFallback && !options?.signal?.aborted) {
+            if (allowFallback && !aborted) {
               nonRetryableError = { message: errMsg };
             } else {
-            if (!committed) {
-              // Synthetic start+error so the stream protocol stays valid.
-              output.push({ type: "start", partial: freshMessage(attempt.model) });
-              committed = true;
-            }
-            const error = freshMessage(attempt.model);
-            error.stopReason = options?.signal?.aborted ? "aborted" : "error";
-            error.errorMessage = errMsg;
-            output.push({
-              type: "error",
-              reason: error.stopReason as "error" | "aborted",
-              error,
-            });
-            output.end();
-            return;
+              if (!committed) {
+                // Synthetic start+error so the stream protocol stays valid.
+                output.push({ type: "start", partial: freshMessage(attempt.model) });
+                committed = true;
+              }
+              const error = freshMessage(attempt.model);
+              error.stopReason = aborted ? "aborted" : "error";
+              error.errorMessage = errMsg;
+              output.push({
+                type: "error",
+                reason: error.stopReason as "error" | "aborted",
+                error,
+              });
+              output.end();
+              return;
             }
           }
         }
