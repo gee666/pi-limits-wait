@@ -142,9 +142,97 @@ section("streamWithLimitsRetry");
 {
   const primary = mockModel("primary");
   const fallback = mockModel("fallback");
+  const seen: string[] = [];
+  const notifications: string[] = [];
+  __configureFallbackModelsForTests(
+    [{ model: fallback }],
+    { modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fallback-key", headers: {} }) }, ui: { notify: (message: string) => notifications.push(message), setStatus: () => undefined } } as unknown as Parameters<typeof __configureFallbackModelsForTests>[1],
+  );
+  const delegate = (model: Model<Api>) => {
+    seen.push(model.id);
+    return model.id === "primary"
+      ? streamFrom([startEvent(), errorEvent("HTTP 429 retry-after 0.01")])
+      : streamFrom([startEvent(), doneEvent()]);
+  };
+  const events = await collect(streamWithLimitsRetry(delegate, primary, {} as Context, {} as SimpleStreamOptions));
+  ok("tries fallback model after classified rate-limit error", seen.join(",") === "primary,fallback" && events.at(-1)?.type === "done", `seen=${seen.join(",")}, last=${events.at(-1)?.type}`);
+  ok("rate-limit warning includes provider error detail", notifications.some((message) => message.includes("HTTP 429 retry-after 0.01")), `notifications=${notifications.join(";")}`);
+  __configureFallbackModelsForTests([]);
+}
+{
+  const primary = mockModel("primary");
+  const fallback = mockModel("fallback");
   __configureFallbackModelsForTests(
     [{ model: fallback }],
     { modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fallback-key", headers: {} }) }, ui: { notify: () => undefined, setStatus: () => undefined } } as unknown as Parameters<typeof __configureFallbackModelsForTests>[1],
+  );
+  const seen: string[] = [];
+  const delegate = (model: Model<Api>) => {
+    seen.push(model.id);
+    if (model.id === "primary") throw new Error("Connection error.", { cause: new Error("HTTP 429 Too Many Requests retry-after 0.01") });
+    return streamFrom([startEvent(), doneEvent()]);
+  };
+  const events = await collect(streamWithLimitsRetry(delegate, primary, {} as Context, {} as SimpleStreamOptions));
+  ok("detects retryable 429 in wrapped error cause", seen.join(",") === "primary,fallback" && events.at(-1)?.type === "done", `seen=${seen.join(",")}, last=${events.at(-1)?.type}`);
+  __configureFallbackModelsForTests([]);
+}
+{
+  const primary = mockModel("primary");
+  const fallback = mockModel("fallback");
+  const originalFetch = globalThis.fetch;
+  let fetchCalls = 0;
+  globalThis.fetch = (async () => {
+    fetchCalls++;
+    return new Response("early rate limit body", { status: 429, statusText: "Too Many Requests", headers: { "retry-after": "0.01" } });
+  }) as typeof fetch;
+  __configureFallbackModelsForTests(
+    [{ model: fallback }],
+    { modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fallback-key", headers: {} }) }, ui: { notify: () => undefined, setStatus: () => undefined, setWorkingMessage: () => undefined } } as unknown as Parameters<typeof __configureFallbackModelsForTests>[1],
+  );
+  const seen: string[] = [];
+  const delegate = async (model: Model<Api>) => {
+    seen.push(model.id);
+    if (model.id === "primary") await fetch("https://example.invalid/rate-limited");
+    return streamFrom([startEvent(), doneEvent()]);
+  };
+  const events = await collect(streamWithLimitsRetry(delegate, primary, {} as Context, {} as SimpleStreamOptions));
+  ok("falls back immediately when fetch observes 429 before provider stream error", seen.join(",") === "primary,fallback" && fetchCalls === 1 && events.at(-1)?.type === "done", `seen=${seen.join(",")}, fetchCalls=${fetchCalls}, last=${events.at(-1)?.type}`);
+  __configureFallbackModelsForTests([]);
+  globalThis.fetch = originalFetch;
+}
+{
+  const primary = mockModel("primary");
+  const fallback = mockModel("fallback");
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response("early rate limit body", { status: 429, statusText: "Too Many Requests", headers: { "retry-after": "0.01" } })) as typeof fetch;
+  __configureFallbackModelsForTests(
+    [{ model: fallback }],
+    { modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fallback-key", headers: {} }) }, ui: { notify: () => undefined, setStatus: () => undefined, setWorkingMessage: () => undefined } } as unknown as Parameters<typeof __configureFallbackModelsForTests>[1],
+  );
+  const seen: string[] = [];
+  const delegate = async (model: Model<Api>) => {
+    seen.push(model.id);
+    if (model.id === "primary") {
+      try {
+        await fetch("https://example.invalid/rate-limited");
+      } catch {
+        return streamFrom([startEvent(), errorEvent("Connection error.")]);
+      }
+    }
+    return streamFrom([startEvent(), doneEvent()]);
+  };
+  const events = await collect(streamWithLimitsRetry(delegate, primary, {} as Context, {} as SimpleStreamOptions));
+  ok("uses observed 429 when provider hides it behind connection error event", seen.join(",") === "primary,fallback" && events.at(-1)?.type === "done", `seen=${seen.join(",")}, last=${events.at(-1)?.type}`);
+  __configureFallbackModelsForTests([]);
+  globalThis.fetch = originalFetch;
+}
+{
+  const primary = mockModel("primary");
+  const fallback = mockModel("fallback");
+  const notifications: string[] = [];
+  __configureFallbackModelsForTests(
+    [{ model: fallback }],
+    { modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fallback-key", headers: {} }) }, ui: { notify: (message: string) => notifications.push(message), setStatus: () => undefined } } as unknown as Parameters<typeof __configureFallbackModelsForTests>[1],
   );
   const seen: string[] = [];
   const delegate = (model: Model<Api>) => {
@@ -154,7 +242,7 @@ section("streamWithLimitsRetry");
       : streamFrom([startEvent(), doneEvent()]);
   };
   const events = await collect(streamWithLimitsRetry(delegate, primary, {} as Context, {} as SimpleStreamOptions));
-  ok("tries fallback model after any non-retryable error", seen.join(",") === "primary,fallback" && events.at(-1)?.type === "done", `seen=${seen.join(",")}, last=${events.at(-1)?.type}`);
+  ok("does not freeze or fallback on unclassified non-retryable errors", seen.join(",") === "primary" && events.at(-1)?.type === "error" && notifications.every((message) => !message.includes("freezing it")), `seen=${seen.join(",")}, last=${events.at(-1)?.type}, notifications=${notifications.join(";")}`);
   __configureFallbackModelsForTests([]);
 }
 {

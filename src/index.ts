@@ -28,14 +28,13 @@ const PI_IDENTITY_SENTENCE_PATTERN =
 
 const DEFAULT_RATE_LIMIT_WAIT_MS = 30 * 60 * 1_000; // 30 minutes
 const DEFAULT_OVERLOADED_WAIT_MS = 5 * 60 * 1_000; // 5 minutes
-const DEFAULT_NON_RETRYABLE_FREEZE_MS = 60 * 60 * 1_000; // 1 hour
 const SETTINGS_KEY = "oira666_pi-limits-wait";
 
 /** Key used with ctx.ui.setStatus() for the countdown line. */
 const STATUS_KEY = "limits-wait";
 const MODELS_STATUS_KEY = "limits-wait-models";
 
-type RetryReason = "rate-limit" | "overloaded" | "authentication" | "model-frozen";
+type RetryReason = "rate-limit" | "overloaded" | "authentication";
 
 type RetryableError = {
   reason: RetryReason;
@@ -67,6 +66,8 @@ let restoreFetch: (() => void) | undefined;
 let ambientStatusCleanup: (() => void) | undefined;
 let modelStatusCleanup: (() => void) | undefined;
 let activeProviderRequests = 0;
+let activeFallbackProviderRequests = 0;
+let lastObservedRateLimitError: { at: number; message: string } | undefined;
 const wrappedApis = new Set<Api>();
 const builtinStreamSimpleByApi = new Map<Api, StreamSimpleFn>();
 let fallbackModels: FallbackModel[] = [];
@@ -75,7 +76,6 @@ let primaryThinkingLevel: ThinkingLevel | undefined;
 let suppressNextModelSelect = false;
 let settingsSignature: string | undefined;
 const rateLimitMemory = new Map<string, RateLimitMemory>();
-const nonRetryableFailureMemory = new Map<string, { failedAt: number; deadline: number; errorMessage: string }>();
 
 // ─── Anthropic subscription prompt sanitisation ──────────────────────────────
 
@@ -250,27 +250,24 @@ function formatDuration(ms: number): string {
 function updateRateLimitedModelsStatus(): void {
   const ctx = sharedCtx;
   if (!ctx) return;
-  const now = Date.now();
-  const lines: string[] = [];
-  for (const [key, entry] of rateLimitMemory) {
-    if (now >= entry.deadline) {
-      rateLimitMemory.delete(key);
-      continue;
+  try {
+    const now = Date.now();
+    const lines: string[] = [];
+    for (const [key, entry] of rateLimitMemory) {
+      if (now >= entry.deadline) {
+        rateLimitMemory.delete(key);
+        continue;
+      }
+      lines.push(`${key}: ${formatDuration(entry.deadline - now)}`);
     }
-    lines.push(`${key}: ${formatDuration(entry.deadline - now)}`);
-  }
-  for (const [key, entry] of nonRetryableFailureMemory) {
-    if (now >= entry.deadline) {
-      nonRetryableFailureMemory.delete(key);
-      continue;
+    if (lines.length === 0) {
+      modelStatusCleanup?.();
+      return;
     }
-    lines.push(`${key}: frozen ${formatDuration(entry.deadline - now)}`);
-  }
-  if (lines.length === 0) {
+    ctx.ui.setStatus(MODELS_STATUS_KEY, `🚦 Limited: ${lines.join(" | ")}`);
+  } catch {
     modelStatusCleanup?.();
-    return;
   }
-  ctx.ui.setStatus(MODELS_STATUS_KEY, `🚦 Limited: ${lines.join(" | ")}`);
 }
 
 function ensureRateLimitedModelsStatus(): void {
@@ -280,40 +277,49 @@ function ensureRateLimitedModelsStatus(): void {
   modelStatusCleanup = () => {
     clearInterval(ticker);
     modelStatusCleanup = undefined;
-    sharedCtx?.ui.setStatus(MODELS_STATUS_KEY, undefined);
+    try {
+      sharedCtx?.ui.setStatus(MODELS_STATUS_KEY, undefined);
+    } catch {
+      // The extension context can become stale after print-mode session teardown.
+    }
   };
 }
 
-function rememberRateLimit(model: Model<Api>, retryable: RetryableError): void {
+function rememberRateLimit(model: Model<Api>, retryable: RetryableError, errorMessage?: string): void {
   const deadline = Date.now() + retryable.waitMs;
   rateLimitMemory.set(modelKey(model), { reason: retryable.reason, limitedAt: Date.now(), deadline });
-  sharedCtx?.ui.notify(`${formatModel(model)} ${reasonLabel(retryable.reason).toLowerCase()} for ${formatDuration(retryable.waitMs)}.`, "warning");
+  const detail = errorMessage ? ` Error: ${formatErrorDetail(errorMessage)}` : "";
+  sharedCtx?.ui.notify(`${formatModel(model)} ${reasonLabel(retryable.reason).toLowerCase()} for ${formatDuration(retryable.waitMs)}.${detail}`, "warning");
   ensureRateLimitedModelsStatus();
-}
-
-function activeNonRetryableFailure(model: Model<Api>): { failedAt: number; deadline: number; errorMessage: string } | undefined {
-  const entry = nonRetryableFailureMemory.get(modelKey(model));
-  if (!entry) return undefined;
-  if (Date.now() >= entry.deadline) {
-    nonRetryableFailureMemory.delete(modelKey(model));
-    return undefined;
-  }
-  return entry;
-}
-
-function hasNonRetryableFailure(model: Model<Api>): boolean {
-  return Boolean(activeNonRetryableFailure(model));
 }
 
 function nextAvailableCandidate(current: Model<Api>): FallbackModel | undefined {
-  return candidateOrder(current).find((entry) => !activeLimit(entry.model) && !hasNonRetryableFailure(entry.model));
+  return candidateOrder(current).find((entry) => !activeLimit(entry.model));
 }
 
-function rememberNonRetryableFailure(model: Model<Api>, errorMessage: string): void {
-  const deadline = Date.now() + DEFAULT_NON_RETRYABLE_FREEZE_MS;
-  nonRetryableFailureMemory.set(modelKey(model), { failedAt: Date.now(), deadline, errorMessage });
-  sharedCtx?.ui.notify(`${formatModel(model)} failed; freezing it for ${formatDuration(DEFAULT_NON_RETRYABLE_FREEZE_MS)} and trying another configured model if available.`, "warning");
-  ensureRateLimitedModelsStatus();
+function formatErrorDetail(errorMessage: string, maxLength = 500): string {
+  const oneLine = errorMessage.replace(/\s+/g, " ").trim();
+  if (!oneLine) return "unknown error";
+  return oneLine.length > maxLength ? `${oneLine.slice(0, maxLength - 1)}…` : oneLine;
+}
+
+function errorMessageWithCauses(err: unknown): string {
+  const messages: string[] = [];
+  let current: unknown = err;
+  const seen = new Set<unknown>();
+
+  while (current && !seen.has(current)) {
+    seen.add(current);
+    if (current instanceof Error) {
+      if (current.message) messages.push(current.message);
+      current = (current as Error & { cause?: unknown }).cause;
+      continue;
+    }
+    messages.push(String(current));
+    break;
+  }
+
+  return messages.filter(Boolean).join(" Cause: ") || String(err);
 }
 
 function isAbortMessage(msg: string): boolean {
@@ -335,9 +341,15 @@ function isAbortErrorEvent(event: AssistantMessageEvent, signal?: AbortSignal): 
   return reason === "aborted" || stopReason === "aborted" || isAbortMessage(message);
 }
 
+function recentObservedRateLimitError(maxAgeMs = 60_000): string | undefined {
+  if (!lastObservedRateLimitError) return undefined;
+  if (Date.now() - lastObservedRateLimitError.at > maxAgeMs) return undefined;
+  return lastObservedRateLimitError.message;
+}
+
 function earliestCandidateDeadline(current: Model<Api>): number | undefined {
   const deadlines = candidateOrder(current)
-    .map((entry) => activeLimit(entry.model)?.deadline ?? activeNonRetryableFailure(entry.model)?.deadline)
+    .map((entry) => activeLimit(entry.model)?.deadline)
     .filter((deadline): deadline is number => typeof deadline === "number");
   return deadlines.length > 0 ? Math.min(...deadlines) : undefined;
 }
@@ -345,7 +357,7 @@ function earliestCandidateDeadline(current: Model<Api>): number | undefined {
 function initialAttempt(model: Model<Api>): FallbackModel {
   const configured = fallbackModels.find((entry) => modelKey(entry.model) === modelKey(model));
   const current = configured ?? { model, reasoningEffort: primaryThinkingLevel };
-  if (!fallbackEnabled() || (!activeLimit(model) && !hasNonRetryableFailure(model))) return current;
+  if (!fallbackEnabled() || !activeLimit(model)) return current;
   return nextAvailableCandidate(model) ?? current;
 }
 
@@ -503,7 +515,6 @@ export function getRetryableError(msg: string): RetryableError | undefined {
 function reasonLabel(reason: RetryReason): string {
   if (reason === "overloaded") return "Server overloaded";
   if (reason === "authentication") return "Authentication refresh pending";
-  if (reason === "model-frozen") return "Model frozen after error";
   return "Rate limited";
 }
 
@@ -624,6 +635,19 @@ export function waitForRateLimit(
 
 // ─── Early 429 observer ──────────────────────────────────────────────────────
 
+async function responseErrorMessage(response: Response): Promise<string> {
+  const retryAfterMs = retryAfterHeaderMs(response.headers);
+  const retryAfter = retryAfterMs !== undefined ? ` retry-after-ms ${retryAfterMs}` : "";
+  let body = "";
+  try {
+    body = await response.clone().text();
+  } catch {
+    // Ignore body read failures; status and retry headers are enough.
+  }
+  const detail = body.trim() ? ` ${formatErrorDetail(body)}` : "";
+  return `HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ""}${retryAfter}${detail}`;
+}
+
 function installFetchRateLimitObserver(): void {
   if (restoreFetch || typeof globalThis.fetch !== "function") return;
 
@@ -634,7 +658,12 @@ function installFetchRateLimitObserver(): void {
     if (activeProviderRequests > 0) {
       if (response.status === 429) {
         const waitMs = retryAfterHeaderMs(response.headers) ?? DEFAULT_RATE_LIMIT_WAIT_MS;
+        const message = await responseErrorMessage(response);
+        lastObservedRateLimitError = { at: Date.now(), message };
         showAmbientRetryStatus("rate-limit", waitMs);
+        if (activeFallbackProviderRequests > 0) {
+          throw new Error(message);
+        }
       } else if (ambientStatusCleanup && response.ok) {
         clearAmbientRetryStatus();
       }
@@ -666,7 +695,7 @@ export function __configureFallbackModelsForTests(
   primaryModel = undefined;
   primaryThinkingLevel = undefined;
   rateLimitMemory.clear();
-  nonRetryableFailureMemory.clear();
+  lastObservedRateLimitError = undefined;
   ambientStatusCleanup?.();
   modelStatusCleanup?.();
 }
@@ -716,10 +745,11 @@ export function streamWithLimitsRetry(
 
     while (true) {
       activeProviderRequests++;
+      if (allowFallback) activeFallbackProviderRequests++;
       installFetchRateLimitObserver();
       const buffer: AssistantMessageEvent[] = [];
       let retryable: RetryableError | undefined;
-      let nonRetryableError: { message: string; event?: AssistantMessageEvent } | undefined;
+      let retryableErrorMessage = "";
 
       try {
         try {
@@ -753,14 +783,22 @@ export function streamWithLimitsRetry(
                 }
 
                 retryable = getRetryableError(errMsg);
-                if (retryable) break;
-
-                if (allowFallback) {
-                  nonRetryableError = { message: errMsg, event };
+                if (retryable) {
+                  retryableErrorMessage = errMsg;
+                  break;
+                }
+                const observedRateLimit = allowFallback ? recentObservedRateLimitError() : undefined;
+                retryable = observedRateLimit ? getRetryableError(observedRateLimit) : undefined;
+                if (retryable && observedRateLimit) {
+                  retryableErrorMessage = observedRateLimit;
                   break;
                 }
 
-                // Non-retryable error without fallbacks: ensure start came first, then forward error.
+                // Non-retryable provider errors are request-specific by default
+                // (bad request, context size, content/tool schema issues, user aborts
+                // reported without abort metadata, etc.). Do not globally freeze a
+                // model or try fallbacks unless the error was positively classified
+                // above as a retryable capacity/limit condition.
                 if (buffer.length > 0) {
                   flush(buffer);
                 } else {
@@ -801,76 +839,40 @@ export function streamWithLimitsRetry(
             }
           }
         } catch (err) {
-          const errMsg = err instanceof Error ? err.message : String(err);
+          const errMsg = errorMessageWithCauses(err);
           const aborted = Boolean(options?.signal?.aborted) || isAbortMessage(errMsg);
           retryable = !aborted ? getRetryableError(errMsg) : undefined;
+          if (retryable) retryableErrorMessage = errMsg;
+          if (!retryable && allowFallback) {
+            const observedRateLimit = recentObservedRateLimitError();
+            retryable = observedRateLimit ? getRetryableError(observedRateLimit) : undefined;
+            if (retryable && observedRateLimit) retryableErrorMessage = observedRateLimit;
+          }
           if (!retryable) {
-            if (allowFallback && !aborted) {
-              nonRetryableError = { message: errMsg };
-            } else {
-              if (!committed) {
-                // Synthetic start+error so the stream protocol stays valid.
-                output.push({ type: "start", partial: freshMessage(attempt.model) });
-                committed = true;
-              }
-              const error = freshMessage(attempt.model);
-              error.stopReason = aborted ? "aborted" : "error";
-              error.errorMessage = errMsg;
-              output.push({
-                type: "error",
-                reason: error.stopReason as "error" | "aborted",
-                error,
-              });
-              output.end();
-              return;
+            if (!committed) {
+              // Synthetic start+error so the stream protocol stays valid.
+              output.push({ type: "start", partial: freshMessage(attempt.model) });
+              committed = true;
             }
+            const error = freshMessage(attempt.model);
+            error.stopReason = aborted ? "aborted" : "error";
+            error.errorMessage = errMsg;
+            output.push({
+              type: "error",
+              reason: error.stopReason as "error" | "aborted",
+              error,
+            });
+            output.end();
+            return;
           }
         }
       } finally {
         activeProviderRequests--;
+        if (allowFallback) activeFallbackProviderRequests--;
         if (activeProviderRequests === 0) {
           clearAmbientRetryStatus();
           restoreFetch?.();
         }
-      }
-
-      if (nonRetryableError) {
-        if (allowFallback && !committed) {
-          rememberNonRetryableFailure(attempt.model, nonRetryableError.message);
-          const next = nextAvailableCandidate(attempt.model);
-          if (next) {
-            attempt = next;
-            continue;
-          }
-
-          const deadline = earliestCandidateDeadline(attempt.model);
-          if (deadline) {
-            const waitResult = await waitForRetry("model-frozen", Math.max(0, deadline - Date.now()), options?.signal);
-            if (waitResult !== "aborted") {
-              attempt = nextAvailableCandidate(attempt.model) ?? { model: getPrimaryModel(attempt.model), reasoningEffort: primaryThinkingLevel };
-              continue;
-            }
-          }
-        }
-
-        if (!committed) {
-          if (buffer.length > 0) {
-            flush(buffer);
-          } else {
-            output.push({ type: "start", partial: freshMessage(attempt.model) });
-            committed = true;
-          }
-        }
-        if (nonRetryableError.event) {
-          output.push(nonRetryableError.event);
-        } else {
-          const error = freshMessage(attempt.model);
-          error.stopReason = "error";
-          error.errorMessage = nonRetryableError.message;
-          output.push({ type: "error", reason: "error", error });
-        }
-        output.end();
-        return;
       }
 
       if (!retryable) {
@@ -891,7 +893,7 @@ export function streamWithLimitsRetry(
       }
 
       if (allowFallback) {
-        rememberRateLimit(attempt.model, retryable);
+        rememberRateLimit(attempt.model, retryable, retryableErrorMessage);
         const next = nextAvailableCandidate(attempt.model);
         if (next) {
           attempt = next;
