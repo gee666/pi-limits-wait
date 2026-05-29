@@ -27,38 +27,36 @@ Restart Pi or run `/reload` after installing.
 
 By default, if you do not configure fallback models, the extension behaves exactly as before: it waits for the current model's limit to reset and retries.
 
-To enable automatic model fallback, add `oira666_pi-limits-wait.try_models` to Pi's normal `settings.json`.
+To enable automatic model fallback, add `fallback-models` to a `limits-wait.json` file.
 
-Pi settings can be global or project-local:
+The extension reads these files in order; later files override earlier ones:
 
 | Location | Scope |
 |----------|-------|
-| `~/.pi/agent/settings.json` | Global, all projects |
-| `.pi/settings.json` | Project-local |
-
-Project settings override global settings. The extension reads these through Pi's `SettingsManager`, so normal Pi settings paths and `PI_CODING_AGENT_DIR` are respected.
+| `~/.config/.pi/limits-wait.json` | Global defaults |
+| `<Pi agent dir>/limits-wait.json` (for example `~/.pi/agent/limits-wait.json`, or `PI_CODING_AGENT_DIR/limits-wait.json`) | Pi agent directory |
+| `.limits-wait.json` | Project root override |
+| `.pi/limits-wait.json` | Pi project override |
 
 Example:
 
 ```json
 {
-  "oira666_pi-limits-wait": {
-    "try_models": [
-      {
-        "provider": "anthropic",
-        "modelname": "claude-sonnet-4-5",
-        "reasoning effort": "medium"
-      },
-      {
-        "provider": "openai",
-        "modelname": "gpt-5.1-codex"
-      }
-    ]
-  }
+  "fallback-models": [
+    {
+      "provider": "anthropic",
+      "modelname": "claude-sonnet-4-5",
+      "reasoning effort": "medium"
+    },
+    {
+      "provider": "openai",
+      "modelname": "gpt-5.1-codex"
+    }
+  ]
 }
 ```
 
-Each `try_models` entry supports:
+Each `fallback-models` entry supports:
 
 - `provider` — required. The Pi provider name, for example `anthropic`, `openai`, `google`, etc.
 - `modelname` — required. The model id/name as Pi knows it.
@@ -69,7 +67,7 @@ Fallback behavior:
 1. Pi starts with the normal default or user-selected model.
 2. If that model is rate-limited, the extension tries models in this order:
    - the original default/user-selected model;
-   - then every model from `oira666_pi-limits-wait.try_models`, top to bottom.
+   - then every model from `fallback-models`, top to bottom.
 3. The first model that responds without a rate-limit becomes the active Pi model for the rest of the session/task.
 4. If that model later becomes rate-limited too, the extension starts again from the same ordered list.
 5. Rate-limit reset times are remembered only in memory, so known-limited models are skipped until their countdown expires. This memory is cleared when Pi restarts.

@@ -1,7 +1,11 @@
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import type { Api, AssistantMessageEvent, Context, Model, SimpleStreamOptions } from "@mariozechner/pi-ai";
 import { createAssistantMessageEventStream } from "@mariozechner/pi-ai";
 import {
   __configureFallbackModelsForTests,
+  __readFallbackSettingsForTests,
   getRetryableError,
   isAuthenticationRefreshError,
   isRateLimitError,
@@ -84,6 +88,30 @@ ok("uses retry delay on overloaded", getRetryableError("server_is_overloaded ret
 {
   const past = new Headers({ "retry-after": new Date(Date.now() - 10_000).toUTCString() });
   ok("past retry-after date parses as zero", retryAfterHeaderMs(past) === 0);
+}
+
+section("fallback settings files");
+{
+  const root = mkdtempSync(join(tmpdir(), "limits-wait-"));
+  try {
+    const home = join(root, "home");
+    const agent = join(root, "agent");
+    const project = join(root, "project");
+    mkdirSync(join(home, ".config", ".pi"), { recursive: true });
+    mkdirSync(agent, { recursive: true });
+    mkdirSync(join(project, ".pi"), { recursive: true });
+    writeFileSync(join(home, ".config", ".pi", "limits-wait.json"), JSON.stringify({ "fallback-models": [{ provider: "base", modelname: "base" }], keep: "home" }));
+    writeFileSync(join(agent, "limits-wait.json"), JSON.stringify({ keep: "agent", agentOnly: true }));
+    writeFileSync(join(project, ".limits-wait.json"), JSON.stringify({ keep: "project-root" }));
+    writeFileSync(join(project, ".pi", "limits-wait.json"), JSON.stringify({ keep: "project-pi", "fallback-models": [{ provider: "final", modelname: "final" }] }));
+
+    const resolved = __readFallbackSettingsForTests(project, agent, home);
+    ok("loads all limits-wait.json locations in precedence order", resolved.loadedPaths.length === 4, `paths=${resolved.loadedPaths.join(",")}`);
+    ok("project .pi/limits-wait.json has highest precedence", (resolved.config["fallback-models"] as Array<{ provider: string }>)[0]?.provider === "final" && resolved.config.keep === "project-pi");
+    ok("lower-priority keys are preserved", resolved.config.agentOnly === true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 }
 
 section("waitForRateLimit");
