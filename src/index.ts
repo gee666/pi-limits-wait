@@ -31,15 +31,22 @@ const PI_IDENTITY_SENTENCE_PATTERN =
 
 const DEFAULT_RATE_LIMIT_WAIT_MS = 30 * 60 * 1_000; // 30 minutes
 const DEFAULT_OVERLOADED_WAIT_MS = 5 * 60 * 1_000; // 5 minutes
-const DEFAULT_NON_RETRYABLE_FREEZE_MS = 60 * 60 * 1_000; // 1 hour
+const DEFAULT_NETWORK_WAIT_MS = 15 * 1_000; // 15 seconds
+const DEFAULT_NON_RETRYABLE_FREEZE_MS = 10 * 60 * 1_000; // 1 hour
+/** How many times a non-retryable error is retried before we freeze/fallback. */
+const NON_RETRYABLE_MAX_ATTEMPTS = 3;
+/** Short backoff between non-retryable retries. */
+const NON_RETRYABLE_RETRY_DELAY_MS = 5 * 1_000; // 5 seconds
 const SETTINGS_FILE_NAME = "limits-wait.json";
 const FALLBACK_MODELS_KEY = "fallback-models";
+/** Env var to toggle the 1-hour model-freeze behaviour. Default: enabled. */
+const FREEZING_ENV_VAR = "PI_LIMITS_WAIT_FREEZING_ENABLED";
 
 /** Key used with ctx.ui.setStatus() for the countdown line. */
 const STATUS_KEY = "limits-wait";
 const MODELS_STATUS_KEY = "limits-wait-models";
 
-type RetryReason = "rate-limit" | "overloaded" | "authentication" | "model-frozen";
+type RetryReason = "rate-limit" | "overloaded" | "authentication" | "model-frozen" | "network" | "retry";
 
 type RetryableError = {
   reason: RetryReason;
@@ -82,6 +89,8 @@ let lastObservedRateLimitError: { at: number; message: string } | undefined;
 const wrappedApis = new Set<Api>();
 const builtinStreamSimpleByApi = new Map<Api, StreamSimpleFn>();
 let fallbackModels: FallbackModel[] = [];
+let nonRetryableMaxAttempts = NON_RETRYABLE_MAX_ATTEMPTS;
+let nonRetryableRetryDelayMs = NON_RETRYABLE_RETRY_DELAY_MS;
 let primaryModel: Model<Api> | undefined;
 let primaryThinkingLevel: ThinkingLevel | undefined;
 let suppressNextModelSelect = false;
@@ -504,6 +513,40 @@ export function isServerOverloadedError(msg: string): boolean {
   );
 }
 
+/**
+ * Transient network / HTTP transport failures. These are NOT API rate-limit or
+ * overload responses, but they are still worth retrying with a short backoff
+ * instead of treating them as a hard non-retryable failure (which would freeze
+ * the model for an hour). Most importantly this covers undici's idle-timeout
+ * aborts (`UND_ERR_HEADERS_TIMEOUT` / `UND_ERR_BODY_TIMEOUT`) that fire when a
+ * streaming request stalls without a response.
+ */
+export function isTransientNetworkError(msg: string): boolean {
+  const lower = msg.toLowerCase();
+  return (
+    lower.includes("und_err_headers_timeout") ||
+    lower.includes("und_err_body_timeout") ||
+    lower.includes("und_err_connect_timeout") ||
+    lower.includes("und_err_socket") ||
+    lower.includes("headers timeout") ||
+    lower.includes("body timeout") ||
+    lower.includes("connect timeout") ||
+    lower.includes("fetch failed") ||
+    lower.includes("terminated") ||
+    lower.includes("socket hang up") ||
+    lower.includes("other side closed") ||
+    lower.includes("network_error") ||
+    lower.includes("network error") ||
+    lower.includes("econnreset") ||
+    lower.includes("econnrefused") ||
+    lower.includes("etimedout") ||
+    lower.includes("enetunreach") ||
+    lower.includes("ehostunreach") ||
+    lower.includes("eai_again") ||
+    lower.includes("enotfound")
+  );
+}
+
 export function isAuthenticationRefreshError(msg: string): boolean {
   const lower = msg.toLowerCase();
   return (
@@ -589,6 +632,9 @@ export function getRetryableError(msg: string): RetryableError | undefined {
   if (isRateLimitError(msg)) {
     return { reason: "rate-limit", waitMs: rateLimitWaitMs(msg) };
   }
+  if (isTransientNetworkError(msg)) {
+    return { reason: "network", waitMs: parseRetryDelayMs(msg) ?? DEFAULT_NETWORK_WAIT_MS };
+  }
   return undefined;
 }
 
@@ -598,7 +644,21 @@ function reasonLabel(reason: RetryReason): string {
   if (reason === "overloaded") return "Server overloaded";
   if (reason === "authentication") return "Authentication refresh pending";
   if (reason === "model-frozen") return "Model frozen after error";
+  if (reason === "network") return "Network/timeout error";
+  if (reason === "retry") return "Retrying after error";
   return "Rate limited";
+}
+
+/**
+ * Whether the 1-hour model-freeze behaviour is enabled. Controlled by the
+ * `PI_LIMITS_WAIT_FREEZING_ENABLED` env var (default enabled). Set it to
+ * `false`/`0`/`no`/`off` to disable freezing entirely.
+ */
+export function freezingEnabled(): boolean {
+  const raw = process.env[FREEZING_ENV_VAR];
+  if (raw === undefined) return true;
+  const value = raw.trim().toLowerCase();
+  return !(value === "false" || value === "0" || value === "no" || value === "off");
 }
 
 function statusText(reason: RetryReason, deadline: number, allowSkip: boolean): string {
@@ -692,14 +752,19 @@ export function waitForRetry(
     };
 
     tick();
+    // The interval only drives the visible 1s countdown; the actual wait is
+    // resolved precisely at the deadline by `timer` below (so a 200ms backoff
+    // resolves in ~200ms instead of being rounded up to the next 1s tick).
     const ticker = setInterval(() => {
       if (Date.now() >= deadline) { cleanup(); resolve("waited"); return; }
       tick();
     }, 1_000);
+    const timer = setTimeout(() => { if (!done) { cleanup(); resolve("waited"); } }, Math.max(0, deadline - Date.now()));
 
     function cleanup() {
       done = true;
       clearInterval(ticker);
+      clearTimeout(timer);
       signal?.removeEventListener("abort", onAbort);
       unsubInput?.();
       ctx?.ui.setStatus(STATUS_KEY, undefined);
@@ -769,6 +834,11 @@ type StreamSimpleFn = (
   options?: SimpleStreamOptions,
 ) => AssistantMessageEventStream | Promise<AssistantMessageEventStream>;
 
+export function __setNonRetryableTuningForTests(maxAttempts: number, retryDelayMs: number): void {
+  nonRetryableMaxAttempts = maxAttempts;
+  nonRetryableRetryDelayMs = retryDelayMs;
+}
+
 export function __configureFallbackModelsForTests(
   models: FallbackModel[],
   ctx?: ExtensionContext,
@@ -821,6 +891,11 @@ export function streamWithLimitsRetry(
     let committed = false;
     const allowFallback = fallbackEnabled() && isFallbackEligibleModel(model);
     let attempt: FallbackModel = allowFallback ? initialAttempt(model) : { model, reasoningEffort: primaryThinkingLevel };
+    // Per-stream bookkeeping: how many times each model has hit a non-retryable
+    // error, and which models we've exhausted (used to advance fallbacks when
+    // freezing is disabled).
+    const nonRetryableAttempts = new Map<string, number>();
+    const triedModels = new Set<string>();
 
     const flush = (buffer: AssistantMessageEvent[]) => {
       for (const event of buffer) output.push(event);
@@ -879,20 +954,11 @@ export function streamWithLimitsRetry(
                   break;
                 }
 
-                if (allowFallback) {
-                  nonRetryableError = { message: errMsg, event };
-                  break;
-                }
-
-                if (buffer.length > 0) {
-                  flush(buffer);
-                } else {
-                  output.push({ type: "start", partial: freshMessage(attempt.model) });
-                  committed = true;
-                }
-                output.push(event);
-                output.end();
-                return;
+                // Defer handling to the post-loop block, which applies the
+                // bounded non-retryable retry / fallback / freeze logic. This
+                // runs whether or not fallbacks are configured.
+                nonRetryableError = { message: errMsg, event };
+                break;
               }
 
               if (event.type === "start") {
@@ -934,25 +1000,21 @@ export function streamWithLimitsRetry(
             if (retryable && observedRateLimit) retryableErrorMessage = observedRateLimit;
           }
           if (!retryable) {
-            if (allowFallback && !aborted) {
-              nonRetryableError = { message: errMsg };
-            } else {
+            if (aborted) {
               if (!committed) {
                 // Synthetic start+error so the stream protocol stays valid.
                 output.push({ type: "start", partial: freshMessage(attempt.model) });
                 committed = true;
               }
               const error = freshMessage(attempt.model);
-              error.stopReason = aborted ? "aborted" : "error";
+              error.stopReason = "aborted";
               error.errorMessage = errMsg;
-              output.push({
-                type: "error",
-                reason: error.stopReason as "error" | "aborted",
-                error,
-              });
+              output.push({ type: "error", reason: "aborted", error });
               output.end();
               return;
             }
+            // Defer to the post-loop block for bounded retries / fallback.
+            nonRetryableError = { message: errMsg };
           }
         }
       } finally {
@@ -964,68 +1026,96 @@ export function streamWithLimitsRetry(
         }
       }
 
-      if (nonRetryableError) {
-        if (allowFallback && !committed) {
-          rememberNonRetryableFailure(attempt.model, nonRetryableError.message);
-          const next = nextAvailableCandidate(attempt.model);
-          if (next) {
-            attempt = next;
-            continue;
+      if (!retryable) {
+        // Both explicit non-retryable error events/exceptions and a provider
+        // stream that ended without a terminal event land here.
+        const failureEvent = nonRetryableError?.event;
+        const failureMessage = nonRetryableError?.message ?? "Provider stream ended without a terminal event.";
+
+        const emitFailure = () => {
+          if (!committed) {
+            if (buffer.length > 0) {
+              flush(buffer);
+            } else {
+              output.push({ type: "start", partial: freshMessage(attempt.model) });
+              committed = true;
+            }
+          }
+          if (failureEvent) {
+            output.push(failureEvent);
+          } else {
+            const error = freshMessage(attempt.model);
+            error.stopReason = "error";
+            error.errorMessage = failureMessage;
+            output.push({ type: "error", reason: "error", error });
+          }
+          output.end();
+        };
+
+        const emitAborted = () => {
+          if (!committed) {
+            output.push({ type: "start", partial: freshMessage(attempt.model) });
+            committed = true;
+          }
+          const error = freshMessage(attempt.model);
+          error.stopReason = "aborted";
+          error.errorMessage = "Request aborted while retrying after error.";
+          output.push({ type: "error", reason: "aborted", error });
+          output.end();
+        };
+
+        // Nothing has been streamed yet: give the same model a few quick retries
+        // before we freeze it or fall back. This rides out transient failures
+        // that aren't recognised as retryable (stalls, odd 5xx, malformed
+        // errors) instead of immediately freezing the model for an hour.
+        if (!committed) {
+          const key = modelKey(attempt.model);
+          const attempts = (nonRetryableAttempts.get(key) ?? 0) + 1;
+          nonRetryableAttempts.set(key, attempts);
+
+          if (attempts < nonRetryableMaxAttempts) {
+            const waitResult = await waitForRetry("retry", nonRetryableRetryDelayMs, options?.signal);
+            if (waitResult === "aborted") {
+              emitAborted();
+              return;
+            }
+            continue; // retry the same model
           }
 
-          const deadline = earliestCandidateDeadline(attempt.model);
-          if (deadline) {
-            const waitResult = await waitForRetry("model-frozen", Math.max(0, deadline - Date.now()), options?.signal);
-            if (waitResult !== "aborted") {
-              attempt = nextAvailableCandidate(attempt.model) ?? { model: getPrimaryModel(attempt.model), reasoningEffort: primaryThinkingLevel };
-              continue;
+          // Retries for this model are exhausted.
+          triedModels.add(key);
+
+          if (allowFallback) {
+            if (freezingEnabled()) {
+              rememberNonRetryableFailure(attempt.model, failureMessage);
+              const next = nextAvailableCandidate(attempt.model);
+              if (next) {
+                attempt = next;
+                continue;
+              }
+
+              const deadline = earliestCandidateDeadline(attempt.model);
+              if (deadline) {
+                const waitResult = await waitForRetry("model-frozen", Math.max(0, deadline - Date.now()), options?.signal);
+                if (waitResult !== "aborted") {
+                  attempt = nextAvailableCandidate(attempt.model) ?? { model: getPrimaryModel(attempt.model), reasoningEffort: primaryThinkingLevel };
+                  continue;
+                }
+              }
+            } else {
+              // Freezing disabled: walk through the remaining configured
+              // candidates (without freezing) and only give up once they are
+              // all exhausted. Never block on a long "model-frozen" wait.
+              const next = candidateOrder(attempt.model).find((entry) => !triedModels.has(modelKey(entry.model)));
+              if (next) {
+                attempt = next;
+                continue;
+              }
             }
           }
         }
 
-        if (!committed) {
-          if (buffer.length > 0) {
-            flush(buffer);
-          } else {
-            output.push({ type: "start", partial: freshMessage(attempt.model) });
-            committed = true;
-          }
-        }
-        if (nonRetryableError.event) {
-          output.push(nonRetryableError.event);
-        } else {
-          const error = freshMessage(attempt.model);
-          error.stopReason = "error";
-          error.errorMessage = nonRetryableError.message;
-          output.push({ type: "error", reason: "error", error });
-        }
-        output.end();
-        return;
-      }
-
-      if (!retryable) {
-        if (allowFallback && !committed) {
-          const message = "Provider stream ended without a terminal event.";
-          rememberNonRetryableFailure(attempt.model, message);
-          const next = nextAvailableCandidate(attempt.model);
-          if (next) {
-            attempt = next;
-            continue;
-          }
-        }
-        if (!committed) {
-          if (buffer.length > 0) {
-            flush(buffer);
-          } else {
-            output.push({ type: "start", partial: freshMessage(attempt.model) });
-            committed = true;
-          }
-        }
-        const error = freshMessage(attempt.model);
-        error.stopReason = "error";
-        error.errorMessage = "Provider stream ended without a terminal event.";
-        output.push({ type: "error", reason: "error", error });
-        output.end();
+        emitFailure();
         return;
       }
 

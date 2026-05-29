@@ -19,6 +19,8 @@ Restart Pi or run `/reload` after installing.
 - Uses provider retry timing when available (`retry-after`, `retry-after-ms`, `retry in ...`, reset messages).
 - If no retry timing is available for a rate limit, waits 30 minutes before retrying.
 - On `server_is_overloaded`, waits 5 minutes, then retries. If the provider is still overloaded after Pi's normal retries, it waits another 5 minutes and repeats.
+- On transient network/transport failures — including undici idle-timeout aborts (`UND_ERR_HEADERS_TIMEOUT` / `UND_ERR_BODY_TIMEOUT`), `fetch failed`, `terminated`, `ECONNRESET`, `ETIMEDOUT`, etc. — treats the error as retryable with a short backoff (default 15s, or the provider's `retry-after`) instead of giving up. This prevents a stalled streaming request from turning into a silent hang.
+- For any other (unclassified) non-retryable error, retries the same model a few times (default 3) before falling back / freezing it, so a one-off hiccup does not immediately sideline a model.
 - Shows a countdown in the Pi status/working line.
 - Press Enter during the countdown to skip the wait and retry immediately.
 - Optionally falls back to configured models when the current/default model is rate-limited.
@@ -73,6 +75,12 @@ Fallback behavior:
 5. Rate-limit reset times are remembered only in memory, so known-limited models are skipped until their countdown expires. This memory is cleared when Pi restarts.
 
 When the settings are loaded, the extension shows the full usable fallback model list. When models become rate-limited, it shows a live countdown for each limited model.
+
+## Environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PI_LIMITS_WAIT_FREEZING_ENABLED` | `true` | When a model keeps failing with a non-retryable error, it is normally "frozen" for 1 hour and skipped in favour of other configured models. Set this to `false` (also accepts `0`, `no`, `off`) to disable freezing entirely: the extension will instead try each configured candidate once (after the bounded retries) and then surface the error, never blocking on a long "model-frozen" wait. Useful for non-interactive / subagent runs where no one can press Enter to skip. |
 
 ## License
 

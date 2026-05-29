@@ -6,15 +6,22 @@ import { createAssistantMessageEventStream } from "@mariozechner/pi-ai";
 import {
   __configureFallbackModelsForTests,
   __readFallbackSettingsForTests,
+  __setNonRetryableTuningForTests,
+  freezingEnabled,
   getRetryableError,
   isAuthenticationRefreshError,
   isRateLimitError,
   isServerOverloadedError,
+  isTransientNetworkError,
   retryAfterHeaderMs,
   sanitiseSystemPrompt,
   streamWithLimitsRetry,
   waitForRateLimit,
 } from "../index.js";
+
+// Keep non-retryable retry backoff tiny so the suite stays fast while still
+// exercising the real retry-count behaviour.
+__setNonRetryableTuningForTests(3, 2);
 
 let passed = 0;
 let failed = 0;
@@ -85,6 +92,32 @@ ok("detects refreshable authentication errors", isAuthenticationRefreshError('Er
 ok("does not retry generic unauthorized", !isRateLimitError("HTTP 401 Unauthorized") && !isServerOverloadedError("HTTP 401 Unauthorized") && !isAuthenticationRefreshError("HTTP 401 Unauthorized"));
 ok("classifies overloaded", getRetryableError("server_is_overloaded")?.reason === "overloaded");
 ok("uses retry delay on overloaded", getRetryableError("server_is_overloaded retry-after 0.01")?.waitMs === 10);
+
+section("transient network / timeout detection");
+ok("detects undici headers timeout", isTransientNetworkError("UND_ERR_HEADERS_TIMEOUT: Headers Timeout Error"));
+ok("detects undici body timeout", isTransientNetworkError("UND_ERR_BODY_TIMEOUT"));
+ok("detects generic fetch failed", isTransientNetworkError("TypeError: fetch failed"));
+ok("detects terminated stream", isTransientNetworkError("terminated"));
+ok("detects ECONNRESET", isTransientNetworkError("read ECONNRESET socket hang up"));
+ok("plain 400 is not a network error", !isTransientNetworkError("HTTP 400 Bad Request"));
+ok("classifies headers timeout as retryable network error", getRetryableError("UND_ERR_HEADERS_TIMEOUT")?.reason === "network");
+ok("network error uses short default backoff", getRetryableError("fetch failed")?.waitMs === 15_000);
+ok("network error honors explicit retry-after", getRetryableError("fetch failed retry-after 0.01")?.waitMs === 10);
+
+section("freezing toggle env var");
+{
+  const prev = process.env.PI_LIMITS_WAIT_FREEZING_ENABLED;
+  delete process.env.PI_LIMITS_WAIT_FREEZING_ENABLED;
+  ok("freezing enabled by default", freezingEnabled() === true);
+  process.env.PI_LIMITS_WAIT_FREEZING_ENABLED = "false";
+  ok("freezing disabled when set to false", freezingEnabled() === false);
+  process.env.PI_LIMITS_WAIT_FREEZING_ENABLED = "0";
+  ok("freezing disabled when set to 0", freezingEnabled() === false);
+  process.env.PI_LIMITS_WAIT_FREEZING_ENABLED = "true";
+  ok("freezing enabled when set to true", freezingEnabled() === true);
+  if (prev === undefined) delete process.env.PI_LIMITS_WAIT_FREEZING_ENABLED;
+  else process.env.PI_LIMITS_WAIT_FREEZING_ENABLED = prev;
+}
 {
   const past = new Headers({ "retry-after": new Date(Date.now() - 10_000).toUTCString() });
   ok("past retry-after date parses as zero", retryAfterHeaderMs(past) === 0);
@@ -174,7 +207,7 @@ section("streamWithLimitsRetry");
   const notifications: string[] = [];
   __configureFallbackModelsForTests(
     [{ model: fallback }],
-    { modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fallback-key", headers: {} }) }, ui: { notify: (message: string) => notifications.push(message), setStatus: () => undefined } } as unknown as Parameters<typeof __configureFallbackModelsForTests>[1],
+    { modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fallback-key", headers: {} }) }, ui: { notify: (message: string) => notifications.push(message), setStatus: () => undefined, setWorkingMessage: () => undefined } } as unknown as Parameters<typeof __configureFallbackModelsForTests>[1],
   );
   const delegate = (model: Model<Api>) => {
     seen.push(model.id);
@@ -192,7 +225,7 @@ section("streamWithLimitsRetry");
   const fallback = mockModel("fallback");
   __configureFallbackModelsForTests(
     [{ model: fallback }],
-    { modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fallback-key", headers: {} }) }, ui: { notify: () => undefined, setStatus: () => undefined } } as unknown as Parameters<typeof __configureFallbackModelsForTests>[1],
+    { modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fallback-key", headers: {} }) }, ui: { notify: () => undefined, setStatus: () => undefined, setWorkingMessage: () => undefined } } as unknown as Parameters<typeof __configureFallbackModelsForTests>[1],
   );
   const seen: string[] = [];
   const delegate = (model: Model<Api>) => {
@@ -260,7 +293,7 @@ section("streamWithLimitsRetry");
   const notifications: string[] = [];
   __configureFallbackModelsForTests(
     [{ model: fallback }],
-    { modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fallback-key", headers: {} }) }, ui: { notify: (message: string) => notifications.push(message), setStatus: () => undefined } } as unknown as Parameters<typeof __configureFallbackModelsForTests>[1],
+    { modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fallback-key", headers: {} }) }, ui: { notify: (message: string) => notifications.push(message), setStatus: () => undefined, setWorkingMessage: () => undefined } } as unknown as Parameters<typeof __configureFallbackModelsForTests>[1],
   );
   const seen: string[] = [];
   const delegate = (model: Model<Api>) => {
@@ -270,7 +303,7 @@ section("streamWithLimitsRetry");
       : streamFrom([startEvent(), doneEvent()]);
   };
   const events = await collect(streamWithLimitsRetry(delegate, primary, {} as Context, {} as SimpleStreamOptions));
-  ok("freezes failed model and tries fallback on unclassified non-retryable errors", seen.join(",") === "primary,fallback" && events.at(-1)?.type === "done" && notifications.some((message) => message.includes("HTTP 400 Bad Request") && message.includes("freezing it")), `seen=${seen.join(",")}, last=${events.at(-1)?.type}, notifications=${notifications.join(";")}`);
+  ok("retries then freezes failed model and tries fallback on unclassified non-retryable errors", seen.join(",") === "primary,primary,primary,fallback" && events.at(-1)?.type === "done" && notifications.some((message) => message.includes("HTTP 400 Bad Request") && message.includes("freezing it")), `seen=${seen.join(",")}, last=${events.at(-1)?.type}, notifications=${notifications.join(";")}`);
   __configureFallbackModelsForTests([]);
 }
 {
@@ -279,7 +312,7 @@ section("streamWithLimitsRetry");
   const notifications: string[] = [];
   __configureFallbackModelsForTests(
     [{ model: fallback }],
-    { modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fallback-key", headers: {} }) }, ui: { notify: (message: string) => notifications.push(message), setStatus: () => undefined } } as unknown as Parameters<typeof __configureFallbackModelsForTests>[1],
+    { modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fallback-key", headers: {} }) }, ui: { notify: (message: string) => notifications.push(message), setStatus: () => undefined, setWorkingMessage: () => undefined } } as unknown as Parameters<typeof __configureFallbackModelsForTests>[1],
   );
   const ctrl = new AbortController();
   ctrl.abort();
@@ -299,7 +332,7 @@ section("streamWithLimitsRetry");
   const fallback = mockModel("fallback");
   __configureFallbackModelsForTests(
     [{ model: fallback }],
-    { modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fallback-key", headers: {} }) }, ui: { notify: () => undefined, setStatus: () => undefined } } as unknown as Parameters<typeof __configureFallbackModelsForTests>[1],
+    { modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fallback-key", headers: {} }) }, ui: { notify: () => undefined, setStatus: () => undefined, setWorkingMessage: () => undefined } } as unknown as Parameters<typeof __configureFallbackModelsForTests>[1],
   );
   const seen: string[] = [];
   const delegate = (model: Model<Api>) => {
@@ -307,8 +340,58 @@ section("streamWithLimitsRetry");
     return streamFrom([startEvent(), errorEvent("synthetic resume failed")]);
   };
   const events = await collect(streamWithLimitsRetry(delegate, synthetic, {} as Context, {} as SimpleStreamOptions));
-  ok("does not fallback/freeze internal synthetic models", seen.join(",") === "pi-subagent-resume/synthetic-tool-call" && events.at(-1)?.type === "error", `seen=${seen.join(",")}, last=${events.at(-1)?.type}`);
+  ok("does not fallback/freeze internal synthetic models (still bounded-retries then errors)", seen.every((id) => id === "pi-subagent-resume/synthetic-tool-call") && seen.length === 3 && events.at(-1)?.type === "error", `seen=${seen.join(",")}, last=${events.at(-1)?.type}`);
   __configureFallbackModelsForTests([]);
+}
+{
+  // Network/timeout stalls (undici idle-timeout aborts) must be retried, not
+  // treated as a hard failure that freezes the model. This is the regression
+  // that caused the silent multi-minute/hour subagent hang.
+  let calls = 0;
+  const delegate = () => {
+    calls++;
+    return calls === 1
+      ? streamFrom([startEvent(), errorEvent("UND_ERR_HEADERS_TIMEOUT: Headers Timeout Error retry-after 0.01")])
+      : streamFrom([startEvent(), doneEvent()]);
+  };
+  const events = await collect(streamWithLimitsRetry(delegate, mockModel(), {} as Context, {} as SimpleStreamOptions));
+  ok("retries undici timeout (network) error then succeeds", calls === 2 && events.at(-1)?.type === "done", `calls=${calls}, last=${events.at(-1)?.type}`);
+}
+{
+  // An unclassified non-retryable error recovers if a later attempt succeeds,
+  // within the bounded retry budget, without any fallback configured.
+  let calls = 0;
+  const delegate = () => {
+    calls++;
+    return calls < 3
+      ? streamFrom([startEvent(), errorEvent("HTTP 500 Internal Server Error")])
+      : streamFrom([startEvent(), doneEvent()]);
+  };
+  const events = await collect(streamWithLimitsRetry(delegate, mockModel(), {} as Context, {} as SimpleStreamOptions));
+  ok("retries unclassified error up to the limit then succeeds (no fallback)", calls === 3 && events.at(-1)?.type === "done", `calls=${calls}, last=${events.at(-1)?.type}`);
+}
+{
+  // With freezing disabled, a persistently failing model must never enter the
+  // long "model-frozen" wait; it tries each configured candidate once (after
+  // its retry budget) and then surfaces the error.
+  process.env.PI_LIMITS_WAIT_FREEZING_ENABLED = "false";
+  const primary = mockModel("primary");
+  const fallback = mockModel("fallback");
+  const notifications: string[] = [];
+  __configureFallbackModelsForTests(
+    [{ model: fallback }],
+    { modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fallback-key", headers: {} }) }, ui: { notify: (message: string) => notifications.push(message), setStatus: () => undefined, setWorkingMessage: () => undefined } } as unknown as Parameters<typeof __configureFallbackModelsForTests>[1],
+  );
+  const seen: string[] = [];
+  const delegate = (model: Model<Api>) => {
+    seen.push(model.id);
+    return streamFrom([startEvent(), errorEvent("HTTP 400 Bad Request")]);
+  };
+  const events = await collect(streamWithLimitsRetry(delegate, primary, {} as Context, {} as SimpleStreamOptions));
+  const last = events.at(-1);
+  ok("freezing disabled: tries each candidate without freezing then errors", seen.join(",") === "primary,primary,primary,fallback,fallback,fallback" && last?.type === "error" && !notifications.some((m) => m.includes("freezing it")), `seen=${seen.join(",")}, last=${last?.type}, notifications=${notifications.join(";")}`);
+  __configureFallbackModelsForTests([]);
+  delete process.env.PI_LIMITS_WAIT_FREEZING_ENABLED;
 }
 {
   const delegate = () => streamFrom([errorEvent("HTTP 401 Unauthorized")]);
