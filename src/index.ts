@@ -85,7 +85,7 @@ let ambientStatusCleanup: (() => void) | undefined;
 let modelStatusCleanup: (() => void) | undefined;
 let activeProviderRequests = 0;
 let activeFallbackProviderRequests = 0;
-let lastObservedRateLimitError: { at: number; message: string } | undefined;
+let lastObservedHttpError: { at: number; message: string } | undefined;
 const wrappedApis = new Set<Api>();
 const builtinStreamSimpleByApi = new Map<Api, StreamSimpleFn>();
 let fallbackModels: FallbackModel[] = [];
@@ -355,11 +355,15 @@ function ensureRateLimitedModelsStatus(): void {
   };
 }
 
+function notifyRetryableError(model: Model<Api>, retryable: RetryableError, errorMessage?: string): void {
+  const detail = errorMessage ? ` Error: ${formatErrorDetail(errorMessage)}` : "";
+  sharedCtx?.ui.notify(`${formatModel(model)} ${reasonLabel(retryable.reason).toLowerCase()} for ${formatDuration(retryable.waitMs)}.${detail}`, "warning");
+}
+
 function rememberRateLimit(model: Model<Api>, retryable: RetryableError, errorMessage?: string): void {
   const deadline = Date.now() + retryable.waitMs;
   rateLimitMemory.set(modelKey(model), { reason: retryable.reason, limitedAt: Date.now(), deadline });
-  const detail = errorMessage ? ` Error: ${formatErrorDetail(errorMessage)}` : "";
-  sharedCtx?.ui.notify(`${formatModel(model)} ${reasonLabel(retryable.reason).toLowerCase()} for ${formatDuration(retryable.waitMs)}.${detail}`, "warning");
+  notifyRetryableError(model, retryable, errorMessage);
   ensureRateLimitedModelsStatus();
 }
 
@@ -432,10 +436,21 @@ function isAbortErrorEvent(event: AssistantMessageEvent, signal?: AbortSignal): 
   return reason === "aborted" || stopReason === "aborted" || isAbortMessage(message);
 }
 
+function recentObservedHttpError(maxAgeMs = 60_000): string | undefined {
+  if (!lastObservedHttpError) return undefined;
+  if (Date.now() - lastObservedHttpError.at > maxAgeMs) return undefined;
+  return lastObservedHttpError.message;
+}
+
 function recentObservedRateLimitError(maxAgeMs = 60_000): string | undefined {
-  if (!lastObservedRateLimitError) return undefined;
-  if (Date.now() - lastObservedRateLimitError.at > maxAgeMs) return undefined;
-  return lastObservedRateLimitError.message;
+  const message = recentObservedHttpError(maxAgeMs);
+  return message && isRateLimitError(message) ? message : undefined;
+}
+
+function errorMessageWithRecentHttpStatus(errorMessage: string): string {
+  const observed = recentObservedHttpError();
+  if (!observed || /(?:^|\D)[1-5]\d\d(?:\D|$)/.test(errorMessage) || errorMessage.includes(observed)) return errorMessage;
+  return `${observed}; Error: ${errorMessage}`;
 }
 
 function earliestCandidateDeadline(current: Model<Api>): number | undefined {
@@ -490,7 +505,7 @@ async function switchPiModel(entry: FallbackModel): Promise<void> {
 
 // ─── Retryable error detection ────────────────────────────────────────────────
 
-export function isRateLimitError(msg: string): boolean {
+function isExplicitRateLimitError(msg: string): boolean {
   const lower = msg.toLowerCase();
   return (
     /(?:^|\D)429(?:\D|$)/.test(msg) ||
@@ -498,7 +513,14 @@ export function isRateLimitError(msg: string): boolean {
     /rate\s*limit/.test(lower) ||
     lower.includes("too many requests") ||
     lower.includes("quota exceeded") ||
-    lower.includes("quota will reset") ||
+    lower.includes("quota will reset")
+  );
+}
+
+export function isRateLimitError(msg: string): boolean {
+  const lower = msg.toLowerCase();
+  return (
+    isExplicitRateLimitError(msg) ||
     lower.includes("retry delay") ||
     lower.includes("retry-after")
   );
@@ -628,6 +650,9 @@ export function getRetryableError(msg: string): RetryableError | undefined {
   }
   if (isAuthenticationRefreshError(msg)) {
     return { reason: "authentication", waitMs: parseRetryDelayMs(msg) ?? DEFAULT_RATE_LIMIT_WAIT_MS };
+  }
+  if (isTransientNetworkError(msg) && !isExplicitRateLimitError(msg)) {
+    return { reason: "network", waitMs: parseRetryDelayMs(msg) ?? DEFAULT_NETWORK_WAIT_MS };
   }
   if (isRateLimitError(msg)) {
     return { reason: "rate-limit", waitMs: rateLimitWaitMs(msg) };
@@ -804,13 +829,15 @@ function installFetchRateLimitObserver(): void {
     const response = await originalFetch(...args);
 
     if (activeProviderRequests > 0) {
-      if (response.status === 429) {
-        const waitMs = retryAfterHeaderMs(response.headers) ?? DEFAULT_RATE_LIMIT_WAIT_MS;
+      if (!response.ok) {
         const message = await responseErrorMessage(response);
-        lastObservedRateLimitError = { at: Date.now(), message };
-        showAmbientRetryStatus("rate-limit", waitMs);
-        if (activeFallbackProviderRequests > 0) {
-          throw new Error(message);
+        lastObservedHttpError = { at: Date.now(), message };
+        if (response.status === 429) {
+          const waitMs = retryAfterHeaderMs(response.headers) ?? DEFAULT_RATE_LIMIT_WAIT_MS;
+          showAmbientRetryStatus("rate-limit", waitMs);
+          if (activeFallbackProviderRequests > 0) {
+            throw new Error(message);
+          }
         }
       } else if (ambientStatusCleanup && response.ok) {
         clearAmbientRetryStatus();
@@ -849,7 +876,7 @@ export function __configureFallbackModelsForTests(
   primaryThinkingLevel = undefined;
   rateLimitMemory.clear();
   nonRetryableFailureMemory.clear();
-  lastObservedRateLimitError = undefined;
+  lastObservedHttpError = undefined;
   ambientStatusCleanup?.();
   modelStatusCleanup?.();
 }
@@ -925,7 +952,8 @@ export function streamWithLimitsRetry(
           for await (const event of inner) {
             if (!committed) {
               if (event.type === "error") {
-                const errMsg = event.error.errorMessage ?? "";
+                const rawErrMsg = event.error.errorMessage ?? "";
+                const errMsg = errorMessageWithRecentHttpStatus(rawErrMsg);
 
                 if (isAbortErrorEvent(event, options?.signal)) {
                   if (buffer.length > 0) {
@@ -990,7 +1018,7 @@ export function streamWithLimitsRetry(
             }
           }
         } catch (err) {
-          const errMsg = errorMessageWithCauses(err);
+          const errMsg = errorMessageWithRecentHttpStatus(errorMessageWithCauses(err));
           const aborted = Boolean(options?.signal?.aborted) || isAbortMessage(errMsg);
           retryable = !aborted ? getRetryableError(errMsg) : undefined;
           if (retryable) retryableErrorMessage = errMsg;
@@ -1120,6 +1148,28 @@ export function streamWithLimitsRetry(
       }
 
       if (allowFallback) {
+        // Network/transport failures usually mean the user's connection dropped
+        // or a socket timed out. Do not mark the model as unavailable, switch
+        // to another model, or enter model-freeze handling; keep retrying the
+        // same model with the short network backoff until it works again.
+        if (retryable.reason === "network") {
+          notifyRetryableError(attempt.model, retryable, retryableErrorMessage);
+          const waitResult = await waitForRetry(retryable.reason, retryable.waitMs, options?.signal);
+          if (waitResult === "aborted") {
+            if (!committed) {
+              output.push({ type: "start", partial: freshMessage(attempt.model) });
+              committed = true;
+            }
+            const error = freshMessage(attempt.model);
+            error.stopReason = "aborted";
+            error.errorMessage = `Request aborted during ${reasonLabel(retryable.reason).toLowerCase()} wait.`;
+            output.push({ type: "error", reason: "aborted", error });
+            output.end();
+            return;
+          }
+          continue;
+        }
+
         rememberRateLimit(attempt.model, retryable, retryableErrorMessage);
         const next = nextAvailableCandidate(attempt.model);
         if (next) {

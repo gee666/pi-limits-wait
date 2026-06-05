@@ -358,6 +358,50 @@ section("streamWithLimitsRetry");
   ok("retries undici timeout (network) error then succeeds", calls === 2 && events.at(-1)?.type === "done", `calls=${calls}, last=${events.at(-1)?.type}`);
 }
 {
+  const primary = mockModel("primary");
+  const fallback = mockModel("fallback");
+  const notifications: string[] = [];
+  __configureFallbackModelsForTests(
+    [{ model: fallback }],
+    { modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fallback-key", headers: {} }) }, ui: { notify: (message: string) => notifications.push(message), setStatus: () => undefined, setWorkingMessage: () => undefined } } as unknown as Parameters<typeof __configureFallbackModelsForTests>[1],
+  );
+  const seen: string[] = [];
+  const delegate = (model: Model<Api>) => {
+    seen.push(model.id);
+    return seen.length === 1
+      ? streamFrom([startEvent(), errorEvent("TypeError: fetch failed retry-after 0.01")])
+      : streamFrom([startEvent(), doneEvent()]);
+  };
+  const events = await collect(streamWithLimitsRetry(delegate, primary, {} as Context, {} as SimpleStreamOptions));
+  ok("network error retries same model instead of switching to fallback", seen.join(",") === "primary,primary" && events.at(-1)?.type === "done", `seen=${seen.join(",")}, last=${events.at(-1)?.type}`);
+  ok("network warning is shown", notifications.some((message) => message.includes("network/timeout error") && message.includes("fetch failed")), `notifications=${notifications.join(";")}`);
+  __configureFallbackModelsForTests([]);
+}
+{
+  const primary = mockModel("primary");
+  const fallback = mockModel("fallback");
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response("temporary outage", { status: 503, statusText: "Service Unavailable" })) as typeof fetch;
+  const notifications: string[] = [];
+  __configureFallbackModelsForTests(
+    [{ model: fallback }],
+    { modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fallback-key", headers: {} }) }, ui: { notify: (message: string) => notifications.push(message), setStatus: () => undefined, setWorkingMessage: () => undefined } } as unknown as Parameters<typeof __configureFallbackModelsForTests>[1],
+  );
+  let calls = 0;
+  const delegate = async () => {
+    calls++;
+    if (calls === 1) {
+      await fetch("https://example.invalid/unavailable");
+      return streamFrom([startEvent(), errorEvent("TypeError: fetch failed retry-after 0.01")]);
+    }
+    return streamFrom([startEvent(), doneEvent()]);
+  };
+  const events = await collect(streamWithLimitsRetry(delegate, primary, {} as Context, {} as SimpleStreamOptions));
+  ok("warning includes observed HTTP status together with fetch error", events.at(-1)?.type === "done" && notifications.some((message) => message.includes("HTTP 503 Service Unavailable") && message.includes("fetch failed")), `notifications=${notifications.join(";")}`);
+  __configureFallbackModelsForTests([]);
+  globalThis.fetch = originalFetch;
+}
+{
   // An unclassified non-retryable error recovers if a later attempt succeeds,
   // within the bounded retry budget, without any fallback configured.
   let calls = 0;
