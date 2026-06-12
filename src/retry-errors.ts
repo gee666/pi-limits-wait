@@ -1,7 +1,7 @@
-import { DEFAULT_OVERLOADED_WAIT_MS, DEFAULT_RATE_LIMIT_WAIT_MS } from "./constants.js";
+import { DEFAULT_NETWORK_WAIT_MS, DEFAULT_OVERLOADED_WAIT_MS, DEFAULT_RATE_LIMIT_WAIT_MS } from "./constants.js";
 import type { RetryableError } from "./types.js";
 
-export function isRateLimitError(msg: string): boolean {
+function isExplicitRateLimitError(msg: string): boolean {
   const lower = msg.toLowerCase();
   return (
     /(?:^|\D)429(?:\D|$)/.test(msg) ||
@@ -9,7 +9,14 @@ export function isRateLimitError(msg: string): boolean {
     /rate\s*limit/.test(lower) ||
     lower.includes("too many requests") ||
     lower.includes("quota exceeded") ||
-    lower.includes("quota will reset") ||
+    lower.includes("quota will reset")
+  );
+}
+
+export function isRateLimitError(msg: string): boolean {
+  const lower = msg.toLowerCase();
+  return (
+    isExplicitRateLimitError(msg) ||
     lower.includes("retry delay") ||
     lower.includes("retry-after")
   );
@@ -21,6 +28,32 @@ export function isServerOverloadedError(msg: string): boolean {
     lower.includes("server_is_overloaded") ||
     lower.includes("server is overloaded") ||
     lower.includes("overloaded_error")
+  );
+}
+
+export function isTransientNetworkError(msg: string): boolean {
+  const lower = msg.toLowerCase();
+  return (
+    lower.includes("und_err_headers_timeout") ||
+    lower.includes("und_err_body_timeout") ||
+    lower.includes("und_err_connect_timeout") ||
+    lower.includes("und_err_socket") ||
+    lower.includes("headers timeout") ||
+    lower.includes("body timeout") ||
+    lower.includes("connect timeout") ||
+    lower.includes("fetch failed") ||
+    lower.includes("terminated") ||
+    lower.includes("socket hang up") ||
+    lower.includes("other side closed") ||
+    lower.includes("network_error") ||
+    lower.includes("network error") ||
+    lower.includes("econnreset") ||
+    lower.includes("econnrefused") ||
+    lower.includes("etimedout") ||
+    lower.includes("enetunreach") ||
+    lower.includes("ehostunreach") ||
+    lower.includes("eai_again") ||
+    lower.includes("enotfound")
   );
 }
 
@@ -106,8 +139,14 @@ export function getRetryableError(msg: string): RetryableError | undefined {
   if (isAuthenticationRefreshError(msg)) {
     return { reason: "authentication", waitMs: parseRetryDelayMs(msg) ?? DEFAULT_RATE_LIMIT_WAIT_MS };
   }
+  if (isTransientNetworkError(msg) && !isExplicitRateLimitError(msg)) {
+    return { reason: "network", waitMs: parseRetryDelayMs(msg) ?? DEFAULT_NETWORK_WAIT_MS };
+  }
   if (isRateLimitError(msg)) {
     return { reason: "rate-limit", waitMs: rateLimitWaitMs(msg) };
+  }
+  if (isTransientNetworkError(msg)) {
+    return { reason: "network", waitMs: parseRetryDelayMs(msg) ?? DEFAULT_NETWORK_WAIT_MS };
   }
   return undefined;
 }

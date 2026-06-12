@@ -12,14 +12,16 @@ import {
 } from "@mariozechner/pi-ai";
 import { installFetchRateLimitObserver } from "./fetch-observer.js";
 import {
+  candidateOrder,
   earliestCandidateDeadline,
+  errorMessageWithRecentHttpStatus,
   fallbackEnabled,
-  formatModel,
   getPrimaryModel,
   initialAttempt,
   isFallbackEligibleModel,
   modelKey,
   nextAvailableCandidate,
+  notifyRetryableError,
   optionsForModel,
   recentObservedRateLimitError,
   rememberNonRetryableFailure,
@@ -28,8 +30,13 @@ import {
 } from "./models.js";
 import { errorMessageWithCauses, getRetryableError, isAbortMessage } from "./retry-errors.js";
 import { state } from "./state.js";
-import type { FallbackModel, StreamSimpleFn } from "./types.js";
-import { clearAmbientRetryStatus, reasonLabel, waitForRetry } from "./ui.js";
+import type { FallbackModel, RetryableError, StreamSimpleFn } from "./types.js";
+import { clearAmbientRetryStatus, clearModelStatus, freezingEnabled, reasonLabel, waitForRetry } from "./ui.js";
+
+export function __setNonRetryableTuningForTests(maxAttempts: number, retryDelayMs: number): void {
+  state.nonRetryableMaxAttempts = maxAttempts;
+  state.nonRetryableRetryDelayMs = retryDelayMs;
+}
 
 export function __configureFallbackModelsForTests(
   models: FallbackModel[],
@@ -41,8 +48,9 @@ export function __configureFallbackModelsForTests(
   state.primaryThinkingLevel = undefined;
   state.rateLimitMemory.clear();
   state.nonRetryableFailureMemory.clear();
-  state.lastObservedRateLimitError = undefined;
+  state.lastObservedHttpError = undefined;
   state.ambientStatusCleanup?.();
+  clearModelStatus();
 }
 
 function freshMessage(model: Model<Api>): AssistantMessage {
@@ -70,14 +78,6 @@ function isAbortErrorEvent(event: AssistantMessageEvent, signal?: AbortSignal): 
   return reason === "aborted" || stopReason === "aborted" || isAbortMessage(message);
 }
 
-/**
- * Wrap a streamSimple with an indefinite retry loop for rate limits and
- * server_is_overloaded errors.
- *
- * Provider events are forwarded unchanged once an attempt is known to be
- * non-retryable. Potential retryable attempts are buffered and discarded, so Pi
- * never sees failed partial output.
- */
 export function streamWithLimitsRetry(
   delegate: StreamSimpleFn,
   model: Model<Api>,
@@ -90,10 +90,24 @@ export function streamWithLimitsRetry(
     let committed = false;
     const allowFallback = fallbackEnabled() && isFallbackEligibleModel(model);
     let attempt: FallbackModel = allowFallback ? initialAttempt(model) : { model, reasoningEffort: state.primaryThinkingLevel };
+    const nonRetryableAttempts = new Map<string, number>();
+    const triedModels = new Set<string>();
 
     const flush = (buffer: AssistantMessageEvent[]) => {
       for (const event of buffer) output.push(event);
       committed = true;
+    };
+
+    const pushAbort = (message: string) => {
+      if (!committed) {
+        output.push({ type: "start", partial: freshMessage(attempt.model) });
+        committed = true;
+      }
+      const error = freshMessage(attempt.model);
+      error.stopReason = "aborted";
+      error.errorMessage = message;
+      output.push({ type: "error", reason: "aborted", error });
+      output.end();
     };
 
     while (true) {
@@ -101,7 +115,7 @@ export function streamWithLimitsRetry(
       if (allowFallback) state.activeFallbackProviderRequests++;
       installFetchRateLimitObserver();
       const buffer: AssistantMessageEvent[] = [];
-      let retryable: ReturnType<typeof getRetryableError>;
+      let retryable: RetryableError | undefined;
       let retryableErrorMessage = "";
       let nonRetryableError: { message: string; event?: AssistantMessageEvent } | undefined;
 
@@ -119,7 +133,8 @@ export function streamWithLimitsRetry(
           for await (const event of inner) {
             if (!committed) {
               if (event.type === "error") {
-                const errMsg = event.error.errorMessage ?? "";
+                const rawErrMsg = event.error.errorMessage ?? "";
+                const errMsg = errorMessageWithRecentHttpStatus(rawErrMsg);
 
                 if (isAbortErrorEvent(event, options?.signal)) {
                   if (buffer.length > 0) {
@@ -148,20 +163,8 @@ export function streamWithLimitsRetry(
                   break;
                 }
 
-                if (allowFallback) {
-                  nonRetryableError = { message: errMsg, event };
-                  break;
-                }
-
-                if (buffer.length > 0) {
-                  flush(buffer);
-                } else {
-                  output.push({ type: "start", partial: freshMessage(attempt.model) });
-                  committed = true;
-                }
-                output.push(event);
-                output.end();
-                return;
+                nonRetryableError = { message: errMsg, event };
+                break;
               }
 
               if (event.type === "start") {
@@ -191,7 +194,7 @@ export function streamWithLimitsRetry(
             }
           }
         } catch (err) {
-          const errMsg = errorMessageWithCauses(err);
+          const errMsg = errorMessageWithRecentHttpStatus(errorMessageWithCauses(err));
           const aborted = Boolean(options?.signal?.aborted) || isAbortMessage(errMsg);
           retryable = !aborted ? getRetryableError(errMsg) : undefined;
           if (retryable) retryableErrorMessage = errMsg;
@@ -201,24 +204,11 @@ export function streamWithLimitsRetry(
             if (retryable && observedRateLimit) retryableErrorMessage = observedRateLimit;
           }
           if (!retryable) {
-            if (allowFallback && !aborted) {
-              nonRetryableError = { message: errMsg };
-            } else {
-              if (!committed) {
-                output.push({ type: "start", partial: freshMessage(attempt.model) });
-                committed = true;
-              }
-              const error = freshMessage(attempt.model);
-              error.stopReason = aborted ? "aborted" : "error";
-              error.errorMessage = errMsg;
-              output.push({
-                type: "error",
-                reason: error.stopReason as "error" | "aborted",
-                error,
-              });
-              output.end();
+            if (aborted) {
+              pushAbort(errMsg);
               return;
             }
+            nonRetryableError = { message: errMsg };
           }
         }
       } finally {
@@ -230,72 +220,88 @@ export function streamWithLimitsRetry(
         }
       }
 
-      if (nonRetryableError) {
-        if (allowFallback && !committed) {
-          rememberNonRetryableFailure(attempt.model, nonRetryableError.message);
-          const next = nextAvailableCandidate(attempt.model);
-          if (next) {
-            attempt = next;
+      if (!retryable) {
+        const failureEvent = nonRetryableError?.event;
+        const failureMessage = nonRetryableError?.message ?? "Provider stream ended without a terminal event.";
+
+        const emitFailure = () => {
+          if (!committed) {
+            if (buffer.length > 0) {
+              flush(buffer);
+            } else {
+              output.push({ type: "start", partial: freshMessage(attempt.model) });
+              committed = true;
+            }
+          }
+          if (failureEvent) {
+            output.push(failureEvent);
+          } else {
+            const error = freshMessage(attempt.model);
+            error.stopReason = "error";
+            error.errorMessage = failureMessage;
+            output.push({ type: "error", reason: "error", error });
+          }
+          output.end();
+        };
+
+        if (!committed) {
+          const key = modelKey(attempt.model);
+          const attempts = (nonRetryableAttempts.get(key) ?? 0) + 1;
+          nonRetryableAttempts.set(key, attempts);
+
+          if (attempts < state.nonRetryableMaxAttempts) {
+            const waitResult = await waitForRetry("retry", state.nonRetryableRetryDelayMs, options?.signal);
+            if (waitResult === "aborted") {
+              pushAbort("Request aborted while retrying after error.");
+              return;
+            }
             continue;
           }
 
-          const deadline = earliestCandidateDeadline(attempt.model);
-          if (deadline) {
-            const waitResult = await waitForRetry("model-frozen", Math.max(0, deadline - Date.now()), options?.signal);
-            if (waitResult !== "aborted") {
-              attempt = nextAvailableCandidate(attempt.model) ?? { model: getPrimaryModel(attempt.model), reasoningEffort: state.primaryThinkingLevel };
-              continue;
+          triedModels.add(key);
+
+          if (allowFallback) {
+            if (freezingEnabled()) {
+              rememberNonRetryableFailure(attempt.model, failureMessage);
+              const next = nextAvailableCandidate(attempt.model);
+              if (next) {
+                attempt = next;
+                continue;
+              }
+
+              const deadline = earliestCandidateDeadline(attempt.model);
+              if (deadline) {
+                const waitResult = await waitForRetry("model-frozen", Math.max(0, deadline - Date.now()), options?.signal);
+                if (waitResult !== "aborted") {
+                  attempt = nextAvailableCandidate(attempt.model) ?? { model: getPrimaryModel(attempt.model), reasoningEffort: state.primaryThinkingLevel };
+                  continue;
+                }
+              }
+            } else {
+              const next = candidateOrder(attempt.model).find((entry) => !triedModels.has(modelKey(entry.model)));
+              if (next) {
+                attempt = next;
+                continue;
+              }
             }
           }
         }
 
-        if (!committed) {
-          if (buffer.length > 0) {
-            flush(buffer);
-          } else {
-            output.push({ type: "start", partial: freshMessage(attempt.model) });
-            committed = true;
-          }
-        }
-        if (nonRetryableError.event) {
-          output.push(nonRetryableError.event);
-        } else {
-          const error = freshMessage(attempt.model);
-          error.stopReason = "error";
-          error.errorMessage = nonRetryableError.message;
-          output.push({ type: "error", reason: "error", error });
-        }
-        output.end();
-        return;
-      }
-
-      if (!retryable) {
-        if (allowFallback && !committed) {
-          const message = "Provider stream ended without a terminal event.";
-          rememberNonRetryableFailure(attempt.model, message);
-          const next = nextAvailableCandidate(attempt.model);
-          if (next) {
-            attempt = next;
-            continue;
-          }
-        }
-        if (!committed) {
-          if (buffer.length > 0) {
-            flush(buffer);
-          } else {
-            output.push({ type: "start", partial: freshMessage(attempt.model) });
-            committed = true;
-          }
-        }
-        const error = freshMessage(attempt.model);
-        error.stopReason = "error";
-        error.errorMessage = "Provider stream ended without a terminal event.";
-        output.push({ type: "error", reason: "error", error });
-        output.end();
+        emitFailure();
         return;
       }
 
       if (allowFallback) {
+        if (retryable.reason === "network") {
+          notifyRetryableError(attempt.model, retryable, retryableErrorMessage);
+          const waitResult = await waitForRetry(retryable.reason, retryable.waitMs, options?.signal);
+          if (waitResult === "aborted") {
+            pushAbort(`Request aborted during ${reasonLabel(retryable.reason).toLowerCase()} wait.`);
+            return;
+          }
+          continue;
+        }
+
         rememberRateLimit(attempt.model, retryable, retryableErrorMessage);
         const next = nextAvailableCandidate(attempt.model);
         if (next) {
@@ -307,15 +313,7 @@ export function streamWithLimitsRetry(
         const waitMs = deadline ? Math.max(0, deadline - Date.now()) : retryable.waitMs;
         const waitResult = await waitForRetry(retryable.reason, waitMs, options?.signal);
         if (waitResult === "aborted") {
-          if (!committed) {
-            output.push({ type: "start", partial: freshMessage(attempt.model) });
-            committed = true;
-          }
-          const error = freshMessage(attempt.model);
-          error.stopReason = "aborted";
-          error.errorMessage = `Request aborted during ${reasonLabel(retryable.reason).toLowerCase()} wait.`;
-          output.push({ type: "error", reason: "aborted", error });
-          output.end();
+          pushAbort(`Request aborted during ${reasonLabel(retryable.reason).toLowerCase()} wait.`);
           return;
         }
         attempt = nextAvailableCandidate(attempt.model) ?? { model: getPrimaryModel(attempt.model), reasoningEffort: state.primaryThinkingLevel };
@@ -324,15 +322,7 @@ export function streamWithLimitsRetry(
 
       const waitResult = await waitForRetry(retryable.reason, retryable.waitMs, options?.signal);
       if (waitResult === "aborted") {
-        if (!committed) {
-          output.push({ type: "start", partial: freshMessage(attempt.model) });
-          committed = true;
-        }
-        const error = freshMessage(attempt.model);
-        error.stopReason = "aborted";
-        error.errorMessage = `Request aborted during ${reasonLabel(retryable.reason).toLowerCase()} wait.`;
-        output.push({ type: "error", reason: "aborted", error });
-        output.end();
+        pushAbort(`Request aborted during ${reasonLabel(retryable.reason).toLowerCase()} wait.`);
         return;
       }
     }

@@ -1,6 +1,9 @@
-import { SettingsManager, type ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { existsSync, readFileSync } from "fs";
+import { homedir } from "os";
+import { join, resolve } from "path";
+import { getAgentDir, type ExtensionContext } from "@mariozechner/pi-coding-agent";
 import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
-import { SETTINGS_KEY } from "./constants.js";
+import { FALLBACK_MODELS_KEY, SETTINGS_FILE_NAME } from "./constants.js";
 import { formatModel, modelKey } from "./models.js";
 import { state } from "./state.js";
 import type { ConfiguredModel } from "./types.js";
@@ -10,8 +13,8 @@ function isThinkingLevel(value: unknown): value is ThinkingLevel {
 }
 
 export function parseConfiguredModels(raw: unknown): ConfiguredModel[] {
-  const source = raw && typeof raw === "object" && Array.isArray((raw as { try_models?: unknown }).try_models)
-    ? (raw as { try_models: unknown[] }).try_models
+  const source = raw && typeof raw === "object" && Array.isArray((raw as { [FALLBACK_MODELS_KEY]?: unknown })[FALLBACK_MODELS_KEY])
+    ? (raw as { [FALLBACK_MODELS_KEY]: unknown[] })[FALLBACK_MODELS_KEY]
     : [];
 
   const models: ConfiguredModel[] = [];
@@ -26,46 +29,82 @@ export function parseConfiguredModels(raw: unknown): ConfiguredModel[] {
       : "";
     const reasoning = record["reasoning effort"] ?? record.reasoningEffort ?? record.reasoning_effort;
     if (!provider || !modelname) continue;
-    models.push({
-      provider,
-      modelname,
-      reasoningEffort: isThinkingLevel(reasoning) ? reasoning : undefined,
-    });
+    models.push({ provider, modelname, reasoningEffort: isThinkingLevel(reasoning) ? reasoning : undefined });
   }
   return models;
+}
+
+export function configFileCandidates(cwd: string, agentDir = getAgentDir(), homeDir = homedir()): string[] {
+  return [
+    join(homeDir, ".config", ".pi", SETTINGS_FILE_NAME),
+    join(agentDir, SETTINGS_FILE_NAME),
+    resolve(cwd, `.${SETTINGS_FILE_NAME}`),
+    resolve(cwd, ".pi", SETTINGS_FILE_NAME),
+  ];
+}
+
+function mergeConfig(base: Record<string, unknown>, override: Record<string, unknown>): Record<string, unknown> {
+  return { ...base, ...override };
+}
+
+export function readFallbackSettings(cwd: string, agentDir = getAgentDir(), homeDir = homedir()): { config: Record<string, unknown>; loadedPaths: string[]; warnings: string[] } {
+  let config: Record<string, unknown> = {};
+  const loadedPaths: string[] = [];
+  const warnings: string[] = [];
+  const seen = new Set<string>();
+
+  for (const candidate of configFileCandidates(cwd, agentDir, homeDir)) {
+    const path = resolve(candidate);
+    if (seen.has(path)) continue;
+    seen.add(path);
+    if (!existsSync(path)) continue;
+
+    try {
+      const parsed = JSON.parse(readFileSync(path, "utf-8")) as unknown;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        warnings.push(`${path}: expected a JSON object`);
+        continue;
+      }
+      config = mergeConfig(config, parsed as Record<string, unknown>);
+      loadedPaths.push(path);
+    } catch (err) {
+      warnings.push(`${path}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  return { config, loadedPaths, warnings };
+}
+
+export function __readFallbackSettingsForTests(cwd: string, agentDir: string, homeDir: string): { config: Record<string, unknown>; loadedPaths: string[]; warnings: string[] } {
+  return readFallbackSettings(cwd, agentDir, homeDir);
 }
 
 export function loadFallbackSettings(ctx: ExtensionContext): void {
   state.fallbackModels = [];
 
   try {
-    const settingsManager = SettingsManager.create(ctx.cwd);
-    const globalSettings = settingsManager.getGlobalSettings() as Record<string, unknown>;
-    const projectSettings = settingsManager.getProjectSettings() as Record<string, unknown>;
-    const globalConfig = globalSettings[SETTINGS_KEY];
-    const projectConfig = projectSettings[SETTINGS_KEY];
-    const config = {
-      ...(globalConfig && typeof globalConfig === "object" && !Array.isArray(globalConfig) ? globalConfig : {}),
-      ...(projectConfig && typeof projectConfig === "object" && !Array.isArray(projectConfig) ? projectConfig : {}),
-    };
-    const content = JSON.stringify(config);
+    const { config, loadedPaths, warnings } = readFallbackSettings(ctx.cwd);
+    const content = JSON.stringify({ config, loadedPaths, warnings });
     const shouldNotify = state.settingsSignature !== content;
     state.settingsSignature = content;
 
     const configured = parseConfiguredModels(config);
-    if (configured.length === 0) return;
+    if (configured.length === 0) {
+      if (shouldNotify && warnings.length > 0) ctx.ui.notify(`Could not fully load ${SETTINGS_FILE_NAME}: ${warnings.join(", ")}`, "warning");
+      return;
+    }
 
-    const warnings: string[] = [];
+    const modelWarnings: string[] = [];
     const seen = new Set<string>();
 
     for (const entry of configured) {
       const model = ctx.modelRegistry.find(entry.provider, entry.modelname);
       if (!model) {
-        warnings.push(`missing ${entry.provider}/${entry.modelname}`);
+        modelWarnings.push(`missing ${entry.provider}/${entry.modelname}`);
         continue;
       }
       if (!ctx.modelRegistry.hasConfiguredAuth(model)) {
-        warnings.push(`no auth ${entry.provider}/${entry.modelname}`);
+        modelWarnings.push(`no auth ${entry.provider}/${entry.modelname}`);
         continue;
       }
       const key = modelKey(model);
@@ -77,13 +116,15 @@ export function loadFallbackSettings(ctx: ExtensionContext): void {
     const lines = state.fallbackModels.map((entry, index) =>
       `${index + 1}. ${formatModel(entry.model)}${entry.reasoningEffort ? ` (${entry.reasoningEffort})` : ""}`,
     );
+    const source = loadedPaths.length > 0 ? ` from ${loadedPaths.join(", ")}` : "";
     const message = lines.length > 0
-      ? `Loaded ${SETTINGS_KEY}.try_models:\n${lines.join("\n")}`
-      : `Loaded ${SETTINGS_KEY}.try_models, but no usable fallback models were found.`;
+      ? `Loaded ${SETTINGS_FILE_NAME}.${FALLBACK_MODELS_KEY}${source}:\n${lines.join("\n")}`
+      : `Loaded ${SETTINGS_FILE_NAME}.${FALLBACK_MODELS_KEY}${source}, but no usable fallback models were found.`;
+    const allWarnings = [...warnings, ...modelWarnings];
     if (shouldNotify) {
-      ctx.ui.notify(warnings.length > 0 ? `${message}\nSkipped: ${warnings.join(", ")}` : message, warnings.length > 0 ? "warning" : "info");
+      ctx.ui.notify(allWarnings.length > 0 ? `${message}\nSkipped: ${allWarnings.join(", ")}` : message, allWarnings.length > 0 ? "warning" : "info");
     }
   } catch (err) {
-    ctx.ui.notify(`Could not load ${SETTINGS_KEY}.try_models: ${err instanceof Error ? err.message : String(err)}`, "warning");
+    ctx.ui.notify(`Could not load ${SETTINGS_FILE_NAME}.${FALLBACK_MODELS_KEY}: ${err instanceof Error ? err.message : String(err)}`, "warning");
   }
 }

@@ -24,13 +24,15 @@ export function installFetchRateLimitObserver(): void {
     const response = await originalFetch(...args);
 
     if (state.activeProviderRequests > 0) {
-      if (response.status === 429) {
-        const waitMs = retryAfterHeaderMs(response.headers) ?? DEFAULT_RATE_LIMIT_WAIT_MS;
+      if (!response.ok) {
         const message = await responseErrorMessage(response);
-        state.lastObservedRateLimitError = { at: Date.now(), message };
-        showAmbientRetryStatus("rate-limit", waitMs);
-        if (state.activeFallbackProviderRequests > 0) {
-          throw new Error(message);
+        state.lastObservedHttpError = { at: Date.now(), message };
+        if (response.status === 429) {
+          const waitMs = retryAfterHeaderMs(response.headers) ?? DEFAULT_RATE_LIMIT_WAIT_MS;
+          showAmbientRetryStatus("rate-limit", waitMs);
+          if (state.activeFallbackProviderRequests > 0) {
+            throw new Error(message);
+          }
         }
       } else if (state.ambientStatusCleanup && response.ok) {
         clearAmbientRetryStatus();

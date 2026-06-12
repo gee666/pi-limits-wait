@@ -2,7 +2,7 @@ import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
 import type { Api, AssistantMessageEventStream, Context, Model, SimpleStreamOptions } from "@mariozechner/pi-ai";
 
-export type RetryReason = "rate-limit" | "overloaded" | "authentication" | "model-frozen";
+export type RetryReason = "rate-limit" | "overloaded" | "authentication" | "model-frozen" | "network" | "retry";
 
 export type RetryableError = {
   reason: RetryReason;

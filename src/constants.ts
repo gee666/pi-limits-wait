@@ -12,5 +12,12 @@ export const PI_IDENTITY_SENTENCE_PATTERN =
 
 export const DEFAULT_RATE_LIMIT_WAIT_MS = 30 * 60 * 1_000; // 30 minutes
 export const DEFAULT_OVERLOADED_WAIT_MS = 5 * 60 * 1_000; // 5 minutes
-export const DEFAULT_NON_RETRYABLE_FREEZE_MS = 60 * 60 * 1_000; // 1 hour
-export const SETTINGS_KEY = "oira666_pi-limits-wait";
+export const DEFAULT_NETWORK_WAIT_MS = 15 * 1_000; // 15 seconds
+export const DEFAULT_NON_RETRYABLE_FREEZE_MS = 10 * 60 * 1_000; // 10 minutes
+
+export const NON_RETRYABLE_MAX_ATTEMPTS = 3;
+export const NON_RETRYABLE_RETRY_DELAY_MS = 5 * 1_000; // 5 seconds
+
+export const SETTINGS_FILE_NAME = "limits-wait.json";
+export const FALLBACK_MODELS_KEY = "fallback-models";
+export const FREEZING_ENV_VAR = "PI_LIMITS_WAIT_FREEZING_ENABLED";

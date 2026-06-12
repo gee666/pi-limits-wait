@@ -1,3 +1,4 @@
+import { FREEZING_ENV_VAR } from "./constants.js";
 import { state } from "./state.js";
 import type { RetryReason } from "./types.js";
 
@@ -19,10 +20,19 @@ export function reasonLabel(reason: RetryReason): string {
   if (reason === "overloaded") return "Server overloaded";
   if (reason === "authentication") return "Authentication refresh pending";
   if (reason === "model-frozen") return "Model frozen after error";
+  if (reason === "network") return "Network/timeout error";
+  if (reason === "retry") return "Retrying after error";
   return "Rate limited";
 }
 
-function statusText(reason: RetryReason, deadline: number, allowSkip: boolean): string {
+export function freezingEnabled(): boolean {
+  const raw = process.env[FREEZING_ENV_VAR];
+  if (raw === undefined) return true;
+  const value = raw.trim().toLowerCase();
+  return !(value === "false" || value === "0" || value === "no" || value === "off");
+}
+
+function countdownText(reason: RetryReason, deadline: number, allowSkip: boolean): string {
   const remaining = Math.max(0, deadline - Date.now());
   const totalSecs = Math.ceil(remaining / 1_000);
   const mins = Math.floor(totalSecs / 60);
@@ -46,7 +56,7 @@ export function showAmbientRetryStatus(reason: RetryReason, waitMs: number): voi
       state.ambientStatusCleanup?.();
       return;
     }
-    ctx.ui.setWorkingMessage(statusText(reason, deadline, false));
+    ctx.ui.setWorkingMessage(countdownText(reason, deadline, false));
   };
 
   tick();
@@ -60,6 +70,10 @@ export function showAmbientRetryStatus(reason: RetryReason, waitMs: number): voi
 
 export function clearAmbientRetryStatus(): void {
   state.ambientStatusCleanup?.();
+}
+
+export function clearModelStatus(): void {
+  state.modelStatusCleanup?.();
 }
 
 export function waitForRetry(
@@ -98,7 +112,7 @@ export function waitForRetry(
     signal?.addEventListener("abort", onAbort);
 
     const tick = () => {
-      ctx?.ui.setWorkingMessage(statusText(reason, deadline, Boolean(unsubInput)));
+      ctx?.ui.setWorkingMessage(countdownText(reason, deadline, Boolean(unsubInput)));
     };
 
     tick();
@@ -106,10 +120,12 @@ export function waitForRetry(
       if (Date.now() >= deadline) { cleanup(); resolve("waited"); return; }
       tick();
     }, 1_000);
+    const timer = setTimeout(() => { if (!done) { cleanup(); resolve("waited"); } }, Math.max(0, deadline - Date.now()));
 
     function cleanup() {
       done = true;
       clearInterval(ticker);
+      clearTimeout(timer);
       signal?.removeEventListener("abort", onAbort);
       unsubInput?.();
       ctx?.ui.setWorkingMessage();

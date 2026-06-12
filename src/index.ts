@@ -12,16 +12,23 @@ export {
   isAuthenticationRefreshError,
   isRateLimitError,
   isServerOverloadedError,
+  isTransientNetworkError,
   parseRetryDelayMs,
   rateLimitWaitMs,
   retryAfterHeaderMs,
 } from "./retry-errors.js";
 export {
+  __readFallbackSettingsForTests,
+  configFileCandidates,
+  readFallbackSettings,
+} from "./settings.js";
+export {
   __configureFallbackModelsForTests,
+  __setNonRetryableTuningForTests,
   streamWithLimitsRetry,
   streamWithRateLimitRetry,
 } from "./stream.js";
-export { waitForRateLimit, waitForRetry } from "./ui.js";
+export { freezingEnabled, waitForRateLimit, waitForRetry } from "./ui.js";
 export type { FallbackModel } from "./types.js";
 
 export default function (pi: ExtensionAPI) {

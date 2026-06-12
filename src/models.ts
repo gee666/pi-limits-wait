@@ -1,5 +1,6 @@
 import type { Api, Model, SimpleStreamOptions } from "@mariozechner/pi-ai";
 import { DEFAULT_NON_RETRYABLE_FREEZE_MS } from "./constants.js";
+import { isRateLimitError } from "./retry-errors.js";
 import { state } from "./state.js";
 import type { FallbackModel, RetryableError } from "./types.js";
 import { formatErrorDetail, formatDuration, reasonLabel } from "./ui.js";
@@ -55,22 +56,21 @@ export function activeLimit(model: Model<Api>) {
   return entry;
 }
 
-export function pruneExpiredLimitMemory(): void {
-  const now = Date.now();
-  for (const [key, entry] of state.rateLimitMemory) {
-    if (now >= entry.deadline) state.rateLimitMemory.delete(key);
-  }
-  for (const [key, entry] of state.nonRetryableFailureMemory) {
-    if (now >= entry.deadline) state.nonRetryableFailureMemory.delete(key);
-  }
+export function ensureRateLimitedModelsStatus(): void {
+  // Intentionally no-op: limited/frozen model information is communicated via
+  // chat notifications only. Do not render persistent TUI status lines.
+}
+
+export function notifyRetryableError(model: Model<Api>, retryable: RetryableError, errorMessage?: string): void {
+  const detail = errorMessage ? ` Error: ${formatErrorDetail(errorMessage)}` : "";
+  state.sharedCtx?.ui.notify(`${formatModel(model)} ${reasonLabel(retryable.reason).toLowerCase()} for ${formatDuration(retryable.waitMs)}.${detail}`, "warning");
 }
 
 export function rememberRateLimit(model: Model<Api>, retryable: RetryableError, errorMessage?: string): void {
   const deadline = Date.now() + retryable.waitMs;
   state.rateLimitMemory.set(modelKey(model), { reason: retryable.reason, limitedAt: Date.now(), deadline });
-  const detail = errorMessage ? ` Error: ${formatErrorDetail(errorMessage)}` : "";
-  state.sharedCtx?.ui.notify(`${formatModel(model)} ${reasonLabel(retryable.reason).toLowerCase()} for ${formatDuration(retryable.waitMs)}.${detail}`, "warning");
-  pruneExpiredLimitMemory();
+  notifyRetryableError(model, retryable, errorMessage);
+  ensureRateLimitedModelsStatus();
 }
 
 export function activeNonRetryableFailure(model: Model<Api>) {
@@ -95,13 +95,24 @@ export function rememberNonRetryableFailure(model: Model<Api>, errorMessage: str
   const deadline = Date.now() + DEFAULT_NON_RETRYABLE_FREEZE_MS;
   state.nonRetryableFailureMemory.set(modelKey(model), { failedAt: Date.now(), deadline, errorMessage });
   state.sharedCtx?.ui.notify(`${formatModel(model)} failed (${formatErrorDetail(errorMessage)}); freezing it for ${formatDuration(DEFAULT_NON_RETRYABLE_FREEZE_MS)} and trying another configured model if available.`, "warning");
-  pruneExpiredLimitMemory();
+  ensureRateLimitedModelsStatus();
+}
+
+export function recentObservedHttpError(maxAgeMs = 60_000): string | undefined {
+  if (!state.lastObservedHttpError) return undefined;
+  if (Date.now() - state.lastObservedHttpError.at > maxAgeMs) return undefined;
+  return state.lastObservedHttpError.message;
 }
 
 export function recentObservedRateLimitError(maxAgeMs = 60_000): string | undefined {
-  if (!state.lastObservedRateLimitError) return undefined;
-  if (Date.now() - state.lastObservedRateLimitError.at > maxAgeMs) return undefined;
-  return state.lastObservedRateLimitError.message;
+  const message = recentObservedHttpError(maxAgeMs);
+  return message && isRateLimitError(message) ? message : undefined;
+}
+
+export function errorMessageWithRecentHttpStatus(errorMessage: string): string {
+  const observed = recentObservedHttpError();
+  if (!observed || /(?:^|\D)[1-5]\d\d(?:\D|$)/.test(errorMessage) || errorMessage.includes(observed)) return errorMessage;
+  return `${observed}; Error: ${errorMessage}`;
 }
 
 export function earliestCandidateDeadline(current: Model<Api>): number | undefined {
