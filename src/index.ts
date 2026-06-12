@@ -31,10 +31,6 @@ const DEFAULT_OVERLOADED_WAIT_MS = 5 * 60 * 1_000; // 5 minutes
 const DEFAULT_NON_RETRYABLE_FREEZE_MS = 60 * 60 * 1_000; // 1 hour
 const SETTINGS_KEY = "oira666_pi-limits-wait";
 
-/** Key used with ctx.ui.setStatus() for the countdown line. */
-const STATUS_KEY = "limits-wait";
-const MODELS_STATUS_KEY = "limits-wait-models";
-
 type RetryReason = "rate-limit" | "overloaded" | "authentication" | "model-frozen";
 
 type RetryableError = {
@@ -71,7 +67,6 @@ let sharedCtx: ExtensionContext | undefined;
 let extensionApi: ExtensionAPI | undefined;
 let restoreFetch: (() => void) | undefined;
 let ambientStatusCleanup: (() => void) | undefined;
-let modelStatusCleanup: (() => void) | undefined;
 let activeProviderRequests = 0;
 let activeFallbackProviderRequests = 0;
 let lastObservedRateLimitError: { at: number; message: string } | undefined;
@@ -255,49 +250,14 @@ function formatDuration(ms: number): string {
   return hours > 0 ? `${hours}h ${mins}m ${secs}s` : `${mins}m ${secs}s`;
 }
 
-function updateRateLimitedModelsStatus(): void {
-  const ctx = sharedCtx;
-  if (!ctx) return;
-  try {
-    const now = Date.now();
-    const lines: string[] = [];
-    for (const [key, entry] of rateLimitMemory) {
-      if (now >= entry.deadline) {
-        rateLimitMemory.delete(key);
-        continue;
-      }
-      lines.push(`${key}: ${formatDuration(entry.deadline - now)}`);
-    }
-    for (const [key, entry] of nonRetryableFailureMemory) {
-      if (now >= entry.deadline) {
-        nonRetryableFailureMemory.delete(key);
-        continue;
-      }
-      lines.push(`${key}: frozen ${formatDuration(entry.deadline - now)}`);
-    }
-    if (lines.length === 0) {
-      modelStatusCleanup?.();
-      return;
-    }
-    ctx.ui.setStatus(MODELS_STATUS_KEY, `🚦 Limited: ${lines.join(" | ")}`);
-  } catch {
-    modelStatusCleanup?.();
+function pruneExpiredLimitMemory(): void {
+  const now = Date.now();
+  for (const [key, entry] of rateLimitMemory) {
+    if (now >= entry.deadline) rateLimitMemory.delete(key);
   }
-}
-
-function ensureRateLimitedModelsStatus(): void {
-  if (modelStatusCleanup) return;
-  updateRateLimitedModelsStatus();
-  const ticker = setInterval(updateRateLimitedModelsStatus, 1_000);
-  modelStatusCleanup = () => {
-    clearInterval(ticker);
-    modelStatusCleanup = undefined;
-    try {
-      sharedCtx?.ui.setStatus(MODELS_STATUS_KEY, undefined);
-    } catch {
-      // The extension context can become stale after print-mode session teardown.
-    }
-  };
+  for (const [key, entry] of nonRetryableFailureMemory) {
+    if (now >= entry.deadline) nonRetryableFailureMemory.delete(key);
+  }
 }
 
 function rememberRateLimit(model: Model<Api>, retryable: RetryableError, errorMessage?: string): void {
@@ -305,7 +265,7 @@ function rememberRateLimit(model: Model<Api>, retryable: RetryableError, errorMe
   rateLimitMemory.set(modelKey(model), { reason: retryable.reason, limitedAt: Date.now(), deadline });
   const detail = errorMessage ? ` Error: ${formatErrorDetail(errorMessage)}` : "";
   sharedCtx?.ui.notify(`${formatModel(model)} ${reasonLabel(retryable.reason).toLowerCase()} for ${formatDuration(retryable.waitMs)}.${detail}`, "warning");
-  ensureRateLimitedModelsStatus();
+  pruneExpiredLimitMemory();
 }
 
 function activeNonRetryableFailure(model: Model<Api>): NonRetryableFailureMemory | undefined {
@@ -336,7 +296,7 @@ function rememberNonRetryableFailure(model: Model<Api>, errorMessage: string): v
   const deadline = Date.now() + DEFAULT_NON_RETRYABLE_FREEZE_MS;
   nonRetryableFailureMemory.set(modelKey(model), { failedAt: Date.now(), deadline, errorMessage });
   sharedCtx?.ui.notify(`${formatModel(model)} failed (${formatErrorDetail(errorMessage)}); freezing it for ${formatDuration(DEFAULT_NON_RETRYABLE_FREEZE_MS)} and trying another configured model if available.`, "warning");
-  ensureRateLimitedModelsStatus();
+  pruneExpiredLimitMemory();
 }
 
 function errorMessageWithCauses(err: unknown): string {
@@ -581,7 +541,6 @@ function showAmbientRetryStatus(reason: RetryReason, waitMs: number): void {
       return;
     }
     const text = statusText(reason, deadline, false);
-    ctx.ui.setStatus(STATUS_KEY, text);
     ctx.ui.setWorkingMessage(text);
   };
 
@@ -590,7 +549,6 @@ function showAmbientRetryStatus(reason: RetryReason, waitMs: number): void {
   ambientStatusCleanup = () => {
     clearInterval(ticker);
     ambientStatusCleanup = undefined;
-    ctx.ui.setStatus(STATUS_KEY, undefined);
     ctx.ui.setWorkingMessage();
   };
 }
@@ -641,7 +599,6 @@ export function waitForRetry(
 
     const tick = () => {
       const text = statusText(reason, deadline, Boolean(unsubInput));
-      ctx?.ui.setStatus(STATUS_KEY, text);
       ctx?.ui.setWorkingMessage(text);
     };
 
@@ -656,7 +613,6 @@ export function waitForRetry(
       clearInterval(ticker);
       signal?.removeEventListener("abort", onAbort);
       unsubInput?.();
-      ctx?.ui.setStatus(STATUS_KEY, undefined);
       ctx?.ui.setWorkingMessage(); // restore default "Working..."
       clearAmbientRetryStatus();
     }
@@ -735,7 +691,6 @@ export function __configureFallbackModelsForTests(
   nonRetryableFailureMemory.clear();
   lastObservedRateLimitError = undefined;
   ambientStatusCleanup?.();
-  modelStatusCleanup?.();
 }
 
 function freshMessage(model: Model<Api>): AssistantMessage {

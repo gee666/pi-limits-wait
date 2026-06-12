@@ -146,7 +146,7 @@ section("streamWithLimitsRetry");
   const notifications: string[] = [];
   __configureFallbackModelsForTests(
     [{ model: fallback }],
-    { modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fallback-key", headers: {} }) }, ui: { notify: (message: string) => notifications.push(message), setStatus: () => undefined } } as unknown as Parameters<typeof __configureFallbackModelsForTests>[1],
+    { modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fallback-key", headers: {} }) }, ui: { notify: (message: string) => notifications.push(message) } } as unknown as Parameters<typeof __configureFallbackModelsForTests>[1],
   );
   const delegate = (model: Model<Api>) => {
     seen.push(model.id);
@@ -164,7 +164,7 @@ section("streamWithLimitsRetry");
   const fallback = mockModel("fallback");
   __configureFallbackModelsForTests(
     [{ model: fallback }],
-    { modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fallback-key", headers: {} }) }, ui: { notify: () => undefined, setStatus: () => undefined } } as unknown as Parameters<typeof __configureFallbackModelsForTests>[1],
+    { modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fallback-key", headers: {} }) }, ui: { notify: () => undefined } } as unknown as Parameters<typeof __configureFallbackModelsForTests>[1],
   );
   const seen: string[] = [];
   const delegate = (model: Model<Api>) => {
@@ -187,7 +187,7 @@ section("streamWithLimitsRetry");
   }) as typeof fetch;
   __configureFallbackModelsForTests(
     [{ model: fallback }],
-    { modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fallback-key", headers: {} }) }, ui: { notify: () => undefined, setStatus: () => undefined, setWorkingMessage: () => undefined } } as unknown as Parameters<typeof __configureFallbackModelsForTests>[1],
+    { modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fallback-key", headers: {} }) }, ui: { notify: () => undefined, setWorkingMessage: () => undefined } } as unknown as Parameters<typeof __configureFallbackModelsForTests>[1],
   );
   const seen: string[] = [];
   const delegate = async (model: Model<Api>) => {
@@ -207,7 +207,7 @@ section("streamWithLimitsRetry");
   globalThis.fetch = (async () => new Response("early rate limit body", { status: 429, statusText: "Too Many Requests", headers: { "retry-after": "0.01" } })) as typeof fetch;
   __configureFallbackModelsForTests(
     [{ model: fallback }],
-    { modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fallback-key", headers: {} }) }, ui: { notify: () => undefined, setStatus: () => undefined, setWorkingMessage: () => undefined } } as unknown as Parameters<typeof __configureFallbackModelsForTests>[1],
+    { modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fallback-key", headers: {} }) }, ui: { notify: () => undefined, setWorkingMessage: () => undefined } } as unknown as Parameters<typeof __configureFallbackModelsForTests>[1],
   );
   const seen: string[] = [];
   const delegate = async (model: Model<Api>) => {
@@ -232,7 +232,7 @@ section("streamWithLimitsRetry");
   const notifications: string[] = [];
   __configureFallbackModelsForTests(
     [{ model: fallback }],
-    { modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fallback-key", headers: {} }) }, ui: { notify: (message: string) => notifications.push(message), setStatus: () => undefined } } as unknown as Parameters<typeof __configureFallbackModelsForTests>[1],
+    { modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fallback-key", headers: {} }) }, ui: { notify: (message: string) => notifications.push(message) } } as unknown as Parameters<typeof __configureFallbackModelsForTests>[1],
   );
   const seen: string[] = [];
   const delegate = (model: Model<Api>) => {
@@ -251,7 +251,7 @@ section("streamWithLimitsRetry");
   const notifications: string[] = [];
   __configureFallbackModelsForTests(
     [{ model: fallback }],
-    { modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fallback-key", headers: {} }) }, ui: { notify: (message: string) => notifications.push(message), setStatus: () => undefined } } as unknown as Parameters<typeof __configureFallbackModelsForTests>[1],
+    { modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fallback-key", headers: {} }) }, ui: { notify: (message: string) => notifications.push(message) } } as unknown as Parameters<typeof __configureFallbackModelsForTests>[1],
   );
   const ctrl = new AbortController();
   ctrl.abort();
@@ -271,7 +271,7 @@ section("streamWithLimitsRetry");
   const fallback = mockModel("fallback");
   __configureFallbackModelsForTests(
     [{ model: fallback }],
-    { modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fallback-key", headers: {} }) }, ui: { notify: () => undefined, setStatus: () => undefined } } as unknown as Parameters<typeof __configureFallbackModelsForTests>[1],
+    { modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fallback-key", headers: {} }) }, ui: { notify: () => undefined } } as unknown as Parameters<typeof __configureFallbackModelsForTests>[1],
   );
   const seen: string[] = [];
   const delegate = (model: Model<Api>) => {
