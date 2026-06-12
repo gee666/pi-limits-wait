@@ -22,6 +22,7 @@ import {
   modelKey,
   nextAvailableCandidate,
   notifyRetryableError,
+  notifyRetryingAfterError,
   optionsForModel,
   recentObservedRateLimitError,
   rememberNonRetryableFailure,
@@ -250,6 +251,7 @@ export function streamWithLimitsRetry(
           nonRetryableAttempts.set(key, attempts);
 
           if (attempts < state.nonRetryableMaxAttempts) {
+            notifyRetryingAfterError(attempt.model, state.nonRetryableRetryDelayMs, failureMessage);
             const waitResult = await waitForRetry("retry", state.nonRetryableRetryDelayMs, options?.signal);
             if (waitResult === "aborted") {
               pushAbort("Request aborted while retrying after error.");
@@ -320,6 +322,7 @@ export function streamWithLimitsRetry(
         continue;
       }
 
+      notifyRetryableError(attempt.model, retryable, retryableErrorMessage);
       const waitResult = await waitForRetry(retryable.reason, retryable.waitMs, options?.signal);
       if (waitResult === "aborted") {
         pushAbort(`Request aborted during ${reasonLabel(retryable.reason).toLowerCase()} wait.`);

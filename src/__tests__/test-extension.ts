@@ -390,9 +390,10 @@ section("streamWithLimitsRetry");
 {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (async () => new Response("rate limited", { status: 429, statusText: "Too Many Requests", headers: { "retry-after": "0.01" } })) as typeof fetch;
+  const notifications: string[] = [];
   __configureFallbackModelsForTests(
     [],
-    { ui: { notify: () => undefined, setWorkingMessage: () => undefined } } as unknown as Parameters<typeof __configureFallbackModelsForTests>[1],
+    { ui: { notify: (message: string) => notifications.push(message), setWorkingMessage: () => undefined } } as unknown as Parameters<typeof __configureFallbackModelsForTests>[1],
   );
   let calls = 0;
   const delegate = async () => {
@@ -405,6 +406,7 @@ section("streamWithLimitsRetry");
   };
   const events = await collect(streamWithLimitsRetry(delegate, mockModel(), {} as Context, {} as SimpleStreamOptions));
   ok("uses observed retry-after when SDK 429 error omits headers", calls === 2 && events.at(-1)?.type === "done", `calls=${calls}, last=${events.at(-1)?.type}`);
+  ok("retryable warning is shown immediately without fallback", notifications.some((message) => message.includes("HTTP 429 Too Many Requests") && message.includes("rate limited")), `notifications=${notifications.join(";")}`);
   __configureFallbackModelsForTests([]);
   globalThis.fetch = originalFetch;
 }
@@ -435,6 +437,11 @@ section("streamWithLimitsRetry");
 {
   // An unclassified non-retryable error recovers if a later attempt succeeds,
   // within the bounded retry budget, without any fallback configured.
+  const notifications: string[] = [];
+  __configureFallbackModelsForTests(
+    [],
+    { ui: { notify: (message: string) => notifications.push(message), setWorkingMessage: () => undefined } } as unknown as Parameters<typeof __configureFallbackModelsForTests>[1],
+  );
   let calls = 0;
   const delegate = () => {
     calls++;
@@ -444,6 +451,8 @@ section("streamWithLimitsRetry");
   };
   const events = await collect(streamWithLimitsRetry(delegate, mockModel(), {} as Context, {} as SimpleStreamOptions));
   ok("retries unclassified error up to the limit then succeeds (no fallback)", calls === 3 && events.at(-1)?.type === "done", `calls=${calls}, last=${events.at(-1)?.type}`);
+  ok("unclassified retry warning includes provider error immediately", notifications.some((message) => message.includes("retrying after error") && message.includes("HTTP 500 Internal Server Error")), `notifications=${notifications.join(";")}`);
+  __configureFallbackModelsForTests([]);
 }
 {
   // With freezing disabled, a persistently failing model must never enter the

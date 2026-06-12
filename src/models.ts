@@ -62,8 +62,12 @@ export function ensureRateLimitedModelsStatus(): void {
 }
 
 export function notifyRetryableError(model: Model<Api>, retryable: RetryableError, errorMessage?: string): void {
-  const detail = errorMessage ? ` Error: ${formatErrorDetail(errorMessage)}` : "";
+  const detail = errorMessage ? ` Error: ${formatErrorDetail(errorMessage, Number.MAX_SAFE_INTEGER)}` : "";
   state.sharedCtx?.ui.notify(`${formatModel(model)} ${reasonLabel(retryable.reason).toLowerCase()} for ${formatDuration(retryable.waitMs)}.${detail}`, "warning");
+}
+
+export function notifyRetryingAfterError(model: Model<Api>, waitMs: number, errorMessage: string): void {
+  state.sharedCtx?.ui.notify(`${formatModel(model)} retrying after error for ${formatDuration(waitMs)}. Error: ${formatErrorDetail(errorMessage, Number.MAX_SAFE_INTEGER)}`, "warning");
 }
 
 export function rememberRateLimit(model: Model<Api>, retryable: RetryableError, errorMessage?: string): void {
