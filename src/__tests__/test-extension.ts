@@ -92,6 +92,16 @@ ok("detects refreshable authentication errors", isAuthenticationRefreshError('Er
 ok("does not retry generic unauthorized", !isRateLimitError("HTTP 401 Unauthorized") && !isServerOverloadedError("HTTP 401 Unauthorized") && !isAuthenticationRefreshError("HTTP 401 Unauthorized"));
 ok("classifies overloaded", getRetryableError("server_is_overloaded")?.reason === "overloaded");
 ok("uses retry delay on overloaded", getRetryableError("server_is_overloaded retry-after 0.01")?.waitMs === 10);
+{
+  const resetUnixSeconds = Math.ceil((Date.now() + 2_000) / 1_000);
+  const waitMs = getRetryableError(`Claude AI usage limit reached|${resetUnixSeconds}`)?.waitMs ?? 0;
+  ok("parses Claude subscription pipe reset timestamp", waitMs > 0 && waitMs <= 3_500, `waitMs=${waitMs}`);
+}
+{
+  const headers = new Headers({ "anthropic-ratelimit-requests-reset": new Date(Date.now() + 2_000).toISOString() });
+  const waitMs = retryAfterHeaderMs(headers) ?? 0;
+  ok("parses Anthropic reset headers without retry-after", waitMs > 0 && waitMs <= 2_500, `waitMs=${waitMs}`);
+}
 
 section("transient network / timeout detection");
 ok("detects undici headers timeout", isTransientNetworkError("UND_ERR_HEADERS_TIMEOUT: Headers Timeout Error"));
@@ -376,6 +386,27 @@ section("streamWithLimitsRetry");
   ok("network error retries same model instead of switching to fallback", seen.join(",") === "primary,primary" && events.at(-1)?.type === "done", `seen=${seen.join(",")}, last=${events.at(-1)?.type}`);
   ok("network warning is shown", notifications.some((message) => message.includes("network/timeout error") && message.includes("fetch failed")), `notifications=${notifications.join(";")}`);
   __configureFallbackModelsForTests([]);
+}
+{
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response("rate limited", { status: 429, statusText: "Too Many Requests", headers: { "retry-after": "0.01" } })) as typeof fetch;
+  __configureFallbackModelsForTests(
+    [],
+    { ui: { notify: () => undefined, setWorkingMessage: () => undefined } } as unknown as Parameters<typeof __configureFallbackModelsForTests>[1],
+  );
+  let calls = 0;
+  const delegate = async () => {
+    calls++;
+    if (calls === 1) {
+      await fetch("https://example.invalid/rate-limited");
+      return streamFrom([startEvent(), errorEvent("HTTP 429 Too Many Requests")]);
+    }
+    return streamFrom([startEvent(), doneEvent()]);
+  };
+  const events = await collect(streamWithLimitsRetry(delegate, mockModel(), {} as Context, {} as SimpleStreamOptions));
+  ok("uses observed retry-after when SDK 429 error omits headers", calls === 2 && events.at(-1)?.type === "done", `calls=${calls}, last=${events.at(-1)?.type}`);
+  __configureFallbackModelsForTests([]);
+  globalThis.fetch = originalFetch;
 }
 {
   const primary = mockModel("primary");

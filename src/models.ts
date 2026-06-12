@@ -1,6 +1,6 @@
 import type { Api, Model, SimpleStreamOptions } from "@mariozechner/pi-ai";
 import { DEFAULT_NON_RETRYABLE_FREEZE_MS } from "./constants.js";
-import { isRateLimitError } from "./retry-errors.js";
+import { isRateLimitError, parseRetryDelayMs } from "./retry-errors.js";
 import { state } from "./state.js";
 import type { FallbackModel, RetryableError } from "./types.js";
 import { formatErrorDetail, formatDuration, reasonLabel } from "./ui.js";
@@ -111,7 +111,17 @@ export function recentObservedRateLimitError(maxAgeMs = 60_000): string | undefi
 
 export function errorMessageWithRecentHttpStatus(errorMessage: string): string {
   const observed = recentObservedHttpError();
-  if (!observed || /(?:^|\D)[1-5]\d\d(?:\D|$)/.test(errorMessage) || errorMessage.includes(observed)) return errorMessage;
+  if (!observed || errorMessage.includes(observed)) return errorMessage;
+
+  // SDK errors often keep only "429 Too Many Requests" and drop the response
+  // headers. Keep the observed fetch response when it carries retry timing, so
+  // Claude subscription limits use their exact reset/retry time instead of the
+  // generic 30 minute fallback.
+  const currentHasRetryTiming = parseRetryDelayMs(errorMessage) !== undefined;
+  const observedHasRetryTiming = parseRetryDelayMs(observed) !== undefined;
+  if (!currentHasRetryTiming && observedHasRetryTiming) return `${observed}; Error: ${errorMessage}`;
+
+  if (/(?:^|\D)[1-5]\d\d(?:\D|$)/.test(errorMessage)) return errorMessage;
   return `${observed}; Error: ${errorMessage}`;
 }
 

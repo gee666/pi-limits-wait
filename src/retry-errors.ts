@@ -9,7 +9,9 @@ function isExplicitRateLimitError(msg: string): boolean {
     /rate\s*limit/.test(lower) ||
     lower.includes("too many requests") ||
     lower.includes("quota exceeded") ||
-    lower.includes("quota will reset")
+    lower.includes("quota will reset") ||
+    lower.includes("usage limit") ||
+    lower.includes("limit reached")
   );
 }
 
@@ -69,7 +71,60 @@ export function isAuthenticationRefreshError(msg: string): boolean {
   );
 }
 
+function msUntilTimestamp(timestampMs: number): number | undefined {
+  if (!Number.isFinite(timestampMs)) return undefined;
+  return Math.max(0, timestampMs - Date.now());
+}
+
+function parseResetValueMs(value: string): number | undefined {
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+
+  const numeric = Number(trimmed);
+  if (Number.isFinite(numeric) && numeric > 0) {
+    // Epoch milliseconds / epoch seconds / duration seconds, depending on size.
+    if (numeric > 1_000_000_000_000) return msUntilTimestamp(numeric);
+    if (numeric > 1_000_000_000) return msUntilTimestamp(numeric * 1_000);
+    return numeric * 1_000;
+  }
+
+  const dateMs = Date.parse(trimmed);
+  if (!Number.isNaN(dateMs)) return msUntilTimestamp(dateMs);
+  return undefined;
+}
+
+function parseClockTimeResetMs(msg: string): number | undefined {
+  const match = msg.match(/(?:reset|resets|retry|try again)[^\n.]*?\bat\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/i);
+  if (!match?.[1]) return undefined;
+
+  let hours = Number(match[1]);
+  const minutes = match[2] ? Number(match[2]) : 0;
+  const meridiem = match[3]?.toLowerCase();
+  if (!Number.isFinite(hours) || !Number.isFinite(minutes) || minutes < 0 || minutes > 59) return undefined;
+
+  if (meridiem) {
+    if (hours < 1 || hours > 12) return undefined;
+    if (meridiem === "pm" && hours !== 12) hours += 12;
+    if (meridiem === "am" && hours === 12) hours = 0;
+  } else if (hours > 23) {
+    return undefined;
+  }
+
+  const target = new Date();
+  target.setHours(hours, minutes, 0, 0);
+  if (target.getTime() <= Date.now()) target.setDate(target.getDate() + 1);
+  return target.getTime() - Date.now();
+}
+
 export function parseRetryDelayMs(msg: string): number | undefined {
+  // Claude subscription errors often include a Unix reset timestamp after a pipe,
+  // e.g. "Claude AI usage limit reached|1750359600".
+  const pipeTimestamp = msg.match(/\|(\d{10,13})(?:\D|$)/);
+  if (pipeTimestamp?.[1]) {
+    const parsed = parseResetValueMs(pipeTimestamp[1]);
+    if (parsed !== undefined) return parsed;
+  }
+
   const retryAfter = msg.match(/retry-after(?:-ms)?[^0-9]*(\d+(?:\.\d+)?)/i);
   if (retryAfter?.[1]) {
     const value = Number(retryAfter[1]);
@@ -106,7 +161,13 @@ export function parseRetryDelayMs(msg: string): number | undefined {
     }
   }
 
-  return undefined;
+  const resetAtIso = msg.match(/(?:reset|resets|retry|try again)[^\n.]*?\bat\s+([0-9]{4}-[0-9]{2}-[0-9]{2}[^\s,;.}]*)/i);
+  if (resetAtIso?.[1]) {
+    const parsed = parseResetValueMs(resetAtIso[1]);
+    if (parsed !== undefined) return parsed;
+  }
+
+  return parseClockTimeResetMs(msg);
 }
 
 export function rateLimitWaitMs(msg: string): number {
@@ -121,13 +182,30 @@ export function retryAfterHeaderMs(headers: Headers): number | undefined {
   }
 
   const retryAfter = headers.get("retry-after");
-  if (!retryAfter) return undefined;
+  if (retryAfter) {
+    const seconds = Number(retryAfter);
+    if (Number.isFinite(seconds) && seconds > 0) return seconds * 1_000;
 
-  const seconds = Number(retryAfter);
-  if (Number.isFinite(seconds) && seconds > 0) return seconds * 1_000;
+    const dateMs = Date.parse(retryAfter);
+    if (!Number.isNaN(dateMs)) return Math.max(0, dateMs - Date.now());
+  }
 
-  const dateMs = Date.parse(retryAfter);
-  if (!Number.isNaN(dateMs)) return Math.max(0, dateMs - Date.now());
+  for (const name of [
+    "anthropic-ratelimit-unified-reset",
+    "anthropic-ratelimit-unified-5h-reset",
+    "anthropic-ratelimit-unified-7d-reset",
+    "anthropic-ratelimit-requests-reset",
+    "anthropic-ratelimit-tokens-reset",
+    "x-ratelimit-reset",
+    "x-ratelimit-reset-requests",
+    "x-ratelimit-reset-tokens",
+    "ratelimit-reset",
+  ]) {
+    const value = headers.get(name);
+    if (!value) continue;
+    const parsed = parseResetValueMs(value);
+    if (parsed !== undefined) return parsed;
+  }
 
   return undefined;
 }
