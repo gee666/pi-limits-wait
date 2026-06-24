@@ -28,6 +28,8 @@ const PI_REMOVAL_ANCHORS = [
 
 const PI_IDENTITY_SENTENCE_PATTERN =
   /(?:^|\n)\s*You are pi\b[^.!?\n]*(?:[.!?](?=\s|$)|(?=\n|$))/gi;
+const CLAUDE_CODE_IDENTITY_PATTERN =
+  /(?:^|\n)\s*You are Claude Code, Anthropic's official CLI for Claude\.\s*/gi;
 
 const DEFAULT_RATE_LIMIT_WAIT_MS = 30 * 60 * 1_000; // 30 minutes
 const DEFAULT_OVERLOADED_WAIT_MS = 5 * 60 * 1_000; // 5 minutes
@@ -108,22 +110,22 @@ export function sanitiseSystemPrompt(raw: string): string {
 
   return filtered
     .join("\n\n")
+    .replace(CLAUDE_CODE_IDENTITY_PATTERN, "")
     .replace(PI_IDENTITY_SENTENCE_PATTERN, "")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 }
 
-/**
- * Returns true if Anthropic OAuth is configured for this session, regardless
- * of which model is currently active. This handles cases where a synthetic or
- * temporary model (e.g. a subagent/resume provider) is active at
- * before_agent_start time, even though the session will ultimately use an
- * Anthropic subscription model.
- */
-function isAnthropicOAuthSession(ctx: ExtensionContext): boolean {
-  return ctx.modelRegistry.isUsingOAuth(
-    { provider: "anthropic" } as Parameters<typeof ctx.modelRegistry.isUsingOAuth>[0],
-  );
+function anthropicSubscriptionContext(model: Model<Api>, context: Context): Context {
+  if (model.provider !== "anthropic" || !sharedCtx?.modelRegistry.isUsingOAuth(model)) return context;
+
+  const sanitised = sanitiseSystemPrompt(context.systemPrompt ?? "");
+  return {
+    ...context,
+    systemPrompt: sanitised
+      ? `${CLAUDE_CODE_IDENTITY}\n\n${sanitised}`
+      : CLAUDE_CODE_IDENTITY,
+  };
 }
 
 // ─── Optional fallback model settings ────────────────────────────────────────
@@ -948,7 +950,8 @@ export function streamWithLimitsRetry(
             : builtinStreamSimpleByApi.get(attempt.model.api)
               ?? getApiProviders().find((provider) => provider.api === attempt.model.api)?.streamSimple;
           if (!attemptDelegate) throw new Error(`No stream handler registered for API ${attempt.model.api}.`);
-          const inner = await attemptDelegate(attempt.model, context, attemptOptions);
+          const attemptContext = anthropicSubscriptionContext(attempt.model, context);
+          const inner = await attemptDelegate(attempt.model, attemptContext, attemptOptions);
           for await (const event of inner) {
             if (!committed) {
               if (event.type === "error") {
@@ -1262,17 +1265,9 @@ export default function (pi: ExtensionAPI) {
     }
     if (ctx.model && !isInternalSyntheticModel(ctx.model)) registerWrappedApi(pi, ctx.model.api);
 
-    // Anthropic subscription/OAuth requests identify as Claude Code, not Pi.
-    // Check the session-wide Anthropic OAuth configuration rather than only the
-    // current model: resumed/subagent sessions can temporarily expose a
-    // synthetic active model during before_agent_start.
-    if (!isAnthropicOAuthSession(ctx)) return;
-
-    const sanitised = sanitiseSystemPrompt(event.systemPrompt);
-    return {
-      systemPrompt: sanitised
-        ? `${CLAUDE_CODE_IDENTITY}\n\n${sanitised}`
-        : CLAUDE_CODE_IDENTITY,
-    };
+    // Anthropic subscription/OAuth identity is applied per provider request in
+    // streamWithLimitsRetry(). Doing it there ensures every retry/fallback
+    // attempt gets the right prompt for its actual target model, while
+    // non-Anthropic providers never inherit the Claude Code identity.
   });
 }

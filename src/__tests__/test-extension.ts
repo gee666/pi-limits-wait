@@ -82,6 +82,7 @@ section("prompt sanitisation");
   ok("removes Pi identity sentence", !sanitised.includes("You are pi"));
   ok("removes paragraphs with Pi internals", !sanitised.includes("@mariozechner/pi-coding-agent"));
   ok("keeps unrelated instructions", sanitised.includes("Keep this useful instruction."));
+  ok("removes existing Claude Code identity before re-applying", !sanitiseSystemPrompt("You are Claude Code, Anthropic's official CLI for Claude.\n\nKeep this.").includes("Claude Code"));
 }
 
 section("retryable detection");
@@ -167,6 +168,34 @@ section("waitForRateLimit");
 }
 
 section("streamWithLimitsRetry");
+{
+  const prompts: Array<string | undefined> = [];
+  const ctx = { modelRegistry: { isUsingOAuth: () => true }, ui: { notify: () => undefined, setStatus: () => undefined, setWorkingMessage: () => undefined } } as unknown as Parameters<typeof __configureFallbackModelsForTests>[1];
+  __configureFallbackModelsForTests([], ctx);
+  let calls = 0;
+  const delegate = (_model: Model<Api>, context: Context) => {
+    prompts.push(context.systemPrompt);
+    calls++;
+    return calls === 1
+      ? streamFrom([startEvent(), errorEvent("HTTP 429 retry-after 0.001")])
+      : streamFrom([startEvent(), doneEvent()]);
+  };
+  const events = await collect(streamWithLimitsRetry(delegate, mockModel("claude", "anthropic"), { systemPrompt: "You are pi, a coding agent.\n\nKeep this.", messages: [] }, {} as SimpleStreamOptions));
+  ok("adds Claude Code identity to every retried Anthropic OAuth request", prompts.length === 2 && prompts.every((prompt) => prompt?.startsWith("You are Claude Code")) && prompts.every((prompt) => prompt?.includes("Keep this.") && !prompt.includes("You are pi")) && events.at(-1)?.type === "done", `prompts=${JSON.stringify(prompts)}`);
+  __configureFallbackModelsForTests([]);
+}
+{
+  const prompts: Array<string | undefined> = [];
+  const ctx = { modelRegistry: { isUsingOAuth: () => true }, ui: { notify: () => undefined, setStatus: () => undefined, setWorkingMessage: () => undefined } } as unknown as Parameters<typeof __configureFallbackModelsForTests>[1];
+  __configureFallbackModelsForTests([], ctx);
+  const delegate = (_model: Model<Api>, context: Context) => {
+    prompts.push(context.systemPrompt);
+    return streamFrom([startEvent(), doneEvent()]);
+  };
+  await collect(streamWithLimitsRetry(delegate, mockModel("gpt", "openai"), { systemPrompt: "You are pi, a coding agent.", messages: [] }, {} as SimpleStreamOptions));
+  ok("does not add Claude Code identity to non-Anthropic providers", prompts[0] === "You are pi, a coding agent.", `prompt=${prompts[0]}`);
+  __configureFallbackModelsForTests([]);
+}
 {
   let calls = 0;
   const delegate = () => {
