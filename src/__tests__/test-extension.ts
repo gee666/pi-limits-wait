@@ -93,6 +93,16 @@ ok("detects refreshable authentication errors", isAuthenticationRefreshError('Er
 ok("does not retry generic unauthorized", !isRateLimitError("HTTP 401 Unauthorized") && !isServerOverloadedError("HTTP 401 Unauthorized") && !isAuthenticationRefreshError("HTTP 401 Unauthorized"));
 ok("classifies overloaded", getRetryableError("server_is_overloaded")?.reason === "overloaded");
 ok("uses retry delay on overloaded", getRetryableError("server_is_overloaded retry-after 0.01")?.waitMs === 10);
+{
+  const resetUnixSeconds = Math.ceil((Date.now() + 2_000) / 1_000);
+  const waitMs = getRetryableError(`Claude AI usage limit reached|${resetUnixSeconds}`)?.waitMs ?? 0;
+  ok("parses Claude subscription pipe reset timestamp", waitMs > 0 && waitMs <= 3_500, `waitMs=${waitMs}`);
+}
+{
+  const headers = new Headers({ "anthropic-ratelimit-requests-reset": new Date(Date.now() + 2_000).toISOString() });
+  const waitMs = retryAfterHeaderMs(headers) ?? 0;
+  ok("parses Anthropic reset headers without retry-after", waitMs > 0 && waitMs <= 2_500, `waitMs=${waitMs}`);
+}
 
 section("transient network / timeout detection");
 ok("detects undici headers timeout", isTransientNetworkError("UND_ERR_HEADERS_TIMEOUT: Headers Timeout Error"));
@@ -407,6 +417,29 @@ section("streamWithLimitsRetry");
   __configureFallbackModelsForTests([]);
 }
 {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response("rate limited", { status: 429, statusText: "Too Many Requests", headers: { "retry-after": "0.01" } })) as typeof fetch;
+  const notifications: string[] = [];
+  __configureFallbackModelsForTests(
+    [],
+    { ui: { notify: (message: string) => notifications.push(message), setWorkingMessage: () => undefined } } as unknown as Parameters<typeof __configureFallbackModelsForTests>[1],
+  );
+  let calls = 0;
+  const delegate = async () => {
+    calls++;
+    if (calls === 1) {
+      await fetch("https://example.invalid/rate-limited");
+      return streamFrom([startEvent(), errorEvent("HTTP 429 Too Many Requests")]);
+    }
+    return streamFrom([startEvent(), doneEvent()]);
+  };
+  const events = await collect(streamWithLimitsRetry(delegate, mockModel(), {} as Context, {} as SimpleStreamOptions));
+  ok("uses observed retry-after when SDK 429 error omits headers", calls === 2 && events.at(-1)?.type === "done", `calls=${calls}, last=${events.at(-1)?.type}`);
+  ok("retryable warning is shown immediately without fallback", notifications.some((message) => message.includes("HTTP 429 Too Many Requests") && message.includes("rate limited")), `notifications=${notifications.join(";")}`);
+  __configureFallbackModelsForTests([]);
+  globalThis.fetch = originalFetch;
+}
+{
   const primary = mockModel("primary");
   const fallback = mockModel("fallback");
   const originalFetch = globalThis.fetch;
@@ -433,6 +466,11 @@ section("streamWithLimitsRetry");
 {
   // An unclassified non-retryable error recovers if a later attempt succeeds,
   // within the bounded retry budget, without any fallback configured.
+  const notifications: string[] = [];
+  __configureFallbackModelsForTests(
+    [],
+    { ui: { notify: (message: string) => notifications.push(message), setWorkingMessage: () => undefined } } as unknown as Parameters<typeof __configureFallbackModelsForTests>[1],
+  );
   let calls = 0;
   const delegate = () => {
     calls++;
@@ -442,6 +480,8 @@ section("streamWithLimitsRetry");
   };
   const events = await collect(streamWithLimitsRetry(delegate, mockModel(), {} as Context, {} as SimpleStreamOptions));
   ok("retries unclassified error up to the limit then succeeds (no fallback)", calls === 3 && events.at(-1)?.type === "done", `calls=${calls}, last=${events.at(-1)?.type}`);
+  ok("unclassified retry warning includes provider error immediately", notifications.some((message) => message.includes("retrying after error") && message.includes("HTTP 500 Internal Server Error")), `notifications=${notifications.join(";")}`);
+  __configureFallbackModelsForTests([]);
 }
 {
   // With freezing disabled, a persistently failing model must never enter the

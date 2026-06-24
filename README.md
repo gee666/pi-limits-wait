@@ -21,8 +21,8 @@ Restart Pi or run `/reload` after installing.
 - On `server_is_overloaded`, waits 5 minutes, then retries. If the provider is still overloaded after Pi's normal retries, it waits another 5 minutes and repeats.
 - On transient network/transport failures — including undici idle-timeout aborts (`UND_ERR_HEADERS_TIMEOUT` / `UND_ERR_BODY_TIMEOUT`), `fetch failed`, `terminated`, `ECONNRESET`, `ETIMEDOUT`, etc. — treats the error as retryable with a short backoff (default 15s, or the provider's `retry-after`) instead of giving up. This prevents a stalled streaming request from turning into a silent hang.
 - For any other (unclassified) non-retryable error, retries the same model a few times (default 3) before falling back / freezing it, so a one-off hiccup does not immediately sideline a model.
-- Shows a countdown in the Pi status/working line.
-- Press Enter during the countdown to skip the wait and retry immediately.
+- Reports retry/fallback waits in chat notifications without adding persistent TUI status lines.
+- Press Enter during a retry wait to skip the wait and retry immediately.
 - Optionally falls back to configured models when the current/default model is rate-limited.
 
 ## Optional fallback models
@@ -74,7 +74,7 @@ Fallback behavior:
 4. If that model later becomes rate-limited too, the extension starts again from the same ordered list.
 5. Rate-limit reset times are remembered only in memory, so known-limited models are skipped until their countdown expires. This memory is cleared when Pi restarts.
 
-When the settings are loaded, the extension shows the full usable fallback model list. When models become rate-limited, it shows a live countdown for each limited model.
+When the settings are loaded, the extension shows the full usable fallback model list. When models become rate-limited, it reports the wait in chat notifications.
 
 ## Environment variables
 
