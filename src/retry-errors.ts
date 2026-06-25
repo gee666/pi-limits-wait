@@ -43,6 +43,10 @@ export function isTransientNetworkError(msg: string): boolean {
     lower.includes("headers timeout") ||
     lower.includes("body timeout") ||
     lower.includes("connect timeout") ||
+    lower.includes("request timed out") ||
+    lower.includes("timed out") ||
+    lower.includes("timedout") ||
+    lower.includes("timeout") ||
     lower.includes("fetch failed") ||
     lower.includes("terminated") ||
     lower.includes("socket hang up") ||

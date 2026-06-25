@@ -110,6 +110,9 @@ ok("detects undici body timeout", isTransientNetworkError("UND_ERR_BODY_TIMEOUT"
 ok("detects generic fetch failed", isTransientNetworkError("TypeError: fetch failed"));
 ok("detects terminated stream", isTransientNetworkError("terminated"));
 ok("detects ECONNRESET", isTransientNetworkError("read ECONNRESET socket hang up"));
+ok("detects request timed out", isTransientNetworkError("Request timed out."));
+ok("detects retry-failed request timed out", isTransientNetworkError("Retry failed after 3 attempts: Request timed out."));
+ok("classifies request timed out as retryable network error", getRetryableError("Request timed out.")?.reason === "network");
 ok("plain 400 is not a network error", !isTransientNetworkError("HTTP 400 Bad Request"));
 ok("classifies headers timeout as retryable network error", getRetryableError("UND_ERR_HEADERS_TIMEOUT")?.reason === "network");
 ok("network error uses short default backoff", getRetryableError("fetch failed")?.waitMs === 15_000);
