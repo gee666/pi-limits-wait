@@ -89,6 +89,7 @@ export function streamWithLimitsRetry(
   const output = createAssistantMessageEventStream();
 
   void (async () => {
+    const requestCtx = state.sharedCtx;
     let committed = false;
     const allowFallback = fallbackEnabled() && isFallbackEligibleModel(model);
     let attempt: FallbackModel = allowFallback ? initialAttempt(model) : { model, reasoningEffort: state.primaryThinkingLevel };
@@ -124,14 +125,14 @@ export function streamWithLimitsRetry(
       try {
         try {
           const attemptOptions = allowFallback
-            ? await optionsForModel(model, attempt, options)
+            ? await optionsForModel(model, attempt, options, requestCtx)
             : options;
           const attemptDelegate = attempt.model.api === model.api
             ? delegate
             : state.builtinStreamSimpleByApi.get(attempt.model.api)
               ?? getApiProviders().find((provider) => provider.api === attempt.model.api)?.streamSimple;
           if (!attemptDelegate) throw new Error(`No stream handler registered for API ${attempt.model.api}.`);
-          const attemptContext = anthropicSubscriptionContext(attempt.model, context);
+          const attemptContext = anthropicSubscriptionContext(attempt.model, context, attemptOptions, requestCtx);
           const inner = await attemptDelegate(attempt.model, attemptContext, attemptOptions);
           for await (const event of inner) {
             if (!committed) {
@@ -338,17 +339,34 @@ export function streamWithLimitsRetry(
 
 export const streamWithRateLimitRetry = streamWithLimitsRetry;
 
+const LIMITS_WAIT_WRAPPER_FLAG = "__piLimitsWaitWrapper";
+type LimitsWaitStreamSimpleFn = ((
+  model: Model<Api>,
+  context: Context,
+  options?: SimpleStreamOptions,
+) => AssistantMessageEventStream) & { [LIMITS_WAIT_WRAPPER_FLAG]?: true };
+
 export function registerWrappedApi(pi: ExtensionAPI, api: Api): void {
-  if (state.wrappedApis.has(api)) return;
+  const currentStreamSimple = getApiProviders().find((provider) => provider.api === api)?.streamSimple;
+  if (!currentStreamSimple) return;
+  if ((currentStreamSimple as LimitsWaitStreamSimpleFn)[LIMITS_WAIT_WRAPPER_FLAG]) return;
 
-  const builtinStreamSimple = getApiProviders().find((provider) => provider.api === api)?.streamSimple;
-  if (!builtinStreamSimple) return;
-
-  state.builtinStreamSimpleByApi.set(api, builtinStreamSimple);
+  state.builtinStreamSimpleByApi.set(api, currentStreamSimple);
   state.wrappedApis.add(api);
+
+  const wrappedStreamSimple = ((model: Model<Api>, context: Context, options?: SimpleStreamOptions) =>
+    streamWithLimitsRetry(currentStreamSimple, model, context, options)) as LimitsWaitStreamSimpleFn;
+  wrappedStreamSimple[LIMITS_WAIT_WRAPPER_FLAG] = true;
+
   pi.registerProvider(`limits-wait-${api}`, {
     api,
-    streamSimple: (model: Model<Api>, context: Context, options?: SimpleStreamOptions) =>
-      streamWithLimitsRetry(builtinStreamSimple, model, context, options),
+    streamSimple: wrappedStreamSimple,
   });
+
+  // pi-ai wraps provider functions when registering them, so the function later
+  // returned by getApiProviders() is not the same object as wrappedStreamSimple.
+  // Tag the registered wrapper too; otherwise repeated agent_start/model loops
+  // would wrap an already wrapped API again.
+  const registeredStreamSimple = getApiProviders().find((provider) => provider.api === api)?.streamSimple as LimitsWaitStreamSimpleFn | undefined;
+  if (registeredStreamSimple) registeredStreamSimple[LIMITS_WAIT_WRAPPER_FLAG] = true;
 }

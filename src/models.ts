@@ -1,3 +1,4 @@
+import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 import type { Api, Model, SimpleStreamOptions } from "@mariozechner/pi-ai";
 import { DEFAULT_NON_RETRYABLE_FREEZE_MS } from "./constants.js";
 import { isRateLimitError, parseRetryDelayMs } from "./retry-errors.js";
@@ -147,13 +148,14 @@ export async function optionsForModel(
   originalModel: Model<Api>,
   target: FallbackModel,
   options?: SimpleStreamOptions,
+  ctx: ExtensionContext | undefined = state.sharedCtx,
 ): Promise<SimpleStreamOptions | undefined> {
   const level = target.reasoningEffort ?? state.primaryThinkingLevel;
   const reasoning = level && level !== "off" ? level : undefined;
   if (modelKey(originalModel) === modelKey(target.model)) {
     return reasoning ? { ...options, reasoning } : options;
   }
-  const auth = await state.sharedCtx?.modelRegistry.getApiKeyAndHeaders(target.model);
+  const auth = await ctx?.modelRegistry.getApiKeyAndHeaders(target.model);
   if (!auth?.ok) throw new Error(auth ? auth.error : "Model registry is unavailable.");
   return {
     ...options,

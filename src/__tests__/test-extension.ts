@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import type { Api, AssistantMessageEvent, Context, Model, SimpleStreamOptions } from "@mariozechner/pi-ai";
-import { createAssistantMessageEventStream } from "@mariozechner/pi-ai";
+import { createAssistantMessageEventStream, getApiProvider, registerApiProvider, streamSimple as piStreamSimple } from "@mariozechner/pi-ai";
 import {
   __configureFallbackModelsForTests,
   __readFallbackSettingsForTests,
@@ -18,6 +18,7 @@ import {
   streamWithLimitsRetry,
   waitForRateLimit,
 } from "../index.js";
+import { registerWrappedApi } from "../stream.js";
 
 // Keep non-retryable retry backoff tiny so the suite stays fast while still
 // exercising the real retry-count behaviour.
@@ -208,6 +209,111 @@ section("streamWithLimitsRetry");
   await collect(streamWithLimitsRetry(delegate, mockModel("gpt", "openai"), { systemPrompt: "You are pi, a coding agent.", messages: [] }, {} as SimpleStreamOptions));
   ok("does not add Claude Code identity to non-Anthropic providers", prompts[0] === "You are pi, a coding agent.", `prompt=${prompts[0]}`);
   __configureFallbackModelsForTests([]);
+}
+{
+  const prompts: Array<string | undefined> = [];
+  const ctx = { modelRegistry: { isUsingOAuth: () => false }, ui: { notify: () => undefined, setStatus: () => undefined, setWorkingMessage: () => undefined } } as unknown as Parameters<typeof __configureFallbackModelsForTests>[1];
+  __configureFallbackModelsForTests([], ctx);
+  const delegate = (_model: Model<Api>, context: Context) => {
+    prompts.push(context.systemPrompt);
+    return streamFrom([startEvent(), doneEvent()]);
+  };
+  await collect(streamWithLimitsRetry(delegate, mockModel("claude", "anthropic"), { systemPrompt: "You are pi, a coding agent.\n\nKeep this.", messages: [] }, { apiKey: "sk-ant-oat-test" } as SimpleStreamOptions));
+  ok("adds Claude Code identity when Anthropic OAuth token is supplied per request", Boolean(prompts[0]?.startsWith("You are Claude Code") && prompts[0]?.includes("Keep this.") && !prompts[0]?.includes("You are pi")), `prompt=${prompts[0]}`);
+  __configureFallbackModelsForTests([]);
+}
+{
+  const prompts: Array<string | undefined> = [];
+  const ctx = { modelRegistry: { isUsingOAuth: () => true }, ui: { notify: () => undefined, setStatus: () => undefined, setWorkingMessage: () => undefined } } as unknown as Parameters<typeof __configureFallbackModelsForTests>[1];
+  __configureFallbackModelsForTests([], ctx);
+  const delegate = (_model: Model<Api>, context: Context) => {
+    prompts.push(context.systemPrompt);
+    return streamFrom([startEvent(), doneEvent()]);
+  };
+  await collect(streamWithLimitsRetry(delegate, mockModel("claude", "anthropic"), { systemPrompt: "You are pi, a coding agent.", messages: [] }, { apiKey: "sk-ant-api-test" } as SimpleStreamOptions));
+  ok("does not add Claude Code identity to Anthropic API-key requests even if OAuth is configured", prompts[0] === "You are pi, a coding agent.", `prompt=${prompts[0]}`);
+  __configureFallbackModelsForTests([]);
+}
+{
+  const prompts: Array<string | undefined> = [];
+  const ctx = { modelRegistry: { isUsingOAuth: () => true }, ui: { notify: () => undefined, setStatus: () => undefined, setWorkingMessage: () => undefined } } as unknown as Parameters<typeof __configureFallbackModelsForTests>[1];
+  __configureFallbackModelsForTests([], ctx);
+  const delegate = (_model: Model<Api>, context: Context) => {
+    prompts.push(context.systemPrompt);
+    return streamFrom([startEvent(), doneEvent()]);
+  };
+  await collect(streamWithLimitsRetry(delegate, mockModel("gpt", "openai"), { systemPrompt: "You are pi, a coding agent.", messages: [] }, { apiKey: "sk-ant-oat-test" } as SimpleStreamOptions));
+  ok("does not add Claude Code identity to non-Anthropic requests even with an OAuth-looking token", prompts[0] === "You are pi, a coding agent.", `prompt=${prompts[0]}`);
+  __configureFallbackModelsForTests([]);
+}
+{
+  const prompts: Array<string | undefined> = [];
+  const primary = mockModel("gpt", "openai");
+  const fallback = mockModel("claude", "anthropic");
+  __configureFallbackModelsForTests(
+    [{ model: fallback }],
+    { modelRegistry: { isUsingOAuth: () => false, getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "sk-ant-oat-fallback", headers: {} }) }, ui: { notify: () => undefined, setStatus: () => undefined, setWorkingMessage: () => undefined } } as unknown as Parameters<typeof __configureFallbackModelsForTests>[1],
+  );
+  const delegate = (model: Model<Api>, context: Context) => {
+    prompts.push(context.systemPrompt);
+    return model.provider === "openai"
+      ? streamFrom([startEvent(), errorEvent("HTTP 429 retry-after 0.01")])
+      : streamFrom([startEvent(), doneEvent()]);
+  };
+  const events = await collect(streamWithLimitsRetry(delegate, primary, { systemPrompt: "You are pi, a coding agent.\n\nKeep this.", messages: [] }, { apiKey: "openai-key" } as SimpleStreamOptions));
+  ok("adds Claude Code identity to Anthropic OAuth fallback only", Boolean(prompts[0] === "You are pi, a coding agent.\n\nKeep this." && prompts[1]?.startsWith("You are Claude Code") && prompts[1]?.includes("Keep this.") && events.at(-1)?.type === "done"), `prompts=${JSON.stringify(prompts)}`);
+  __configureFallbackModelsForTests([]);
+}
+{
+  const prompts: Array<string | undefined> = [];
+  const ctxOAuth = { modelRegistry: { isUsingOAuth: () => true }, ui: { notify: () => undefined, setStatus: () => undefined, setWorkingMessage: () => undefined } } as unknown as Parameters<typeof __configureFallbackModelsForTests>[1];
+  const ctxApiKey = { modelRegistry: { isUsingOAuth: () => false }, ui: { notify: () => undefined, setStatus: () => undefined, setWorkingMessage: () => undefined } } as unknown as Parameters<typeof __configureFallbackModelsForTests>[1];
+  __configureFallbackModelsForTests([], ctxOAuth);
+  let calls = 0;
+  const delegate = (_model: Model<Api>, context: Context) => {
+    prompts.push(context.systemPrompt);
+    calls++;
+    if (calls === 1) {
+      __configureFallbackModelsForTests([], ctxApiKey);
+      return streamFrom([startEvent(), errorEvent("HTTP 429 retry-after 0.001")]);
+    }
+    return streamFrom([startEvent(), doneEvent()]);
+  };
+  const events = await collect(streamWithLimitsRetry(delegate, mockModel("claude", "anthropic"), { systemPrompt: "You are pi, a coding agent.\n\nKeep this.", messages: [] }, {} as SimpleStreamOptions));
+  ok("keeps Anthropic OAuth identity decision stable across retries even if shared context changes", prompts.length === 2 && prompts.every((prompt) => prompt?.startsWith("You are Claude Code")) && events.at(-1)?.type === "done", `prompts=${JSON.stringify(prompts)}`);
+  __configureFallbackModelsForTests([]);
+}
+{
+  const api = "limits-wait-test-rewrap" as Api;
+  const model = { ...mockModel("claude", "anthropic"), api } as Model<Api>;
+  const prompts: Array<string | undefined> = [];
+  const pi = {
+    registerProvider: (_name: string, config: { api?: Api; streamSimple?: (model: Model<Api>, context: Context, options?: SimpleStreamOptions) => ReturnType<typeof streamFrom> }) => {
+      if (!config.api || !config.streamSimple) throw new Error("invalid test provider config");
+      registerApiProvider({ api: config.api, stream: config.streamSimple as never, streamSimple: config.streamSimple as never }, "limits-wait-test-wrapper");
+    },
+  } as unknown as Parameters<typeof registerWrappedApi>[0];
+  const installProvider = (label: string) => {
+    const streamSimple = (_model: Model<Api>, context: Context) => {
+      prompts.push(`${label}:${context.systemPrompt ?? ""}`);
+      return streamFrom([startEvent(), doneEvent()]);
+    };
+    registerApiProvider({ api, stream: streamSimple as never, streamSimple: streamSimple as never }, `limits-wait-test-${label}`);
+  };
+
+  installProvider("first");
+  registerWrappedApi(pi, api);
+  const wrappedOnce = getApiProvider(api)?.streamSimple;
+  registerWrappedApi(pi, api);
+  const wrappedTwice = getApiProvider(api)?.streamSimple;
+  await collect(piStreamSimple(model, { systemPrompt: "You are pi, a coding agent.\n\nKeep this.", messages: [] }, { apiKey: "sk-ant-oat-test" } as SimpleStreamOptions));
+
+  installProvider("second");
+  registerWrappedApi(pi, api);
+  const wrappedAfterOverwrite = getApiProvider(api)?.streamSimple;
+  await collect(piStreamSimple(model, { systemPrompt: "You are pi, a coding agent.\n\nKeep this.", messages: [] }, { apiKey: "sk-ant-oat-test" } as SimpleStreamOptions));
+
+  ok("keeps API wrapping idempotent, but re-wraps if another provider overwrites it", Boolean(wrappedOnce && wrappedOnce === wrappedTwice && wrappedAfterOverwrite !== wrappedOnce && prompts.length === 2 && prompts.every((prompt) => prompt?.includes("You are Claude Code")) && prompts[1]?.startsWith("second:")), `prompts=${JSON.stringify(prompts)}`);
 }
 {
   let calls = 0;
