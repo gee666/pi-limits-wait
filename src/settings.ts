@@ -1,15 +1,15 @@
 import { existsSync, readFileSync } from "fs";
 import { homedir } from "os";
 import { join, resolve } from "path";
-import { getAgentDir, type ExtensionContext } from "@mariozechner/pi-coding-agent";
-import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
+import { getAgentDir, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { FALLBACK_MODELS_KEY, SETTINGS_FILE_NAME } from "./constants.js";
 import { formatModel, modelKey } from "./models.js";
 import { state } from "./state.js";
 import type { ConfiguredModel } from "./types.js";
 
-function isThinkingLevel(value: unknown): value is ThinkingLevel {
-  return ["off", "minimal", "low", "medium", "high", "xhigh"].includes(String(value));
+function isThinkingLevel(value: unknown): value is ModelThinkingLevel {
+  return ["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(String(value));
 }
 
 export function parseConfiguredModels(raw: unknown): ConfiguredModel[] {

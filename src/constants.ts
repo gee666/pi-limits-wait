@@ -3,7 +3,7 @@ export const CLAUDE_CODE_IDENTITY =
 
 export const PI_REMOVAL_ANCHORS = [
   "pi-coding-agent",
-  "@mariozechner/pi-coding-agent",
+  "@earendil-works/pi-coding-agent",
   "badlogic/pi-mono",
 ] as const;
 

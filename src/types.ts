@@ -1,6 +1,12 @@
-import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
-import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
-import type { Api, AssistantMessageEventStream, Context, Model, SimpleStreamOptions } from "@mariozechner/pi-ai";
+import type { ExtensionContext, ModelRuntime } from "@earendil-works/pi-coding-agent";
+import type {
+  Api,
+  AssistantMessageEventStream,
+  Context,
+  Model,
+  ModelsSimpleStreamOptions,
+  ModelThinkingLevel,
+} from "@earendil-works/pi-ai";
 
 export type RetryReason = "rate-limit" | "overloaded" | "authentication" | "model-frozen" | "network" | "retry";
 
@@ -12,12 +18,12 @@ export type RetryableError = {
 export type ConfiguredModel = {
   provider: string;
   modelname: string;
-  reasoningEffort?: ThinkingLevel;
+  reasoningEffort?: ModelThinkingLevel;
 };
 
 export type FallbackModel = {
   model: Model<Api>;
-  reasoningEffort?: ThinkingLevel;
+  reasoningEffort?: ModelThinkingLevel;
 };
 
 export type RateLimitMemory = {
@@ -32,10 +38,11 @@ export type NonRetryableFailureMemory = {
   errorMessage: string;
 };
 
-export type StreamSimpleFn = (
+export type RuntimeStreamSimpleFn = (
+  this: ModelRuntime,
   model: Model<Api>,
   context: Context,
-  options?: SimpleStreamOptions,
-) => AssistantMessageEventStream | Promise<AssistantMessageEventStream>;
+  options?: ModelsSimpleStreamOptions,
+) => AssistantMessageEventStream;
 
 export type TestExtensionContext = ExtensionContext | undefined;
