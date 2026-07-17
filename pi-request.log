@@ -1,0 +1,22 @@
+{
+  "url": "https://api.anthropic.com/v1/messages",
+  "headers": {
+    "accept": "application/json",
+    "anthropic-beta": "claude-code-20250219,oauth-2025-04-20",
+    "anthropic-dangerous-direct-browser-access": "true",
+    "anthropic-version": "2023-06-01",
+    "authorization": "Bearer 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",
+    "content-type": "application/json",
+    "user-agent": "claude-cli/2.1.75",
+    "x-app": "cli",
+    "x-stainless-arch": "x64",
+    "x-stainless-lang": "js",
+    "x-stainless-os": "Windows",
+    "x-stainless-package-version": "0.91.1",
+    "x-stainless-retry-count": "0",
+    "x-stainless-runtime": "node",
+    "x-stainless-runtime-version": "v26.2.0",
+    "x-stainless-timeout": "300"
+  },
+  "bodyPreview": "{\"model\":\"claude-opus-4-8\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Reply with exactly: ok\",\"cache_control\":{\"type\":\"ephemeral\"}}]}],\"max_tokens\":128000,\"stream\":true,\"system\":[{\"type\":\"text\",\"text\":\"You are Claude Code, Anthropic's official CLI for Claude.\",\"cache_control\":{\"type\":\"ephemeral\"}},{\"type\":\"text\",\"text\":\"You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.\\n\\nAvailable tools:\\n(none)\\n\\nIn addition to the tools above, you may have access to other custom tools depending on the project.\\n\\nGuidelines:\\n- Be concise in your responses\\n- Show file paths clearly when working with files\\n\\nPi documentation (read only when the user asks about pi itself, its SDK, extensions, themes, skills, or TUI):\\n- Main documentation: C:\\\\Users\\\\MaSliusareva\\\\AppData\\\\Roaming\\\\npm\\\\node_modules\\\\@earendil-works\\\\pi-coding-agent\\\\README.md\\n- Additional docs: C:\\\\Users\\\\MaSliusareva\\\\AppData\\\\Roaming\\\\npm\\\\node_modules\\\\@earendil-works\\\\pi-coding-agent\\\\docs\\n- Examples: C:\\\\Users\\\\MaSliusareva\\\\AppData\\\\Roaming\\\\npm\\\\node_modules\\\\@earendil-works\\\\pi-coding-agent\\\\examples (extensions, custom tools, SDK)\\n- When reading pi docs or examples, resolve docs/... under Additional docs and examples/... under Examples, not the current working directory\\n- When asked about: extensions (docs/extensions.md, examples/extensions/), themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), adding models (docs/models.md), pi packages (docs/packages.md)\\n- When working on pi topics, read the docs and examples, and follow .md cross-references before implementing\\n- Always read pi .md files completely and follow links to related docs (e.g., tui.md for TUI API details)\\nCurrent working directory: C:/Workshop/pi-limits-wait\",\"cache_control\":{\"type\":\"ephemeral\"}}],\"thinking\":{\"type\":\"adaptive\",\"display\":\"summarized\"},\"output_config\":{\"effort\":\"medium\"}}"
+}

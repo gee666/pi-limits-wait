@@ -1,0 +1,66 @@
+{
+  "time": "2026-07-17T09:45:26.054Z",
+  "method": "POST",
+  "url": "/v1/messages",
+  "headers": {
+    "host": "127.0.0.1:8877",
+    "connection": "keep-alive",
+    "accept": "application/json",
+    "anthropic-beta": "claude-code-20250219,oauth-2025-04-20",
+    "anthropic-version": "2023-06-01",
+    "authorization": "Bearer test-token",
+    "content-type": "application/json",
+    "user-agent": "claude-cli/2.1.75",
+    "x-app": "cli",
+    "accept-language": "*",
+    "sec-fetch-mode": "cors",
+    "accept-encoding": "gzip, deflate",
+    "content-length": "71"
+  },
+  "bodyPreview": "{\"model\":\"claude-opus-4-8\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"
+}
+----
+{
+  "time": "2026-07-17T09:45:26.066Z",
+  "method": "POST",
+  "url": "/v1/messages",
+  "headers": {
+    "host": "127.0.0.1:8877",
+    "connection": "keep-alive",
+    "accept": "application/json",
+    "anthropic-beta": "claude-code-20250219,oauth-2025-04-20",
+    "anthropic-version": "2023-06-01",
+    "authorization": "Bearer test-token",
+    "content-type": "application/json",
+    "user-agent": "claude-cli/2.1.75",
+    "x-app": "cli",
+    "accept-language": "*",
+    "sec-fetch-mode": "cors",
+    "accept-encoding": "gzip, deflate",
+    "content-length": "71"
+  },
+  "bodyPreview": "{\"model\":\"claude-opus-4-8\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"
+}
+----
+{
+  "time": "2026-07-17T09:45:26.071Z",
+  "method": "POST",
+  "url": "/v1/messages",
+  "headers": {
+    "host": "127.0.0.1:8877",
+    "connection": "keep-alive",
+    "accept": "application/json",
+    "anthropic-beta": "claude-code-20250219,oauth-2025-04-20",
+    "anthropic-version": "2023-06-01",
+    "authorization": "Bearer test-token",
+    "content-type": "application/json",
+    "user-agent": "claude-cli/2.1.75",
+    "x-app": "cli",
+    "accept-language": "*",
+    "sec-fetch-mode": "cors",
+    "accept-encoding": "gzip, deflate",
+    "content-length": "71"
+  },
+  "bodyPreview": "{\"model\":\"claude-opus-4-8\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"
+}
+----

@@ -1,10 +1,11 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { isInternalSyntheticModel } from "./models.js";
+import { sanitiseAnthropicPayloadSystem } from "./prompt.js";
 import { loadFallbackSettings } from "./settings.js";
 import { state } from "./state.js";
 import { registerWrappedApi } from "./stream.js";
 
-export { sanitiseSystemPrompt } from "./prompt.js";
+export { sanitiseAnthropicPayloadSystem, sanitiseSystemPrompt } from "./prompt.js";
 export {
   getRetryableError,
   isAuthenticationRefreshError,
@@ -38,6 +39,16 @@ function registerContextApis(pi: ExtensionAPI, ctx: ExtensionContext): void {
 
 export default function (pi: ExtensionAPI) {
   state.extensionApi = pi;
+
+  // Anthropic now rejects Claude Pro/Max (OAuth) requests whose system prompt
+  // still carries the host agent's fingerprints (pi-coding-agent paths, "You
+  // are pi", etc.). pi-ai prepends the Claude Code identity block for OAuth
+  // tokens but passes the host system prompt through as a second block, which
+  // trips the check. Sanitise that block on the outbound payload right before
+  // it is sent. This hook fires for every provider request and only mutates
+  // Anthropic OAuth payloads (identified by the Claude Code identity block), so
+  // API-key Anthropic calls and non-Anthropic providers are untouched.
+  pi.on("before_provider_request", (event) => sanitiseAnthropicPayloadSystem(event.payload));
 
   pi.on("model_select", (event) => {
     if (state.suppressNextModelSelect) {

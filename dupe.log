@@ -1,0 +1,9 @@
+{
+  "url": "https://api.anthropic.com/v1/messages",
+  "method": "POST",
+  "origStatus": "400",
+  "origBody": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Third-party apps now draw from extra usage, not plan limits. Ask your workspace admin to add more and keep going.\"},\"request_id\":\"req_011Cd7QhcMWDc8Aa72nvoVTG\"}",
+  "dupeStatus": "400",
+  "dupeBody": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Third-party apps now draw from extra usage, not plan limits. Ask your workspace admin to add more and keep going.\"},\"request_id\":\"req_011Cd7QhaUtey8LhU4bxJUbo\"}"
+}
+----

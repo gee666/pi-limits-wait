@@ -1,0 +1,5 @@
+globalThis.fetch is: native-builtin
+FAIL 400 A pi-default-fetch: {"type":"error","error":{"type":"invalid_request_error","message":"Third-party apps now draw from extra usage, not plan 
+FAIL 400 B fresh-undici-Agent: {"type":"error","error":{"type":"invalid_request_error","message":"Third-party apps now draw from extra usage, not plan 
+FAIL 400 C fresh-undici-Agent-allowH2: {"type":"error","error":{"type":"invalid_request_error","message":"Third-party apps now draw from extra usage, not plan 
+FAIL 400 D fresh-undici-EnvHttpProxyAgent: {"type":"error","error":{"type":"invalid_request_error","message":"Third-party apps now draw from extra usage, not plan 

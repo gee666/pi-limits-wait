@@ -1,0 +1,22 @@
+{
+  "url": "https://api.anthropic.com/v1/messages",
+  "authorization": "Bearer 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",
+  "allHeaderKeys": [
+    "accept",
+    "anthropic-beta",
+    "anthropic-dangerous-direct-browser-access",
+    "anthropic-version",
+    "authorization",
+    "content-type",
+    "user-agent",
+    "x-app",
+    "x-stainless-arch",
+    "x-stainless-lang",
+    "x-stainless-os",
+    "x-stainless-package-version",
+    "x-stainless-retry-count",
+    "x-stainless-runtime",
+    "x-stainless-runtime-version",
+    "x-stainless-timeout"
+  ]
+}

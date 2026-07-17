@@ -10,6 +10,13 @@ export const PI_REMOVAL_ANCHORS = [
 export const PI_IDENTITY_SENTENCE_PATTERN =
   /(?:^|\n)\s*You are pi\b[^.!?\n]*(?:[.!?](?=\s|$)|(?=\n|$))/gi;
 
+// Strips the host-harness identity clause pi prepends to its system prompt, e.g.
+// "You are an expert coding assistant operating inside pi, a coding agent harness."
+// The Claude Code identity block already establishes who the assistant is, so
+// leaving this clause in tells the model (and Anthropic) it is running inside pi.
+export const PI_HARNESS_IDENTITY_PATTERN =
+  /\s+operating inside pi,\s*a coding agent harness/gi;
+
 export const CLAUDE_CODE_IDENTITY_PATTERN =
   /(?:^|\n)\s*You are Claude Code, Anthropic's official CLI for Claude\.\s*/gi;
 

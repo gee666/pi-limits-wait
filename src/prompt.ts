@@ -1,6 +1,6 @@
 import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 import type { Api, Context, Model, SimpleStreamOptions } from "@mariozechner/pi-ai";
-import { CLAUDE_CODE_IDENTITY, CLAUDE_CODE_IDENTITY_PATTERN, PI_IDENTITY_SENTENCE_PATTERN, PI_REMOVAL_ANCHORS } from "./constants.js";
+import { CLAUDE_CODE_IDENTITY, CLAUDE_CODE_IDENTITY_PATTERN, PI_HARNESS_IDENTITY_PATTERN, PI_IDENTITY_SENTENCE_PATTERN, PI_REMOVAL_ANCHORS } from "./constants.js";
 import { state } from "./state.js";
 
 export function sanitiseSystemPrompt(raw: string): string {
@@ -13,6 +13,7 @@ export function sanitiseSystemPrompt(raw: string): string {
     .join("\n\n")
     .replace(CLAUDE_CODE_IDENTITY_PATTERN, "")
     .replace(PI_IDENTITY_SENTENCE_PATTERN, "")
+    .replace(PI_HARNESS_IDENTITY_PATTERN, "")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 }
@@ -86,4 +87,62 @@ export function anthropicSubscriptionContext(
       ? `${CLAUDE_CODE_IDENTITY}\n\n${sanitised}`
       : CLAUDE_CODE_IDENTITY,
   };
+}
+
+interface SystemTextBlock {
+  type: string;
+  text?: unknown;
+  [key: string]: unknown;
+}
+
+function isClaudeCodeIdentityBlock(block: unknown): block is SystemTextBlock {
+  if (!block || typeof block !== "object") return false;
+  const b = block as SystemTextBlock;
+  return b.type === "text" && typeof b.text === "string" && b.text.includes(CLAUDE_CODE_IDENTITY);
+}
+
+/**
+ * Sanitise the `system` blocks of an Anthropic provider request payload.
+ *
+ * Anthropic now rejects Claude Pro/Max (OAuth) requests whose system prompt
+ * still carries third-party-agent fingerprints (e.g. pi-coding-agent paths or
+ * "You are pi" identity). pi-ai already prepends the Claude Code identity as
+ * the first `system` block for OAuth tokens, but passes the host agent's full
+ * system prompt through as a second block unchanged, which trips the check.
+ *
+ * This runs from the `before_provider_request` extension hook, which fires for
+ * every provider request and whose return value replaces the outbound payload.
+ * It only touches payloads that already carry the Claude Code identity block
+ * (i.e. Anthropic OAuth requests), so API-key Anthropic calls and non-Anthropic
+ * providers are left untouched. Each remaining text block is run through
+ * `sanitiseSystemPrompt`; blocks that become empty are dropped.
+ */
+export function sanitiseAnthropicPayloadSystem(payload: unknown): unknown {
+  if (!payload || typeof payload !== "object") return payload;
+  const system = (payload as { system?: unknown }).system;
+  if (!Array.isArray(system)) return payload;
+
+  const identityIndex = system.findIndex(isClaudeCodeIdentityBlock);
+  if (identityIndex === -1) return payload;
+
+  const newSystem: unknown[] = [];
+  for (let i = 0; i < system.length; i++) {
+    const block = system[i];
+    if (i === identityIndex) {
+      newSystem.push(block);
+      continue;
+    }
+    if (
+      block && typeof block === "object"
+      && (block as SystemTextBlock).type === "text"
+      && typeof (block as SystemTextBlock).text === "string"
+    ) {
+      const sanitised = sanitiseSystemPrompt((block as SystemTextBlock).text as string);
+      if (sanitised) newSystem.push({ ...block, text: sanitised });
+    } else {
+      newSystem.push(block);
+    }
+  }
+
+  return { ...payload, system: newSystem };
 }

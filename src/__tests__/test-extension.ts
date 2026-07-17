@@ -14,6 +14,7 @@ import {
   isServerOverloadedError,
   isTransientNetworkError,
   retryAfterHeaderMs,
+  sanitiseAnthropicPayloadSystem,
   sanitiseSystemPrompt,
   streamWithLimitsRetry,
   waitForRateLimit,
@@ -84,6 +85,51 @@ section("prompt sanitisation");
   ok("removes paragraphs with Pi internals", !sanitised.includes("@mariozechner/pi-coding-agent"));
   ok("keeps unrelated instructions", sanitised.includes("Keep this useful instruction."));
   ok("removes existing Claude Code identity before re-applying", !sanitiseSystemPrompt("You are Claude Code, Anthropic's official CLI for Claude.\n\nKeep this.").includes("Claude Code"));
+  ok("strips host-harness identity clause", !sanitiseSystemPrompt("You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files.").includes("operating inside pi") && sanitiseSystemPrompt("You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files.").includes("You are an expert coding assistant"));
+}
+
+section("anthropic payload system sanitisation");
+{
+  const ccBlock = { type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude.", cache_control: { type: "ephemeral" } };
+  const piPrompt = [
+    "You are an expert coding assistant operating inside pi, a coding agent harness.",
+    "Keep this useful instruction.",
+    "Pi documentation:\n- Main: C:\\pi-coding-agent\\README.md\n- See @mariozechner/pi-coding-agent and badlogic/pi-mono.",
+  ].join("\n\n");
+  const payload = {
+    model: "claude-opus-4-8",
+    messages: [{ role: "user", content: "hi" }],
+    max_tokens: 128000,
+    stream: true,
+    system: [ccBlock, { type: "text", text: piPrompt, cache_control: { type: "ephemeral" } }],
+    thinking: { type: "adaptive", display: "summarized" },
+    output_config: { effort: "medium" },
+  };
+  const result = sanitiseAnthropicPayloadSystem(payload) as typeof payload;
+  ok("keeps Claude Code identity block", (result.system[0] as { text: string }).text === ccBlock.text);
+  ok("keeps non-pi paragraphs in second block", (result.system[1] as { text: string }).text.includes("Keep this useful instruction."));
+  ok("removes pi-anchor paragraphs from second block", !(result.system[1] as { text: string }).text.includes("pi-coding-agent") && !(result.system[1] as { text: string }).text.includes("badlogic/pi-mono"));
+  ok("preserves unrelated payload fields", result.model === "claude-opus-4-8" && result.thinking.type === "adaptive" && result.output_config.effort === "medium");
+  ok("preserves cache_control on second block", (result.system[1] as { cache_control: { type: string } }).cache_control.type === "ephemeral");
+}
+{
+  // Non-OAuth Anthropic payload (no Claude Code identity block) is left untouched.
+  const payload = { model: "claude-opus-4-8", system: [{ type: "text", text: "pi-coding-agent docs here" }] };
+  ok("leaves non-OAuth Anthropic payload unchanged", sanitiseAnthropicPayloadSystem(payload) === payload);
+}
+{
+  // Non-Anthropic / non-object payloads pass through unchanged.
+  ok("leaves non-object payload unchanged", sanitiseAnthropicPayloadSystem(undefined) === undefined);
+  {
+    const noSystem = { model: "gpt", system: "single string" };
+    ok("leaves payload without system array unchanged", sanitiseAnthropicPayloadSystem(noSystem) === noSystem);
+  }
+}
+{
+  // A second block that sanitises to empty is dropped entirely.
+  const payload = { system: [{ type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude." }, { type: "text", text: "@mariozechner/pi-coding-agent only" }] };
+  const result = sanitiseAnthropicPayloadSystem(payload) as { system: unknown[] };
+  ok("drops system blocks that become empty after sanitisation", result.system.length === 1);
 }
 
 section("retryable detection");
