@@ -22,6 +22,7 @@ import {
   isRateLimitError,
   isServerOverloadedError,
   isTransientNetworkError,
+  loadUnknownErrorRetrySettings,
   retryAfterHeaderMs,
   sanitiseAnthropicPayloadSystem,
   sanitiseSystemPrompt,
@@ -135,6 +136,23 @@ section("settings and waits");
   else process.env.PI_LIMITS_WAIT_FREEZING_ENABLED = previous;
 }
 {
+  const previous = {
+    waiting: process.env.PI_LIMITS_WAIT_DEFAULT_WAITING,
+    maxRetry: process.env.PI_LIMITS_WAIT_MAX_RETRY,
+    interval: process.env.PI_LIMITS_WAIT_RETRY_INTERVAL,
+  };
+  process.env.PI_LIMITS_WAIT_DEFAULT_WAITING = "false";
+  process.env.PI_LIMITS_WAIT_MAX_RETRY = "7";
+  process.env.PI_LIMITS_WAIT_RETRY_INTERVAL = "2";
+  loadUnknownErrorRetrySettings();
+  ok("unknown-error retry environment settings work", !state.unknownErrorWaitingEnabled && state.nonRetryableMaxAttempts === 8 && state.nonRetryableRetryDelayMs === 2_000);
+  for (const [key, value] of Object.entries(previous)) {
+    if (value === undefined) delete process.env[key === "waiting" ? "PI_LIMITS_WAIT_DEFAULT_WAITING" : key === "maxRetry" ? "PI_LIMITS_WAIT_MAX_RETRY" : "PI_LIMITS_WAIT_RETRY_INTERVAL"];
+    else process.env[key === "waiting" ? "PI_LIMITS_WAIT_DEFAULT_WAITING" : key === "maxRetry" ? "PI_LIMITS_WAIT_MAX_RETRY" : "PI_LIMITS_WAIT_RETRY_INTERVAL"] = value;
+  }
+  loadUnknownErrorRetrySettings();
+}
+{
   const controller = new AbortController();
   controller.abort();
   ok("pre-aborted wait resolves immediately", await waitForRateLimit(60_000, controller.signal) === "aborted");
@@ -192,6 +210,41 @@ async function createRuntime(
     });
   }
   return runtime;
+}
+
+section("unknown-error retry integration");
+{
+  const calls: Record<string, ProviderCall[]> = {};
+  let attempts = 0;
+  const runtime = await createRuntime({
+    unknown(model) {
+      attempts++;
+      return attempts === 1
+        ? streamFrom([startEvent(model), errorEvent(model, "Internal server error")])
+        : streamFrom([startEvent(model), doneEvent(model)]);
+    },
+  }, calls);
+  const model = runtime.getModel("unknown", "unknown-model")!;
+  state.unknownErrorWaitingEnabled = true;
+  __setNonRetryableTuningForTests(2, 0);
+  const release = installModelRuntimeInterception();
+  const events = await collect(runtime.streamSimple(model, context));
+  ok("unknown errors wait and retry by default", attempts === 2 && events.at(-1)?.type === "done");
+  release();
+  __setNonRetryableTuningForTests(1_000_000, 5_000);
+}
+{
+  const calls: Record<string, ProviderCall[]> = {};
+  const runtime = await createRuntime({
+    unknown(model) { return streamFrom([startEvent(model), errorEvent(model, "Internal server error")]); },
+  }, calls);
+  const model = runtime.getModel("unknown", "unknown-model")!;
+  state.unknownErrorWaitingEnabled = false;
+  const release = installModelRuntimeInterception();
+  const events = await collect(runtime.streamSimple(model, context));
+  ok("disabled unknown-error waiting surfaces the first failure", calls.unknown?.length === 1 && events.at(-1)?.type === "error");
+  release();
+  state.unknownErrorWaitingEnabled = true;
 }
 
 section("real ModelRuntime retry integration");

@@ -22,7 +22,7 @@ Restart Pi or run `/reload` after installing.
 - If no retry timing is available for a rate limit, waits 30 minutes before retrying.
 - On `server_is_overloaded`, waits 5 minutes, then retries. If the provider is still overloaded after Pi's normal retries, it waits another 5 minutes and repeats.
 - On transient network/transport failures — including undici idle-timeout aborts (`UND_ERR_HEADERS_TIMEOUT` / `UND_ERR_BODY_TIMEOUT`), `fetch failed`, `terminated`, `ECONNRESET`, `ETIMEDOUT`, etc. — treats the error as retryable with a short backoff (default 15s, or the provider's `retry-after`) instead of giving up. This prevents a stalled streaming request from turning into a silent hang.
-- For any other (unclassified) non-retryable error, retries the same model a few times (default 3) before falling back / freezing it, so a one-off hiccup does not immediately sideline a model.
+- For any other (unclassified) provider error — including an API `Internal server error` — waits and retries the same model. This is enabled by default and uses a configurable retry limit and interval; it does not alter model-limit wait intervals.
 - Reports retry/fallback waits in chat notifications without adding persistent TUI status lines.
 - Press Enter during a retry wait to skip the wait and retry immediately.
 - Optionally falls back to configured models when the current/default model is rate-limited. Every fallback to a different model—even on the same provider—deliberately discards request-owned credentials, headers, environment overrides, and provider-specific options so the target runtime resolves its own configuration.
@@ -87,7 +87,10 @@ When the settings are loaded, the extension shows the full usable fallback model
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PI_LIMITS_WAIT_FREEZING_ENABLED` | `true` | When a model keeps failing with a non-retryable error, it is normally "frozen" for 1 hour and skipped in favour of other configured models. Set this to `false` (also accepts `0`, `no`, `off`) to disable freezing entirely: the extension will instead try each configured candidate once (after the bounded retries) and then surface the error, never blocking on a long "model-frozen" wait. Useful for non-interactive / subagent runs where no one can press Enter to skip. |
+| `PI_LIMITS_WAIT_DEFAULT_WAITING` | `true` | Whether unclassified/unknown provider errors enter the wait-and-retry cycle. Set to `false` (also accepts `0`, `no`, `off`) to surface the error immediately. Rate-limit, overload, authentication, and network retry behavior is unchanged. |
+| `PI_LIMITS_WAIT_MAX_RETRY` | `999999` | Maximum retries for an unclassified/unknown provider error. The initial failed request does not count as a retry. Must be a non-negative integer. |
+| `PI_LIMITS_WAIT_RETRY_INTERVAL` | `5` | Seconds to wait between unclassified/unknown provider-error retries. Must be a non-negative integer (values above 2147483 are capped to Node's maximum reliable timer delay). This does not affect model-limit wait intervals. |
+| `PI_LIMITS_WAIT_FREEZING_ENABLED` | `true` | When a model keeps failing with a non-retryable error, it is normally "frozen" for 10 minutes and skipped in favour of other configured models. Set this to `false` (also accepts `0`, `no`, `off`) to disable freezing entirely: the extension will instead try each configured candidate once (after the bounded retries) and then surface the error, never blocking on a long "model-frozen" wait. Useful for non-interactive / subagent runs where no one can press Enter to skip. |
 
 ## License
 

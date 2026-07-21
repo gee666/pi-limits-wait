@@ -405,7 +405,7 @@ export function streamWithLimitsRetry(
           output.end();
         };
 
-        if (!committed) {
+        if (!committed && state.unknownErrorWaitingEnabled) {
           const key = modelKey(attempt.model);
           const attempts = (nonRetryableAttempts.get(key) ?? 0) + 1;
           nonRetryableAttempts.set(key, attempts);

@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Api, Model, ModelThinkingLevel } from "@earendil-works/pi-ai";
-import { NON_RETRYABLE_MAX_ATTEMPTS, NON_RETRYABLE_RETRY_DELAY_MS } from "./constants.js";
+import { DEFAULT_UNKNOWN_ERROR_MAX_RETRIES, DEFAULT_UNKNOWN_ERROR_RETRY_INTERVAL_MS } from "./constants.js";
 import type { FallbackModel, NonRetryableFailureMemory, RateLimitMemory } from "./types.js";
 
 export const state = {
@@ -9,8 +9,10 @@ export const state = {
   ambientStatusCleanup: undefined as (() => void) | undefined,
   modelStatusCleanup: undefined as (() => void) | undefined,
   fallbackModels: [] as FallbackModel[],
-  nonRetryableMaxAttempts: NON_RETRYABLE_MAX_ATTEMPTS,
-  nonRetryableRetryDelayMs: NON_RETRYABLE_RETRY_DELAY_MS,
+  unknownErrorWaitingEnabled: true,
+  // Includes the initial request, so the default is one more than max retries.
+  nonRetryableMaxAttempts: DEFAULT_UNKNOWN_ERROR_MAX_RETRIES + 1,
+  nonRetryableRetryDelayMs: DEFAULT_UNKNOWN_ERROR_RETRY_INTERVAL_MS,
   primaryModel: undefined as Model<Api> | undefined,
   primaryThinkingLevel: undefined as ModelThinkingLevel | undefined,
   expectedModelSelections: new Map<string, Set<symbol>>(),

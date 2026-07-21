@@ -1,4 +1,11 @@
-import { FREEZING_ENV_VAR } from "./constants.js";
+import {
+  DEFAULT_UNKNOWN_ERROR_MAX_RETRIES,
+  DEFAULT_UNKNOWN_ERROR_RETRY_INTERVAL_MS,
+  DEFAULT_WAITING_ENV_VAR,
+  FREEZING_ENV_VAR,
+  MAX_RETRY_ENV_VAR,
+  RETRY_INTERVAL_ENV_VAR,
+} from "./constants.js";
 import { state } from "./state.js";
 import type { RetryReason } from "./types.js";
 
@@ -25,11 +32,41 @@ export function reasonLabel(reason: RetryReason): string {
   return "Rate limited";
 }
 
-export function freezingEnabled(): boolean {
-  const raw = process.env[FREEZING_ENV_VAR];
-  if (raw === undefined) return true;
+function envBoolean(raw: string | undefined, defaultValue: boolean): boolean {
+  if (raw === undefined) return defaultValue;
   const value = raw.trim().toLowerCase();
   return !(value === "false" || value === "0" || value === "no" || value === "off");
+}
+
+function envNonNegativeInteger(raw: string | undefined, defaultValue: number, maximum = Number.MAX_SAFE_INTEGER): number {
+  if (raw === undefined || !/^\d+$/.test(raw.trim())) return defaultValue;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) ? Math.min(value, maximum) : defaultValue;
+}
+
+export function freezingEnabled(): boolean {
+  return envBoolean(process.env[FREEZING_ENV_VAR], true);
+}
+
+/** Load unknown-error retry settings once per extension instance/reload. */
+export function loadUnknownErrorRetrySettings(): void {
+  state.unknownErrorWaitingEnabled = envBoolean(process.env[DEFAULT_WAITING_ENV_VAR], true);
+  const maxRetries = envNonNegativeInteger(
+    process.env[MAX_RETRY_ENV_VAR],
+    DEFAULT_UNKNOWN_ERROR_MAX_RETRIES,
+    Number.MAX_SAFE_INTEGER - 1,
+  );
+  // The first failed request is not itself a retry.
+  state.nonRetryableMaxAttempts = maxRetries + 1;
+
+  // PI_LIMITS_WAIT_RETRY_INTERVAL is expressed in seconds; internally waits use ms.
+  const intervalSeconds = envNonNegativeInteger(
+    process.env[RETRY_INTERVAL_ENV_VAR],
+    DEFAULT_UNKNOWN_ERROR_RETRY_INTERVAL_MS / 1_000,
+    // Node timers cannot reliably wait longer than this in one timeout.
+    Math.floor(2_147_483_647 / 1_000),
+  );
+  state.nonRetryableRetryDelayMs = intervalSeconds * 1_000;
 }
 
 function countdownText(reason: RetryReason, deadline: number, allowSkip: boolean): string {

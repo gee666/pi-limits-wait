@@ -2,6 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { isInternalSyntheticModel } from "./models.js";
 import { sanitiseAnthropicPayloadSystem } from "./prompt.js";
 import { loadFallbackSettings } from "./settings.js";
+import { loadUnknownErrorRetrySettings } from "./ui.js";
 import { consumeExpectedModelSelection, state } from "./state.js";
 import { installModelRuntimeInterception } from "./stream.js";
 
@@ -28,11 +29,12 @@ export {
   streamWithLimitsRetry,
   streamWithRateLimitRetry,
 } from "./stream.js";
-export { freezingEnabled, waitForRateLimit, waitForRetry } from "./ui.js";
+export { freezingEnabled, loadUnknownErrorRetrySettings, waitForRateLimit, waitForRetry } from "./ui.js";
 export type { FallbackModel } from "./types.js";
 
 export default function (pi: ExtensionAPI) {
   state.extensionApi = pi;
+  loadUnknownErrorRetrySettings();
   const releaseInterception = installModelRuntimeInterception();
 
   // Current pi-ai inserts the Claude Code identity as the first system block
