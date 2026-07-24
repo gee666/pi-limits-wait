@@ -28,6 +28,7 @@ import {
 } from "./models.js";
 import { withAttemptResponseObserver } from "./response-observer.js";
 import { errorMessageWithCauses, getRetryableError, isAbortMessage, parseRetryDelayMs, retryAfterHeaderMs } from "./retry-errors.js";
+import { loadFallbackSettings } from "./settings.js";
 import { state } from "./state.js";
 import type { FallbackModel, RetryableError, RuntimeStreamSimpleFn } from "./types.js";
 import { clearModelStatus, freezingEnabled, reasonLabel, waitForRetry } from "./ui.js";
@@ -172,6 +173,11 @@ export function streamWithLimitsRetry(
   const signal = options?.signal && ownerSignal
     ? AbortSignal.any([options.signal, ownerSignal])
     : options?.signal ?? ownerSignal;
+
+  // A long-running agent task can make many LLM calls between tool calls.
+  // Refresh here—not only in before_agent_start—so project settings edited
+  // during that task take effect on the next LLM call without /reload.
+  if (state.sharedCtx?.modelRegistry) loadFallbackSettings(state.sharedCtx);
 
   void (async () => {
     let committed = false;

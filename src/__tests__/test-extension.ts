@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { ModelRuntime, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   createAssistantMessageEventStream,
   type Api,
@@ -26,6 +26,7 @@ import {
   retryAfterHeaderMs,
   sanitiseAnthropicPayloadSystem,
   sanitiseSystemPrompt,
+  streamWithLimitsRetry,
   waitForRateLimit,
 } from "../index.js";
 import { withAttemptResponseObserver } from "../response-observer.js";
@@ -173,6 +174,44 @@ section("settings and waits");
     const resolved = __readFallbackSettingsForTests(project, agent, home);
     ok("loads settings in documented precedence", resolved.loadedPaths.length === 4 && resolved.config.keep === "project");
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+{
+  const root = mkdtempSync(join(tmpdir(), "limits-wait-refresh-"));
+  try {
+    const settingsDir = join(root, ".pi");
+    mkdirSync(settingsDir, { recursive: true });
+    const settingsPath = join(settingsDir, "limits-wait.json");
+    const primary = { provider: "refresh", id: "primary", api: "openai-completions" } as Model<Api>;
+    const first = { provider: "refresh", id: "first", api: "openai-completions" } as Model<Api>;
+    const second = { provider: "refresh", id: "second", api: "openai-completions" } as Model<Api>;
+    const models = new Map([[first.id, first], [second.id, second]]);
+    const ctx = {
+      cwd: root,
+      modelRegistry: {
+        find: (provider: string, id: string) => provider === "refresh" ? models.get(id) : undefined,
+        hasConfiguredAuth: () => true,
+      },
+      ui: { notify: () => undefined },
+    } as unknown as ExtensionContext;
+    const seen: string[] = [];
+    const delegate = ((_model: Model<Api>) => {
+      seen.push(state.fallbackModels[0]?.model.id ?? "none");
+      return streamFrom([doneEvent(primary)]);
+    }) as Parameters<typeof streamWithLimitsRetry>[1];
+    const requestContext: Context = { systemPrompt: "", messages: [] };
+
+    state.sharedCtx = ctx;
+    state.primaryModel = primary;
+    writeFileSync(settingsPath, JSON.stringify({ "fallback-models": [{ provider: "refresh", modelname: "first" }] }));
+    await collect(streamWithLimitsRetry({} as ModelRuntime, delegate, primary, requestContext));
+    writeFileSync(settingsPath, JSON.stringify({ "fallback-models": [{ provider: "refresh", modelname: "second" }] }));
+    await collect(streamWithLimitsRetry({} as ModelRuntime, delegate, primary, requestContext));
+
+    ok("reloads fallback settings before every LLM call", seen.join(",") === "first,second", `seen=${seen.join(",")}`);
+  } finally {
+    __configureFallbackModelsForTests([]);
     rmSync(root, { recursive: true, force: true });
   }
 }

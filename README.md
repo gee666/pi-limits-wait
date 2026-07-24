@@ -81,7 +81,7 @@ Fallback behavior:
 4. If that model later becomes rate-limited too, the extension starts again from the same ordered list.
 5. Rate-limit reset times are remembered only in memory, so known-limited models are skipped until their countdown expires. This memory is cleared when Pi restarts.
 
-When the settings are loaded, the extension shows the full usable fallback model list. When models become rate-limited, it reports the wait in chat notifications.
+The extension rereads these files before every LLM call, so changes made during a long-running task take effect on the next LLM call without restarting Pi or using `/reload`. Tool calls do not trigger a settings read. When the settings are loaded, the extension shows the full usable fallback model list. When models become rate-limited, it reports the wait in chat notifications.
 
 ## Environment variables
 
