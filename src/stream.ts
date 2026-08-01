@@ -28,9 +28,10 @@ import {
 } from "./models.js";
 import { withAttemptResponseObserver } from "./response-observer.js";
 import { errorMessageWithCauses, getRetryableError, isAbortMessage, parseRetryDelayMs, retryAfterHeaderMs } from "./retry-errors.js";
+import type { RetryPeriodTracker } from "./retry-summary.js";
 import { loadFallbackSettings } from "./settings.js";
 import { state } from "./state.js";
-import type { FallbackModel, RetryableError, RuntimeStreamSimpleFn } from "./types.js";
+import type { FallbackModel, RetryReason, RetryableError, RuntimeStreamSimpleFn } from "./types.js";
 import { clearModelStatus, freezingEnabled, reasonLabel, waitForRetry } from "./ui.js";
 
 export function __setNonRetryableTuningForTests(maxAttempts: number, retryDelayMs: number): void {
@@ -168,6 +169,7 @@ export function streamWithLimitsRetry(
   context: Context,
   options?: ModelsSimpleStreamOptions,
   ownerSignal?: AbortSignal,
+  retryPeriod?: RetryPeriodTracker,
 ): AssistantMessageEventStream {
   const output = createAssistantMessageEventStream();
   const signal = options?.signal && ownerSignal
@@ -189,12 +191,22 @@ export function streamWithLimitsRetry(
     const nonRetryableAttempts = new Map<string, number>();
     const triedModels = new Set<string>();
 
+    const managedWait = async (reason: RetryReason, waitMs: number, error: string) =>
+      waitForRetry(reason, waitMs, signal, {
+        periodId: retryPeriod?.periodId,
+        model: attempt.model,
+        error,
+        events: retryPeriod?.events,
+        onEnd: (elapsedMs) => retryPeriod?.recordWait(elapsedMs),
+      });
+
     const flush = (buffer: AssistantMessageEvent[]) => {
       for (const event of buffer) output.push(event);
       committed = true;
     };
 
     const pushAbort = (message: string) => {
+      retryPeriod?.finalize();
       if (!committed) {
         output.push({ type: "start", partial: freshMessage(attempt.model) });
         committed = true;
@@ -281,8 +293,10 @@ export function streamWithLimitsRetry(
         await priorOnResponse?.(response, responseModel);
         if (signal?.aborted) return;
         // Throw only after the canonical callback, so after_provider_response
-        // still sees the response and 429 fallback can start immediately.
-        if (response.status === 429) throw new Error(observedHttpError);
+        // still sees every HTTP failure. All statuses remain retry eligible:
+        // classified failures use their normal policy and 400/403 deliberately
+        // enter the configured unknown-error retry loop.
+        if (response.status >= 400) throw new Error(observedHttpError);
       };
 
       try {
@@ -347,6 +361,7 @@ export function streamWithLimitsRetry(
                 output.push({ type: "start", partial: freshMessage(attempt.model) });
                 committed = true;
               }
+              if (event.type === "done") retryPeriod?.finalize();
               output.push(event);
               if (event.type === "done") {
                 finished = true;
@@ -356,6 +371,8 @@ export function streamWithLimitsRetry(
               continue;
             }
 
+            if (event.type === "error") retryPeriod?.recordReason(event.error.errorMessage ?? "Provider stream error");
+            if (event.type === "done" || event.type === "error") retryPeriod?.finalize();
             output.push(event);
             if (event.type === "done" || event.type === "error") {
               finished = true;
@@ -394,6 +411,8 @@ export function streamWithLimitsRetry(
         const failureEvent = nonRetryableError?.event;
         const failureMessage = nonRetryableError?.message ?? "Provider stream ended without a terminal event.";
         const emitFailure = () => {
+          retryPeriod?.recordReason(failureMessage);
+          retryPeriod?.finalize();
           if (!committed) {
             if (buffer.length > 0) flush(buffer);
             else {
@@ -417,10 +436,13 @@ export function streamWithLimitsRetry(
           nonRetryableAttempts.set(key, attempts);
           if (attempts < state.nonRetryableMaxAttempts) {
             notifyRetryingAfterError(attempt.model, state.nonRetryableRetryDelayMs, failureMessage);
-            if (await waitForRetry("retry", state.nonRetryableRetryDelayMs, signal) === "aborted") {
+            retryPeriod?.beginRetry(failureMessage);
+            const wait = await managedWait("retry", state.nonRetryableRetryDelayMs, failureMessage);
+            if (wait === "aborted" || signal?.aborted) {
               pushAbort("Request aborted while retrying after error.");
               return;
             }
+            retryPeriod?.completeRetry();
             continue;
           }
 
@@ -430,16 +452,19 @@ export function streamWithLimitsRetry(
               rememberNonRetryableFailure(attempt.model, failureMessage);
               const next = nextAvailableCandidate(attempt.model);
               if (next) {
+                retryPeriod?.recordImmediateRetry(failureMessage);
                 attempt = next;
                 continue;
               }
               const deadline = earliestCandidateDeadline(attempt.model);
               if (deadline) {
-                const wait = await waitForRetry("model-frozen", Math.max(0, deadline - Date.now()), signal);
-                if (wait === "aborted") {
+                retryPeriod?.beginRetry(failureMessage);
+                const wait = await managedWait("model-frozen", Math.max(0, deadline - Date.now()), failureMessage);
+                if (wait === "aborted" || signal?.aborted) {
                   pushAbort("Request aborted while all fallback models were frozen.");
                   return;
                 }
+                retryPeriod?.completeRetry();
                 attempt = nextAvailableCandidate(attempt.model)
                   ?? configuredAttempt(getPrimaryModel(attempt.model));
                 continue;
@@ -447,6 +472,7 @@ export function streamWithLimitsRetry(
             } else {
               const next = candidateOrder(attempt.model).find((entry) => !triedModels.has(modelKey(entry.model)));
               if (next) {
+                retryPeriod?.recordImmediateRetry(failureMessage);
                 attempt = next;
                 continue;
               }
@@ -460,37 +486,49 @@ export function streamWithLimitsRetry(
       if (allowFallback) {
         if (retryable.reason === "network") {
           notifyRetryableError(attempt.model, retryable, retryableErrorMessage);
-          if (await waitForRetry(retryable.reason, retryable.waitMs, signal) === "aborted") {
+          retryPeriod?.beginRetry(retryableErrorMessage);
+          const wait = await managedWait(retryable.reason, retryable.waitMs, retryableErrorMessage);
+          if (wait === "aborted" || signal?.aborted) {
             pushAbort(`Request aborted during ${reasonLabel(retryable.reason).toLowerCase()} wait.`);
             return;
           }
+          retryPeriod?.completeRetry();
           continue;
         }
 
         rememberRateLimit(attempt.model, retryable, retryableErrorMessage);
         const next = nextAvailableCandidate(attempt.model);
         if (next) {
+          retryPeriod?.recordImmediateRetry(retryableErrorMessage);
           attempt = next;
           continue;
         }
         const deadline = earliestCandidateDeadline(attempt.model);
         const waitMs = deadline ? Math.max(0, deadline - Date.now()) : retryable.waitMs;
-        if (await waitForRetry(retryable.reason, waitMs, signal) === "aborted") {
+        retryPeriod?.beginRetry(retryableErrorMessage);
+        const wait = await managedWait(retryable.reason, waitMs, retryableErrorMessage);
+        if (wait === "aborted" || signal?.aborted) {
           pushAbort(`Request aborted during ${reasonLabel(retryable.reason).toLowerCase()} wait.`);
           return;
         }
+        retryPeriod?.completeRetry();
         attempt = nextAvailableCandidate(attempt.model)
           ?? configuredAttempt(getPrimaryModel(attempt.model));
         continue;
       }
 
       notifyRetryableError(attempt.model, retryable, retryableErrorMessage);
-      if (await waitForRetry(retryable.reason, retryable.waitMs, signal) === "aborted") {
+      retryPeriod?.beginRetry(retryableErrorMessage);
+      const wait = await managedWait(retryable.reason, retryable.waitMs, retryableErrorMessage);
+      if (wait === "aborted" || signal?.aborted) {
         pushAbort(`Request aborted during ${reasonLabel(retryable.reason).toLowerCase()} wait.`);
         return;
       }
+      retryPeriod?.completeRetry();
     }
   })().catch((error) => {
+    retryPeriod?.recordReason(errorMessageWithCauses(error));
+    retryPeriod?.finalize();
     const failure = freshMessage(model);
     failure.stopReason = signal?.aborted ? "aborted" : "error";
     failure.errorMessage = errorMessageWithCauses(error);
@@ -526,23 +564,30 @@ interface InterceptionSlot {
 type InterceptablePrototype = ModelRuntime & { [INTERCEPTION_SYMBOL]?: InterceptionSlot };
 
 /** Install one stable, reload-safe process-wide trampoline. */
-export function installModelRuntimeInterception(): () => boolean {
+export function installModelRuntimeInterception(
+  createRetryPeriod?: () => RetryPeriodTracker,
+): () => boolean {
   const prototype = ModelRuntime.prototype as InterceptablePrototype;
   const owner = {};
   const controller = new AbortController();
   let slot = prototype[INTERCEPTION_SYMBOL];
 
-  const handler: InterceptionHandler = (runtime, model, context, options, delegate) =>
-    streamWithLimitsRetry(runtime, delegate, model, context, options, controller.signal);
+  const handler: InterceptionHandler = (runtime, model, context, options, delegate) => {
+    let retryPeriod: RetryPeriodTracker | undefined;
+    try { retryPeriod = createRetryPeriod?.(); } catch { /* summary tracking is observational */ }
+    return streamWithLimitsRetry(runtime, delegate, model, context, options, controller.signal, retryPeriod);
+  };
 
   if (slot && prototype.streamSimple === slot.wrapper) {
-    slot.abortOwner?.();
+    const previousAbort = slot.abortOwner;
     slot.owner = owner;
     slot.abortOwner = () => controller.abort();
     slot.handler = handler;
+    // Publish the new owner before abort telemetry can re-enter interception.
+    previousAbort?.();
   } else {
+    const previousAbort = slot?.abortOwner;
     if (slot) {
-      slot.abortOwner?.();
       slot.owner = undefined;
       slot.abortOwner = undefined;
       slot.handler = undefined;
@@ -565,14 +610,17 @@ export function installModelRuntimeInterception(): () => boolean {
       value: slot,
     });
     prototype.streamSimple = slot.wrapper;
+    previousAbort?.();
   }
 
   return () => {
     if (slot?.owner !== owner) return false;
-    slot.abortOwner?.();
+    const abortOwner = slot.abortOwner;
     slot.owner = undefined;
     slot.abortOwner = undefined;
     slot.handler = undefined;
-    return true;
+    abortOwner?.();
+    // A re-entrant install during abort owns the shared slot now.
+    return slot.owner === undefined;
   };
 }

@@ -34,26 +34,37 @@ export function parseConfiguredModels(raw: unknown): ConfiguredModel[] {
   return models;
 }
 
-export function configFileCandidates(cwd: string, agentDir = getAgentDir(), homeDir = homedir()): string[] {
-  return [
+export function configFileCandidates(
+  cwd: string,
+  agentDir = getAgentDir(),
+  homeDir = homedir(),
+  isProjectTrusted = false,
+): string[] {
+  const alwaysLoaded = [
     join(homeDir, ".config", ".pi", SETTINGS_FILE_NAME),
     join(agentDir, SETTINGS_FILE_NAME),
-    resolve(cwd, `.${SETTINGS_FILE_NAME}`),
-    resolve(cwd, ".pi", SETTINGS_FILE_NAME),
   ];
+  return isProjectTrusted
+    ? [...alwaysLoaded, resolve(cwd, `.${SETTINGS_FILE_NAME}`), resolve(cwd, ".pi", SETTINGS_FILE_NAME)]
+    : alwaysLoaded;
 }
 
 function mergeConfig(base: Record<string, unknown>, override: Record<string, unknown>): Record<string, unknown> {
   return { ...base, ...override };
 }
 
-export function readFallbackSettings(cwd: string, agentDir = getAgentDir(), homeDir = homedir()): { config: Record<string, unknown>; loadedPaths: string[]; warnings: string[] } {
+export function readFallbackSettings(
+  cwd: string,
+  agentDir = getAgentDir(),
+  homeDir = homedir(),
+  isProjectTrusted = false,
+): { config: Record<string, unknown>; loadedPaths: string[]; warnings: string[] } {
   let config: Record<string, unknown> = {};
   const loadedPaths: string[] = [];
   const warnings: string[] = [];
   const seen = new Set<string>();
 
-  for (const candidate of configFileCandidates(cwd, agentDir, homeDir)) {
+  for (const candidate of configFileCandidates(cwd, agentDir, homeDir, isProjectTrusted)) {
     const path = resolve(candidate);
     if (seen.has(path)) continue;
     seen.add(path);
@@ -75,15 +86,25 @@ export function readFallbackSettings(cwd: string, agentDir = getAgentDir(), home
   return { config, loadedPaths, warnings };
 }
 
-export function __readFallbackSettingsForTests(cwd: string, agentDir: string, homeDir: string): { config: Record<string, unknown>; loadedPaths: string[]; warnings: string[] } {
-  return readFallbackSettings(cwd, agentDir, homeDir);
+export function __readFallbackSettingsForTests(
+  cwd: string,
+  agentDir: string,
+  homeDir: string,
+  isProjectTrusted: boolean,
+): { config: Record<string, unknown>; loadedPaths: string[]; warnings: string[] } {
+  return readFallbackSettings(cwd, agentDir, homeDir, isProjectTrusted);
 }
 
 export function loadFallbackSettings(ctx: ExtensionContext): void {
   state.fallbackModels = [];
 
   try {
-    const { config, loadedPaths, warnings } = readFallbackSettings(ctx.cwd);
+    const { config, loadedPaths, warnings } = readFallbackSettings(
+      ctx.cwd,
+      getAgentDir(),
+      homedir(),
+      typeof ctx.isProjectTrusted === "function" && ctx.isProjectTrusted(),
+    );
     const content = JSON.stringify({ config, loadedPaths, warnings });
     const shouldNotify = state.settingsSignature !== content;
     state.settingsSignature = content;

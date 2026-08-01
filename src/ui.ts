@@ -7,6 +7,15 @@ import {
   RETRY_INTERVAL_ENV_VAR,
 } from "./constants.js";
 import { state } from "./state.js";
+import {
+  createWaitId,
+  emitWaitTelemetry,
+  waitModel,
+  type LimitsWaitWaitEndPayload,
+  type LimitsWaitWaitOutcome,
+  type LimitsWaitWaitStartPayload,
+  type WaitTelemetryOptions,
+} from "./telemetry.js";
 import type { RetryReason } from "./types.js";
 
 export function formatDuration(ms: number): string {
@@ -117,57 +126,103 @@ export function waitForRetry(
   reason: RetryReason,
   waitMs: number,
   signal?: AbortSignal,
-): Promise<"waited" | "skipped" | "aborted"> {
+  telemetry?: WaitTelemetryOptions,
+): Promise<LimitsWaitWaitOutcome> {
   if (waitMs <= 0) return Promise.resolve(signal?.aborted ? "aborted" : "waited");
 
-  return new Promise((resolve) => {
-    if (signal?.aborted) { resolve("aborted"); return; }
+  const startedAt = Date.now();
+  const plannedDeadline = startedAt + waitMs;
+  const waitId = createWaitId();
+  const model = waitModel(telemetry?.model);
+  const events = telemetry?.events ?? state.extensionApi?.events;
+  const common = {
+    version: 1 as const,
+    waitId,
+    ...(telemetry?.periodId ? { periodId: telemetry.periodId } : {}),
+    reason,
+    plannedDurationMs: waitMs,
+    plannedDeadline,
+    startedAt,
+    ...(model ? { model } : {}),
+    ...(telemetry?.error ? { error: formatErrorDetail(telemetry.error) } : {}),
+  };
+  emitWaitTelemetry(events, { ...common, phase: "start" } satisfies LimitsWaitWaitStartPayload);
 
+  return new Promise((resolve) => {
     const ctx = state.sharedCtx;
-    const deadline = Date.now() + waitMs;
     let done = false;
     let unsubInput: (() => void) | undefined;
+    let ticker: ReturnType<typeof setInterval> | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    const onAbort = () => settle("aborted");
+
+    function cleanup() {
+      if (ticker) clearInterval(ticker);
+      if (timer) clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      try { unsubInput?.(); } catch { /* UI unavailable */ }
+      try { ctx?.ui.setWorkingMessage(); } catch { /* UI unavailable */ }
+      try { clearAmbientRetryStatus(); } catch { /* UI unavailable */ }
+    }
+
+    function settle(outcome: LimitsWaitWaitOutcome) {
+      if (done) return;
+      done = true;
+      cleanup();
+      const endedAt = Date.now();
+      const actualElapsedMs = Math.max(0, endedAt - startedAt);
+      try { telemetry?.onEnd?.(actualElapsedMs, outcome); } catch { /* observational callback */ }
+      emitWaitTelemetry(events, {
+        ...common,
+        phase: "end",
+        endedAt,
+        actualElapsedMs,
+        outcome,
+      } satisfies LimitsWaitWaitEndPayload);
+      resolve(outcome);
+    }
+
+    if (signal?.aborted) {
+      settle("aborted");
+      return;
+    }
 
     try {
-      unsubInput = ctx?.ui.onTerminalInput((data) => {
+      const unsubscribe = ctx?.ui.onTerminalInput((data) => {
         if (done) return undefined;
         if (data === "\r" || data === "\n") {
-          cleanup();
-          resolve("skipped");
+          settle("skipped");
           return { consume: true };
         }
         if (data === "\x1b") {
-          cleanup();
-          resolve("aborted");
+          settle("aborted");
           return { consume: true };
         }
         return undefined;
       });
+      if (done) unsubscribe?.();
+      else unsubInput = unsubscribe;
     } catch { /* UI unavailable */ }
+    if (done) return;
 
-    const onAbort = () => { if (!done) { cleanup(); resolve("aborted"); } };
     signal?.addEventListener("abort", onAbort);
+    if (signal?.aborted) {
+      settle("aborted");
+      return;
+    }
 
     const tick = () => {
-      ctx?.ui.setWorkingMessage(countdownText(reason, deadline, Boolean(unsubInput)));
+      try { ctx?.ui.setWorkingMessage(countdownText(reason, plannedDeadline, Boolean(unsubInput))); } catch { /* UI unavailable */ }
     };
 
     tick();
-    const ticker = setInterval(() => {
-      if (Date.now() >= deadline) { cleanup(); resolve("waited"); return; }
-      tick();
+    if (done) return;
+    ticker = setInterval(() => {
+      if (Date.now() >= plannedDeadline) settle("waited");
+      else tick();
     }, 1_000);
-    const timer = setTimeout(() => { if (!done) { cleanup(); resolve("waited"); } }, Math.max(0, deadline - Date.now()));
-
-    function cleanup() {
-      done = true;
-      clearInterval(ticker);
-      clearTimeout(timer);
-      signal?.removeEventListener("abort", onAbort);
-      unsubInput?.();
-      ctx?.ui.setWorkingMessage();
-      clearAmbientRetryStatus();
-    }
+    timer = setTimeout(() => settle("waited"), Math.max(0, plannedDeadline - Date.now()));
   });
 }
 

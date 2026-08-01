@@ -1,6 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { isInternalSyntheticModel } from "./models.js";
 import { sanitiseAnthropicPayloadSystem } from "./prompt.js";
+import { RetrySummaryCoordinator } from "./retry-summary.js";
 import { loadFallbackSettings } from "./settings.js";
 import { loadUnknownErrorRetrySettings } from "./ui.js";
 import { consumeExpectedModelSelection, state } from "./state.js";
@@ -23,6 +24,26 @@ export {
   readFallbackSettings,
 } from "./settings.js";
 export {
+  __createRetrySummaryCoordinatorForTests,
+  LIMITS_WAIT_ENTRY_TYPE,
+  RetrySummaryCoordinator,
+} from "./retry-summary.js";
+export {
+  LIMITS_WAIT_EVENT_CHANNEL,
+} from "./telemetry.js";
+export type {
+  LimitsWaitEndEventPayload,
+  LimitsWaitEventPayload,
+  LimitsWaitModel,
+  LimitsWaitOutcome,
+  LimitsWaitStartEventPayload,
+  LimitsWaitWaitEndPayload,
+  LimitsWaitWaitEventPayload,
+  LimitsWaitWaitOutcome,
+  LimitsWaitWaitStartPayload,
+} from "./telemetry.js";
+export type { LimitsWaitSessionEntryData } from "./retry-summary.js";
+export {
   __configureFallbackModelsForTests,
   __setNonRetryableTuningForTests,
   installModelRuntimeInterception,
@@ -35,7 +56,8 @@ export type { FallbackModel } from "./types.js";
 export default function (pi: ExtensionAPI) {
   state.extensionApi = pi;
   loadUnknownErrorRetrySettings();
-  const releaseInterception = installModelRuntimeInterception();
+  const retrySummaries = new RetrySummaryCoordinator(pi);
+  const releaseInterception = installModelRuntimeInterception(() => retrySummaries.createStream());
 
   // Current pi-ai inserts the Claude Code identity as the first system block
   // for Anthropic OAuth. Sanitise only that exact payload shape; authentication,
@@ -60,10 +82,22 @@ export default function (pi: ExtensionAPI) {
     state.sharedCtx = ctx;
   });
 
+  // turn_end runs after Pi has persisted the assistant turn, so these custom
+  // entries remain durable transcript metadata without entering LLM context.
+  pi.on("turn_end", () => {
+    retrySummaries.flush();
+  });
+
+  pi.on("agent_end", () => {
+    retrySummaries.finalizeAndFlush();
+  });
+
   pi.on("session_shutdown", () => {
     // An old extension instance must not disable or clear state owned by a
     // newer /reload instance.
-    if (!releaseInterception()) return;
+    const ownsInterception = releaseInterception();
+    retrySummaries.finalizeAndFlush();
+    if (!ownsInterception) return;
     state.ambientStatusCleanup?.();
     state.modelStatusCleanup?.();
     state.expectedModelSelections.clear();

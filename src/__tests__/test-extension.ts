@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ModelRuntime, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { ModelRuntime, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   createAssistantMessageEventStream,
   type Api,
@@ -11,7 +11,7 @@ import {
   type Model,
   type ModelsSimpleStreamOptions,
 } from "@earendil-works/pi-ai";
-import {
+import limitsWaitExtension, {
   __configureFallbackModelsForTests,
   __readFallbackSettingsForTests,
   __setNonRetryableTuningForTests,
@@ -22,6 +22,8 @@ import {
   isRateLimitError,
   isServerOverloadedError,
   isTransientNetworkError,
+  LIMITS_WAIT_ENTRY_TYPE,
+  LIMITS_WAIT_EVENT_CHANNEL,
   loadUnknownErrorRetrySettings,
   retryAfterHeaderMs,
   sanitiseAnthropicPayloadSystem,
@@ -29,7 +31,9 @@ import {
   streamWithLimitsRetry,
   waitForRateLimit,
 } from "../index.js";
+import { DEFAULT_UNKNOWN_ERROR_MAX_RETRIES } from "../constants.js";
 import { withAttemptResponseObserver } from "../response-observer.js";
+import { loadFallbackSettings } from "../settings.js";
 import { consumeExpectedModelSelection, expectModelSelection, state } from "../state.js";
 
 let passed = 0;
@@ -129,6 +133,7 @@ ok("classifies explicit network retry", getRetryableError("fetch failed retry-af
 }
 
 section("settings and waits");
+ok("preserves the unknown-error retry default", DEFAULT_UNKNOWN_ERROR_MAX_RETRIES === 999_999);
 {
   const previous = process.env.PI_LIMITS_WAIT_FREEZING_ENABLED;
   process.env.PI_LIMITS_WAIT_FREEZING_ENABLED = "false";
@@ -159,6 +164,48 @@ section("settings and waits");
   ok("pre-aborted wait resolves immediately", await waitForRateLimit(60_000, controller.signal) === "aborted");
 }
 {
+  const previousApi = state.extensionApi;
+  const previousCtx = state.sharedCtx;
+  const telemetry: Array<{ channel: string; payload: Record<string, unknown> }> = [];
+  state.extensionApi = {
+    events: {
+      emit: (channel: string, payload: unknown) => telemetry.push({ channel, payload: payload as Record<string, unknown> }),
+      on: () => () => undefined,
+    },
+  } as unknown as ExtensionAPI;
+  state.sharedCtx = undefined;
+
+  await waitForRateLimit(0);
+  const waited = await waitForRateLimit(5);
+  state.sharedCtx = {
+    ui: {
+      onTerminalInput: (handler: (data: string) => unknown) => {
+        handler("\n");
+        return () => undefined;
+      },
+      setWorkingMessage: () => undefined,
+    },
+  } as unknown as ExtensionContext;
+  const skipped = await waitForRateLimit(1_000);
+  const abortedController = new AbortController();
+  abortedController.abort();
+  const aborted = await waitForRateLimit(1_000, abortedController.signal);
+
+  const starts = telemetry.filter((event) => event.payload.phase === "start");
+  const ends = telemetry.filter((event) => event.payload.phase === "end");
+  ok("only positive waits emit matching versioned start/end events", waited === "waited" && starts.length === 3 && ends.length === 3 && telemetry.every((event) => event.channel === LIMITS_WAIT_EVENT_CHANNEL));
+  ok("skip and abort telemetry reports actual rather than planned timing", skipped === "skipped" && aborted === "aborted" && ends[1]?.payload.outcome === "skipped" && ends[2]?.payload.outcome === "aborted" && Number(ends[1]?.payload.actualElapsedMs) < Number(ends[1]?.payload.plannedDurationMs) && Number(ends[2]?.payload.actualElapsedMs) < Number(ends[2]?.payload.plannedDurationMs));
+  ok("wait event IDs correlate start and end", starts.every((start) => ends.some((end) => end.payload.waitId === start.payload.waitId)));
+
+  state.sharedCtx = undefined;
+  state.extensionApi = {
+    events: { emit: () => { throw new Error("listener failure"); }, on: () => () => undefined },
+  } as unknown as ExtensionAPI;
+  ok("wait telemetry failures do not break waits", await waitForRateLimit(1) === "waited");
+  state.extensionApi = previousApi;
+  state.sharedCtx = previousCtx;
+}
+{
   const root = mkdtempSync(join(tmpdir(), "limits-wait-"));
   try {
     const home = join(root, "home");
@@ -171,9 +218,40 @@ section("settings and waits");
     writeFileSync(join(agent, "limits-wait.json"), JSON.stringify({ keep: "agent" }));
     writeFileSync(join(project, ".limits-wait.json"), JSON.stringify({ keep: "root" }));
     writeFileSync(join(project, ".pi", "limits-wait.json"), JSON.stringify({ keep: "project" }));
-    const resolved = __readFallbackSettingsForTests(project, agent, home);
-    ok("loads settings in documented precedence", resolved.loadedPaths.length === 4 && resolved.config.keep === "project");
+    const resolved = __readFallbackSettingsForTests(project, agent, home, true);
+    ok("loads settings in documented precedence for trusted projects", resolved.loadedPaths.length === 4 && resolved.config.keep === "project");
+    writeFileSync(join(project, ".limits-wait.json"), "not json");
+    const untrusted = __readFallbackSettingsForTests(project, agent, home, false);
+    ok("untrusted projects load only global and agent settings", untrusted.loadedPaths.length === 2 && untrusted.config.keep === "agent" && untrusted.warnings.length === 0);
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+{
+  const root = mkdtempSync(join(tmpdir(), "limits-wait-runtime-trust-"));
+  try {
+    mkdirSync(join(root, ".pi"), { recursive: true });
+    writeFileSync(join(root, ".pi", "limits-wait.json"), JSON.stringify({
+      "fallback-models": [{ provider: "trust", modelname: "project" }],
+    }));
+    const projectModel = { provider: "trust", id: "project", api: "openai-completions" } as Model<Api>;
+    let trusted = false;
+    const ctx = {
+      cwd: root,
+      isProjectTrusted: () => trusted,
+      modelRegistry: {
+        find: (provider: string, id: string) => provider === "trust" && id === "project" ? projectModel : undefined,
+        hasConfiguredAuth: () => true,
+      },
+      ui: { notify: () => undefined },
+    } as unknown as ExtensionContext;
+    loadFallbackSettings(ctx);
+    const untrustedCount = state.fallbackModels.length;
+    trusted = true;
+    loadFallbackSettings(ctx);
+    ok("runtime settings honor current project trust", untrustedCount === 0 && state.fallbackModels[0]?.model === projectModel);
+  } finally {
+    __configureFallbackModelsForTests([]);
     rmSync(root, { recursive: true, force: true });
   }
 }
@@ -194,6 +272,7 @@ section("settings and waits");
         hasConfiguredAuth: () => true,
       },
       ui: { notify: () => undefined },
+      isProjectTrusted: () => true,
     } as unknown as ExtensionContext;
     const seen: string[] = [];
     const delegate = ((_model: Model<Api>) => {
@@ -284,6 +363,106 @@ section("unknown-error retry integration");
   ok("disabled unknown-error waiting surfaces the first failure", calls.unknown?.length === 1 && events.at(-1)?.type === "error");
   release();
   state.unknownErrorWaitingEnabled = true;
+}
+
+for (const status of [400, 403] as const) {
+  const calls: Record<string, ProviderCall[]> = {};
+  const provider = `http${status}`;
+  let attempts = 0;
+  const runtime = await createRuntime({
+    [provider](model, options) {
+      attempts++;
+      const stream = createAssistantMessageEventStream();
+      queueMicrotask(async () => {
+        try {
+          await options?.onResponse?.({ status: attempts === 1 ? status : 200, headers: {} }, model);
+          stream.push(startEvent(model));
+          stream.push(doneEvent(model));
+        } catch (error) {
+          stream.push(startEvent(model));
+          stream.push(errorEvent(model, error instanceof Error ? error.message : String(error)));
+        }
+        stream.end();
+      });
+      return stream;
+    },
+  }, calls);
+  const model = runtime.getModel(provider, `${provider}-model`)!;
+  state.unknownErrorWaitingEnabled = true;
+  __setNonRetryableTuningForTests(2, 0);
+  const release = installModelRuntimeInterception();
+  const events = await collect(runtime.streamSimple(model, context));
+  ok(`HTTP ${status} remains retry-all eligible`, attempts === 2 && events.at(-1)?.type === "done", `attempts=${attempts}`);
+  release();
+}
+__setNonRetryableTuningForTests(1_000_000, 5_000);
+
+section("retry-period session summary lifecycle");
+{
+  type LifecycleHandler = (event: unknown, ctx: unknown) => unknown;
+  const handlers = new Map<string, LifecycleHandler[]>();
+  const entries: Array<{ customType: string; data: unknown }> = [];
+  const telemetry: unknown[] = [];
+  const pi = {
+    on: (event: string, handler: LifecycleHandler) => {
+      const registered = handlers.get(event) ?? [];
+      registered.push(handler);
+      handlers.set(event, registered);
+    },
+    getThinkingLevel: () => "off",
+    appendEntry: (customType: string, data: unknown) => entries.push({ customType, data }),
+    events: {
+      emit: (_channel: string, payload: unknown) => telemetry.push(payload),
+      on: () => () => undefined,
+    },
+  } as unknown as ExtensionAPI;
+  const fire = async (event: string) => {
+    for (const handler of handlers.get(event) ?? []) await handler({}, {});
+  };
+
+  __configureFallbackModelsForTests([]);
+  limitsWaitExtension(pi);
+  state.unknownErrorWaitingEnabled = true;
+  __setNonRetryableTuningForTests(3, 10);
+  let attempts = 0;
+  const calls: Record<string, ProviderCall[]> = {};
+  const runtime = await createRuntime({
+    summary(model) {
+      attempts++;
+      if (attempts === 1) return streamFrom([startEvent(model), errorEvent(model, "HTTP 400   repeated\nreason")]);
+      if (attempts === 2) return streamFrom([startEvent(model), errorEvent(model, " HTTP 400 repeated reason ")]);
+      return streamFrom([startEvent(model), doneEvent(model)]);
+    },
+  }, calls);
+  const model = runtime.getModel("summary", "summary-model")!;
+  const events = await collect(runtime.streamSimple(model, context));
+  ok("finalized retry summary waits for turn_end", events.at(-1)?.type === "done" && entries.length === 0);
+  await fire("turn_end");
+  const summary = entries[0]?.data as { totalWaitingTime?: number; reasons?: string[]; retries_total?: number } | undefined;
+  ok("persists one deduped retry summary with actual wait and retry count", entries.length === 1 && entries[0]?.customType === LIMITS_WAIT_ENTRY_TYPE && summary?.retries_total === 2 && summary.reasons?.join("|") === "HTTP 400 repeated reason" && Number(summary.totalWaitingTime) > 0, JSON.stringify(entries));
+  ok("session summary uses only the standard data fields", summary !== undefined && Object.keys(summary).sort().join(",") === "reasons,retries_total,totalWaitingTime");
+  const waitStart = telemetry.find((payload) => (payload as { phase?: string }).phase === "start") as Record<string, unknown> | undefined;
+  const waitEnd = telemetry.find((payload) => (payload as { phase?: string }).phase === "end") as Record<string, unknown> | undefined;
+  ok("managed wait telemetry includes period, model, error, plan, elapsed, and outcome", typeof waitStart?.periodId === "string" && (waitStart.model as { id?: string } | undefined)?.id === "summary-model" && waitStart.error === "HTTP 400 repeated reason" && Number(waitStart.plannedDeadline) >= Number(waitStart.startedAt) && waitEnd?.outcome === "waited" && Number(waitEnd.actualElapsedMs) > 0);
+
+  const abortController = new AbortController();
+  const abortCalls: Record<string, ProviderCall[]> = {};
+  const abortRuntime = await createRuntime({
+    summaryAbort(model) {
+      setTimeout(() => abortController.abort(), 5);
+      return streamFrom([startEvent(model), errorEvent(model, "fetch failed retry-after 60")]);
+    },
+  }, abortCalls);
+  const abortModel = abortRuntime.getModel("summaryAbort", "summaryAbort-model")!;
+  const abortedEvents = await collect(abortRuntime.streamSimple(abortModel, context, { signal: abortController.signal }));
+  await fire("turn_end");
+  const abortedSummary = entries[1]?.data as { totalWaitingTime?: number; reasons?: string[]; retries_total?: number } | undefined;
+  ok("an aborted managed wait still persists elapsed time and reason without claiming a completed retry", endsAborted(abortedEvents) && abortedSummary?.retries_total === 0 && Number(abortedSummary.totalWaitingTime) > 0 && abortedSummary.reasons?.[0] === "fetch failed retry-after 60", JSON.stringify(entries));
+
+  await fire("agent_end");
+  await fire("session_shutdown");
+  ok("agent/shutdown finalization cannot duplicate flushed summaries", entries.length === 2);
+  __setNonRetryableTuningForTests(1_000_000, 5_000);
 }
 
 section("real ModelRuntime retry integration");
