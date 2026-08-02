@@ -5,7 +5,9 @@ import { join } from "node:path";
 import { ModelRuntime, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   createAssistantMessageEventStream,
+  isContextOverflow,
   type Api,
+  type AssistantMessage,
   type AssistantMessageEvent,
   type Context,
   type Model,
@@ -51,7 +53,7 @@ function section(title: string): void {
   console.log(`\n── ${title} ${"─".repeat(Math.max(0, 60 - title.length))}`);
 }
 
-function message(model: Model<Api>) {
+function message(model: Model<Api>): AssistantMessage {
   return {
     role: "assistant" as const,
     content: [],
@@ -329,6 +331,330 @@ async function createRuntime(
   }
   return runtime;
 }
+
+section("Pi-owned context-overflow handling");
+{
+  const calls: Record<string, ProviderCall[]> = {};
+  let attempts = 0;
+  const overflowText = "Codex error: Your input exceeds the context window of this model. Please adjust your input and try again.";
+  const runtime = await createRuntime({
+    overflow(model) {
+      attempts++;
+      return streamFrom([startEvent(model), errorEvent(model, overflowText)]);
+    },
+  }, calls);
+  const model = runtime.getModel("overflow", "overflow-model")!;
+  state.unknownErrorWaitingEnabled = true;
+  __setNonRetryableTuningForTests(2, 0);
+  const release = installModelRuntimeInterception();
+  const events = await collect(runtime.streamSimple(model, context));
+  const terminal = events.at(-1);
+  ok(
+    "surfaces Pi-recognized provider overflow errors without extension retry",
+    attempts === 1 && terminal?.type === "error" && terminal.error.errorMessage === overflowText
+      && isContextOverflow(terminal.error, model.contextWindow),
+    `attempts=${attempts}, terminal=${terminal?.type}`,
+  );
+  release();
+}
+{
+  const calls: Record<string, ProviderCall[]> = {};
+  let attempts = 0;
+  const overflowText = "request aborted after context_length_exceeded";
+  const runtime = await createRuntime({
+    abortWordedOverflow(model) {
+      attempts++;
+      return streamFrom([startEvent(model), errorEvent(model, overflowText)]);
+    },
+  }, calls);
+  const model = runtime.getModel("abortWordedOverflow", "abortWordedOverflow-model")!;
+  const release = installModelRuntimeInterception();
+  const events = await collect(runtime.streamSimple(model, context));
+  const terminal = events.at(-1);
+  ok(
+    "checks Pi overflow patterns before message-based abort heuristics",
+    attempts === 1 && terminal?.type === "error" && terminal.reason === "error"
+      && isContextOverflow(terminal.error, model.contextWindow),
+    `attempts=${attempts}, terminal=${terminal?.type}`,
+  );
+  release();
+}
+{
+  const calls: Record<string, ProviderCall[]> = {};
+  let attempts = 0;
+  const overflowText = "fetch failed Cause: context_length_exceeded: synchronous provider failure";
+  const runtime = await createRuntime({
+    thrownOverflow() {
+      attempts++;
+      throw new Error(overflowText);
+    },
+  }, calls);
+  const model = runtime.getModel("thrownOverflow", "thrownOverflow-model")!;
+  const release = installModelRuntimeInterception();
+  const events = await collect(runtime.streamSimple(model, context));
+  const terminal = events.at(-1);
+  ok(
+    "surfaces synchronously thrown Pi-recognized overflow errors without extension retry",
+    attempts === 1 && terminal?.type === "error" && terminal.error.errorMessage === overflowText
+      && isContextOverflow(terminal.error, model.contextWindow),
+    `attempts=${attempts}, terminal=${terminal?.type}`,
+  );
+  release();
+}
+{
+  const calls: Record<string, ProviderCall[]> = {};
+  let attempts = 0;
+  const overflowText = "context_length_exceeded after partial output";
+  const runtime = await createRuntime({
+    partialThrow(model) {
+      return {
+        async *[Symbol.asyncIterator]() {
+          attempts++;
+          yield startEvent(model);
+          yield textEvent(model);
+          throw new Error(overflowText);
+        },
+      } as unknown as ReturnType<typeof streamFrom>;
+    },
+  }, calls);
+  const model = runtime.getModel("partialThrow", "partialThrow-model")!;
+  const release = installModelRuntimeInterception();
+  const events = await collect(runtime.streamSimple(model, context));
+  const terminal = events.at(-1);
+  ok(
+    "does not duplicate the stream start when a committed provider throws overflow",
+    attempts === 1 && events.filter((event) => event.type === "start").length === 1
+      && terminal?.type === "error" && isContextOverflow(terminal.error, model.contextWindow),
+    `attempts=${attempts}, starts=${events.filter((event) => event.type === "start").length}`,
+  );
+  release();
+}
+for (const mode of ["terminal", "throw"] as const) {
+  const calls: Record<string, ProviderCall[]> = {};
+  let attempts = 0;
+  let observerCallbacks = 0;
+  const provider = `observer${mode}`;
+  const overflowText = `context_length_exceeded from ${mode}`;
+  const runtime = await createRuntime({
+    [provider](model, options) {
+      return {
+        async *[Symbol.asyncIterator]() {
+          attempts++;
+          await options?.onPayload?.({}, model);
+          await fetch(`data:text/plain,${mode}`);
+          if (mode === "throw") throw new Error(overflowText);
+          yield startEvent(model);
+          yield errorEvent(model, overflowText);
+        },
+      } as unknown as ReturnType<typeof streamFrom>;
+    },
+  }, calls);
+  const model = runtime.getModel(provider, `${provider}-model`)!;
+  const release = installModelRuntimeInterception();
+  const events = await collect(runtime.streamSimple(model, context, {
+    onResponse: () => {
+      observerCallbacks++;
+      throw new Error("observer callback failed");
+    },
+  }));
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  const terminal = events.at(-1);
+  ok(
+    mode === "throw"
+      ? "preserves a thrown provider overflow over observer callback failures"
+      : "does not retry behind a surfaced overflow when an observer callback fails",
+    attempts === 1 && observerCallbacks === 1 && terminal?.type === "error"
+      && terminal.error.errorMessage === overflowText
+      && isContextOverflow(terminal.error, model.contextWindow),
+    `attempts=${attempts}, callbacks=${observerCallbacks}, error=${terminal?.type === "error" ? terminal.error.errorMessage : terminal?.type}`,
+  );
+  release();
+}
+{
+  const calls: Record<string, ProviderCall[]> = {};
+  let attempts = 0;
+  const overflowText = "context_length_exceeded before hanging observer callback";
+  const runtime = await createRuntime({
+    hangingObserver(model, options) {
+      return {
+        async *[Symbol.asyncIterator]() {
+          attempts++;
+          await options?.onPayload?.({}, model);
+          await fetch("data:text/plain,hanging-observer");
+          throw new Error(overflowText);
+        },
+      } as unknown as ReturnType<typeof streamFrom>;
+    },
+  }, calls);
+  const model = runtime.getModel("hangingObserver", "hangingObserver-model")!;
+  const release = installModelRuntimeInterception();
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const result = await Promise.race([
+    collect(runtime.streamSimple(model, context, {
+      onResponse: () => new Promise<void>(() => undefined),
+    })),
+    new Promise<undefined>((resolve) => { timeout = setTimeout(() => resolve(undefined), 100); }),
+  ]);
+  if (timeout) clearTimeout(timeout);
+  const terminal = result?.at(-1);
+  ok(
+    "does not let a hanging observer callback delay Pi-owned overflow",
+    attempts === 1 && terminal?.type === "error"
+      && terminal.error.errorMessage === overflowText
+      && isContextOverflow(terminal.error, model.contextWindow),
+    `attempts=${attempts}, terminal=${terminal?.type ?? "timeout"}`,
+  );
+  release();
+}
+{
+  const calls: Record<string, ProviderCall[]> = {};
+  let selectedModel: Model<Api> | undefined;
+  const runtime = await createRuntime({
+    overflowPrimary(model) {
+      return streamFrom([startEvent(model), errorEvent(model, "HTTP 429 retry-after 60")]);
+    },
+    overflowFallback(model) {
+      return streamFrom([startEvent(model), errorEvent(model, "context_length_exceeded on fallback")]);
+    },
+  }, calls);
+  const primary = runtime.getModel("overflowPrimary", "overflowPrimary-model")!;
+  const fallback = runtime.getModel("overflowFallback", "overflowFallback-model")!;
+  const fallbackCtx = {
+    model: primary,
+    ui: { notify: () => undefined },
+  } as unknown as ExtensionContext;
+  __configureFallbackModelsForTests([{ model: fallback }], fallbackCtx);
+  state.extensionApi = {
+    setModel: async (next: Model<Api>) => {
+      selectedModel = next;
+      (fallbackCtx as unknown as { model: Model<Api> }).model = next;
+      return true;
+    },
+    setThinkingLevel: () => undefined,
+  } as unknown as typeof state.extensionApi;
+  const release = installModelRuntimeInterception();
+  const events = await collect(runtime.streamSimple(primary, context));
+  const terminal = events.at(-1);
+  ok(
+    "commits an already-attempted fallback before Pi receives its overflow",
+    calls.overflowPrimary?.length === 1 && calls.overflowFallback?.length === 1
+      && selectedModel === fallback && terminal?.type === "error"
+      && terminal.error.model === fallback.id
+      && isContextOverflow(terminal.error, fallback.contextWindow),
+    `primary=${calls.overflowPrimary?.length}, fallback=${calls.overflowFallback?.length}, selected=${selectedModel?.id}`,
+  );
+  release();
+  state.extensionApi = undefined;
+  __configureFallbackModelsForTests([]);
+}
+for (const mode of ["newer-selection", "switch-rejected"] as const) {
+  const calls: Record<string, ProviderCall[]> = {};
+  let setModelCalls = 0;
+  let mutableCtx: { model: Model<Api>; ui: { notify: () => void } };
+  const runtime = await createRuntime({
+    guardedPrimary(model) {
+      if (mode === "newer-selection") mutableCtx.model = unrelated;
+      return streamFrom([startEvent(model), errorEvent(model, "HTTP 429 retry-after 60")]);
+    },
+    guardedFallback(model) {
+      return streamFrom([startEvent(model), errorEvent(model, "context_length_exceeded on guarded fallback")]);
+    },
+    unrelated(model) {
+      return streamFrom([startEvent(model), doneEvent(model)]);
+    },
+  }, calls);
+  const primary = runtime.getModel("guardedPrimary", "guardedPrimary-model")!;
+  const fallback = runtime.getModel("guardedFallback", "guardedFallback-model")!;
+  const unrelated = runtime.getModel("unrelated", "unrelated-model")!;
+  mutableCtx = { model: primary, ui: { notify: () => undefined } };
+  __configureFallbackModelsForTests([{ model: fallback }], mutableCtx as unknown as ExtensionContext);
+  state.extensionApi = {
+    setModel: async () => {
+      setModelCalls++;
+      return false;
+    },
+    setThinkingLevel: () => undefined,
+  } as unknown as typeof state.extensionApi;
+  const release = installModelRuntimeInterception();
+  const events = await collect(runtime.streamSimple(primary, context));
+  const terminal = events.at(-1);
+  ok(
+    mode === "newer-selection"
+      ? "never overrides a newer user model selection while surfacing fallback overflow"
+      : "surfaces fallback overflow without retry when Pi rejects model commitment",
+    calls.guardedPrimary?.length === 1 && calls.guardedFallback?.length === 1
+      && terminal?.type === "error" && isContextOverflow(terminal.error, fallback.contextWindow)
+      && (mode === "newer-selection"
+        ? setModelCalls === 0 && mutableCtx.model === unrelated
+        : setModelCalls === 1 && mutableCtx.model === primary),
+    `setModelCalls=${setModelCalls}, current=${mutableCtx.model.id}`,
+  );
+  release();
+  state.extensionApi = undefined;
+  __configureFallbackModelsForTests([]);
+}
+for (const mode of ["silent", "length"] as const) {
+  const calls: Record<string, ProviderCall[]> = {};
+  let attempts = 0;
+  const provider = `${mode}Overflow`;
+  const runtime = await createRuntime({
+    [provider](model) {
+      attempts++;
+      const result = message(model);
+      if (mode === "silent") {
+        result.usage.input = model.contextWindow + 1;
+        result.usage.totalTokens = result.usage.input;
+      } else {
+        result.stopReason = "length";
+        result.usage.input = Math.ceil(model.contextWindow * 0.99);
+        result.usage.output = 0;
+        result.usage.totalTokens = result.usage.input;
+      }
+      return streamFrom([
+        startEvent(model),
+        { type: "done", reason: mode === "silent" ? "stop" : "length", message: result },
+      ]);
+    },
+  }, calls);
+  const model = runtime.getModel(provider, `${provider}-model`)!;
+  const release = installModelRuntimeInterception();
+  const events = await collect(runtime.streamSimple(model, context));
+  const terminal = events.at(-1);
+  ok(
+    mode === "silent"
+      ? "passes through successful over-window usage for Pi to compact"
+      : "passes through zero-output length stops that fill Pi's context window",
+    attempts === 1 && terminal?.type === "done"
+      && isContextOverflow(terminal.message, model.contextWindow),
+    `attempts=${attempts}, terminal=${terminal?.type}`,
+  );
+  release();
+}
+{
+  const calls: Record<string, ProviderCall[]> = {};
+  let attempts = 0;
+  const throttledText = "rate limit: too many tokens; retry in 0.001s";
+  const runtime = await createRuntime({
+    throttled(model) {
+      attempts++;
+      return attempts === 1
+        ? streamFrom([startEvent(model), errorEvent(model, throttledText)])
+        : streamFrom([startEvent(model), doneEvent(model)]);
+    },
+  }, calls);
+  const model = runtime.getModel("throttled", "throttled-model")!;
+  const sample = errorEvent(model, throttledText);
+  const release = installModelRuntimeInterception();
+  const events = await collect(runtime.streamSimple(model, context));
+  ok(
+    "retains Pi's non-overflow exclusion for throttling messages",
+    sample.type === "error" && !isContextOverflow(sample.error, model.contextWindow)
+      && attempts === 2 && events.at(-1)?.type === "done",
+    `attempts=${attempts}`,
+  );
+  release();
+}
+__setNonRetryableTuningForTests(1_000_000, 5_000);
 
 section("unknown-error retry integration");
 {

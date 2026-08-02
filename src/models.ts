@@ -121,13 +121,22 @@ export function initialAttempt(model: Model<Api>): FallbackModel {
 
 let modelSwitchQueue = Promise.resolve();
 
-export async function switchPiModel(entry: FallbackModel, signal?: AbortSignal): Promise<void> {
+export async function switchPiModel(
+  entry: FallbackModel,
+  signal?: AbortSignal,
+  canSelect?: (current: Model<Api> | undefined) => boolean,
+): Promise<boolean> {
+  let selected = false;
   const operation = modelSwitchQueue.then(async () => {
     if (signal?.aborted) return;
     const pi = state.extensionApi;
     if (!pi) return;
     const current = state.sharedCtx?.model;
-    if (current && modelKey(current) === modelKey(entry.model)) return;
+    if (current && modelKey(current) === modelKey(entry.model)) {
+      selected = true;
+      return;
+    }
+    if (canSelect && !canSelect(current)) return;
     if (signal?.aborted) return;
 
     const cancelExpectedSelection = expectModelSelection(entry.model);
@@ -138,6 +147,7 @@ export async function switchPiModel(entry: FallbackModel, signal?: AbortSignal):
         return;
       }
       if (signal?.aborted) return;
+      selected = true;
       const level = entry.reasoningEffort ?? state.primaryThinkingLevel;
       if (level) pi.setThinkingLevel(level);
       if (!signal?.aborted) {
@@ -152,4 +162,5 @@ export async function switchPiModel(entry: FallbackModel, signal?: AbortSignal):
   });
   modelSwitchQueue = operation.catch(() => undefined);
   await operation;
+  return selected;
 }

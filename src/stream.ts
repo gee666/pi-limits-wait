@@ -1,6 +1,7 @@
 import { ModelRuntime, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   createAssistantMessageEventStream,
+  isContextOverflow,
   type Api,
   type AssistantMessage,
   type AssistantMessageEvent,
@@ -66,12 +67,10 @@ function freshMessage(model: Model<Api>): AssistantMessage {
   };
 }
 
-function isAbortErrorEvent(event: AssistantMessageEvent, signal?: AbortSignal): boolean {
+function isExplicitAbortErrorEvent(event: AssistantMessageEvent, signal?: AbortSignal): boolean {
   if (signal?.aborted) return true;
   if (event.type !== "error") return false;
-  return event.reason === "aborted"
-    || event.error.stopReason === "aborted"
-    || isAbortMessage(event.error.errorMessage ?? "");
+  return event.reason === "aborted" || event.error.stopReason === "aborted";
 }
 
 function responseErrorMessage(response: ProviderResponse): string {
@@ -190,6 +189,21 @@ export function streamWithLimitsRetry(
       : { model, reasoningEffort: state.primaryThinkingLevel };
     const nonRetryableAttempts = new Map<string, number>();
     const triedModels = new Set<string>();
+
+    const prepareAttemptForPi = async (): Promise<boolean> => {
+      const originalKey = modelKey(model);
+      const attemptKey = modelKey(attempt.model);
+      if (attemptKey === originalKey) return true;
+      const canSelect = (current: Model<Api> | undefined) => {
+        if (!current) return true;
+        const currentKey = modelKey(current);
+        // Never undo a newer, unrelated user model selection. Pi deliberately
+        // treats the resulting overflow as stale instead of compacting for it.
+        return currentKey === originalKey || currentKey === attemptKey;
+      };
+      if (!canSelect(state.sharedCtx?.model)) return false;
+      return switchPiModel(attempt, signal, canSelect);
+    };
 
     const managedWait = async (reason: RetryReason, waitMs: number, error: string) =>
       waitForRetry(reason, waitMs, signal, {
@@ -329,14 +343,45 @@ export function streamWithLimitsRetry(
             if (!committed) {
               if (event.type === "error") {
                 const errMsg = enrichError(event.error.errorMessage ?? "", observedHttpError);
-                if (isAbortErrorEvent(event, signal)) {
+                if (isExplicitAbortErrorEvent(event, signal)) {
+                  if (buffer.length > 0) flush(buffer);
+                  pushAbort(errMsg || "Operation aborted");
+                  return;
+                }
+                const surfacedEvent = errMsg === (event.error.errorMessage ?? "")
+                  ? event
+                  : { ...event, error: { ...event.error, errorMessage: errMsg } };
+                // Pi owns context-overflow recovery. Use Pi's canonical detector
+                // before this extension's message heuristics so mixed transport/
+                // abort wording cannot hide a real overflow from the host.
+                if (isContextOverflow(surfacedEvent.error, attempt.model.contextWindow)) {
+                  // If this request had already moved to a fallback attempt,
+                  // commit that attempted model when safe. Pi intentionally
+                  // ignores overflow errors from a non-current model.
+                  await prepareAttemptForPi();
+                  if (signal?.aborted) {
+                    pushAbort("Request aborted while switching model for context-overflow recovery.");
+                    return;
+                  }
+                  retryPeriod?.finalize();
+                  if (buffer.length > 0) flush(buffer);
+                  else {
+                    output.push({ type: "start", partial: freshMessage(attempt.model) });
+                    committed = true;
+                  }
+                  output.push(surfacedEvent);
+                  finished = true;
+                  output.end();
+                  return;
+                }
+                if (isAbortMessage(errMsg)) {
                   if (buffer.length > 0) flush(buffer);
                   pushAbort(errMsg || "Operation aborted");
                   return;
                 }
                 retryable = getRetryableError(errMsg);
                 if (retryable) retryableErrorMessage = errMsg;
-                else nonRetryableError = { message: errMsg, event };
+                else nonRetryableError = { message: errMsg, event: surfacedEvent };
                 break;
               }
 
@@ -350,7 +395,7 @@ export function streamWithLimitsRetry(
                   pushAbort("Request aborted before switching model.");
                   return;
                 }
-                await switchPiModel(attempt, signal);
+                await prepareAttemptForPi();
                 if (signal?.aborted) {
                   pushAbort("Request aborted while switching model.");
                   return;
@@ -381,17 +426,61 @@ export function streamWithLimitsRetry(
             }
           }
         });
-        await deliverObservedResponses();
-        if (finished) return;
-      } catch (caught) {
-        let err = caught;
         try {
           await deliverObservedResponses();
         } catch (responseError) {
-          err = responseError;
+          // A terminal provider event has already been surfaced. Observer
+          // callback failures must not start a hidden retry behind that event.
+          if (finished) return;
+          throw responseError;
+        }
+        if (finished) return;
+      } catch (caught) {
+        let err = caught;
+        const caughtMessage = errorMessageWithCauses(caught);
+        const caughtAssistant = freshMessage(attempt.model);
+        caughtAssistant.stopReason = "error";
+        caughtAssistant.errorMessage = caughtMessage;
+        const caughtIsOverflow = isContextOverflow(caughtAssistant, attempt.model.contextWindow);
+        if (caughtIsOverflow) {
+          // Response callbacks are observational here. Never let a slow or
+          // failing callback delay a provider overflow from reaching Pi.
+          void deliverObservedResponses().catch(() => undefined);
+        } else {
+          try {
+            await deliverObservedResponses();
+          } catch (responseError) {
+            err = responseError;
+          }
         }
         const errMsg = enrichError(errorMessageWithCauses(err), observedHttpError ?? errorHttpMetadata(err));
-        const aborted = Boolean(signal?.aborted) || isAbortMessage(errMsg);
+        const explicitlyAborted = Boolean(signal?.aborted);
+        const error = freshMessage(attempt.model);
+        error.stopReason = "error";
+        error.errorMessage = errMsg;
+        // Synchronous provider throws do not include an AssistantMessage event,
+        // so build the same terminal shape Pi receives and apply Pi's detector
+        // before classifying network or message-based abort heuristics.
+        if (!explicitlyAborted && isContextOverflow(error, attempt.model.contextWindow)) {
+          await prepareAttemptForPi();
+          if (signal?.aborted) {
+            pushAbort("Request aborted while switching model for context-overflow recovery.");
+            return;
+          }
+          retryPeriod?.finalize();
+          if (!committed) {
+            if (buffer.length > 0) flush(buffer);
+            else {
+              output.push({ type: "start", partial: freshMessage(attempt.model) });
+              committed = true;
+            }
+          }
+          output.push({ type: "error", reason: "error", error });
+          finished = true;
+          output.end();
+          return;
+        }
+        const aborted = explicitlyAborted || isAbortMessage(errMsg);
         retryable = aborted ? undefined : getRetryableError(errMsg);
         if (retryable) retryableErrorMessage = errMsg;
         else if (aborted) {
