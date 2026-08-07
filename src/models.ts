@@ -2,7 +2,7 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 import { DEFAULT_NON_RETRYABLE_FREEZE_MS } from "./constants.js";
 import { expectModelSelection, state } from "./state.js";
 import type { FallbackModel, RetryableError } from "./types.js";
-import { formatErrorDetail, formatDuration, reasonLabel } from "./ui.js";
+import { formatErrorDetail, formatDuration, notifyLiveliness, reasonLabel } from "./ui.js";
 
 export function modelKey(model: Pick<Model<Api>, "provider" | "id">): string {
   return `${model.provider}/${model.id}`;
@@ -67,11 +67,12 @@ export function ensureRateLimitedModelsStatus(): void {
 
 export function notifyRetryableError(model: Model<Api>, retryable: RetryableError, errorMessage?: string): void {
   const detail = errorMessage ? ` Error: ${formatErrorDetail(errorMessage, Number.MAX_SAFE_INTEGER)}` : "";
-  state.sharedCtx?.ui.notify(`${formatModel(model)} ${reasonLabel(retryable.reason).toLowerCase()} for ${formatDuration(retryable.waitMs)}.${detail}`, "warning");
+  // A retry is still planned, so this is progress information, not a failure.
+  notifyLiveliness(`${formatModel(model)} ${reasonLabel(retryable.reason).toLowerCase()} for ${formatDuration(retryable.waitMs)}; waiting, then retrying.${detail}`);
 }
 
 export function notifyRetryingAfterError(model: Model<Api>, waitMs: number, errorMessage: string): void {
-  state.sharedCtx?.ui.notify(`${formatModel(model)} retrying after error for ${formatDuration(waitMs)}. Error: ${formatErrorDetail(errorMessage, Number.MAX_SAFE_INTEGER)}`, "warning");
+  notifyLiveliness(`${formatModel(model)} retrying after error in ${formatDuration(waitMs)}. Error: ${formatErrorDetail(errorMessage, Number.MAX_SAFE_INTEGER)}`);
 }
 
 export function rememberRateLimit(model: Model<Api>, retryable: RetryableError, errorMessage?: string): void {
@@ -102,7 +103,7 @@ export function nextAvailableCandidate(current: Model<Api>): FallbackModel | und
 export function rememberNonRetryableFailure(model: Model<Api>, errorMessage: string): void {
   const deadline = Date.now() + DEFAULT_NON_RETRYABLE_FREEZE_MS;
   state.nonRetryableFailureMemory.set(modelKey(model), { failedAt: Date.now(), deadline, errorMessage });
-  state.sharedCtx?.ui.notify(`${formatModel(model)} failed (${formatErrorDetail(errorMessage)}); freezing it for ${formatDuration(DEFAULT_NON_RETRYABLE_FREEZE_MS)} and trying another configured model if available.`, "warning");
+  notifyLiveliness(`${formatModel(model)} failed (${formatErrorDetail(errorMessage)}); freezing it for ${formatDuration(DEFAULT_NON_RETRYABLE_FREEZE_MS)} and trying another configured model if available.`);
   ensureRateLimitedModelsStatus();
 }
 

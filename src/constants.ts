@@ -30,9 +30,15 @@ export const DEFAULT_NON_RETRYABLE_FREEZE_MS = 10 * 60 * 1_000; // 10 minutes
 export const DEFAULT_UNKNOWN_ERROR_MAX_RETRIES = 999_999;
 export const DEFAULT_UNKNOWN_ERROR_RETRY_INTERVAL_MS = 5 * 1_000; // 5 seconds
 
+// Non-interactive hosts (RPC/JSON) cannot render the TUI countdown, so retry
+// progress is published as periodic liveliness notifications instead.
+export const LIVELINESS_STATUS_KEY = "oira666.pi-limits-wait";
+export const DEFAULT_LIVELINESS_INTERVAL_MS = 15 * 1_000; // 15 seconds
+
 export const SETTINGS_FILE_NAME = "limits-wait.json";
 export const FALLBACK_MODELS_KEY = "fallback-models";
 export const FREEZING_ENV_VAR = "PI_LIMITS_WAIT_FREEZING_ENABLED";
 export const DEFAULT_WAITING_ENV_VAR = "PI_LIMITS_WAIT_DEFAULT_WAITING";
 export const MAX_RETRY_ENV_VAR = "PI_LIMITS_WAIT_MAX_RETRY";
 export const RETRY_INTERVAL_ENV_VAR = "PI_LIMITS_WAIT_RETRY_INTERVAL";
+export const LIVELINESS_INTERVAL_ENV_VAR = "PI_LIMITS_WAIT_LIVELINESS_INTERVAL";

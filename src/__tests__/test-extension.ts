@@ -723,6 +723,84 @@ for (const status of [400, 403] as const) {
 }
 __setNonRetryableTuningForTests(1_000_000, 5_000);
 
+section("RPC-mode liveliness and terminal errors");
+{
+  type Notification = { message: string; type?: string };
+  const rpcModel = { provider: "rpc", id: "rpc-model", api: "openai-completions" } as Model<Api>;
+  const makeCtx = (notifications: Notification[], statuses: Array<string | undefined>) => ({
+    cwd: process.cwd(),
+    mode: "rpc",
+    hasUI: true,
+    isProjectTrusted: () => true,
+    ui: {
+      notify: (message: string, type?: string) => { notifications.push({ message, type }); },
+      setStatus: (_key: string, text: string | undefined) => { statuses.push(text); },
+      setWorkingMessage: () => undefined,
+      onTerminalInput: () => () => undefined,
+    },
+  } as unknown as ExtensionContext);
+  const previousCtx = state.sharedCtx;
+  const previousPrimary = state.primaryModel;
+
+  {
+    const notifications: Notification[] = [];
+    const statuses: Array<string | undefined> = [];
+    state.sharedCtx = makeCtx(notifications, statuses);
+    state.primaryModel = rpcModel;
+    state.unknownErrorWaitingEnabled = true;
+    __setNonRetryableTuningForTests(2, 50);
+    let attempts = 0;
+    const delegate = ((model: Model<Api>) => {
+      attempts++;
+      return attempts === 1
+        ? streamFrom([startEvent(model), errorEvent(model, "Internal server error")])
+        : streamFrom([startEvent(model), doneEvent(model)]);
+    }) as Parameters<typeof streamWithLimitsRetry>[1];
+    const events = await collect(streamWithLimitsRetry({} as ModelRuntime, delegate, rpcModel, context));
+    ok(
+      "planned retries never notify at error level in RPC mode",
+      attempts === 2 && events.at(-1)?.type === "done"
+        && notifications.length > 0 && notifications.every((entry) => entry.type === "info"),
+      JSON.stringify(notifications),
+    );
+    ok(
+      "retry liveliness describes what it does and why",
+      notifications.some((entry) => /retrying after error/i.test(entry.message) && entry.message.includes("Internal server error"))
+        && notifications.some((entry) => /still alive, waiting/i.test(entry.message)),
+      JSON.stringify(notifications),
+    );
+    ok(
+      "liveliness status is published and cleared",
+      statuses.some((text) => typeof text === "string") && statuses.at(-1) === undefined,
+      JSON.stringify(statuses),
+    );
+  }
+
+  {
+    const notifications: Notification[] = [];
+    const statuses: Array<string | undefined> = [];
+    state.sharedCtx = makeCtx(notifications, statuses);
+    state.primaryModel = rpcModel;
+    state.unknownErrorWaitingEnabled = false;
+    const delegate = ((model: Model<Api>) =>
+      streamFrom([startEvent(model), errorEvent(model, "Internal server error")])
+    ) as Parameters<typeof streamWithLimitsRetry>[1];
+    const events = await collect(streamWithLimitsRetry({} as ModelRuntime, delegate, rpcModel, context));
+    const errors = notifications.filter((entry) => entry.type === "error");
+    ok(
+      "giving up notifies exactly one error in RPC mode",
+      events.at(-1)?.type === "error" && errors.length === 1
+        && errors[0]!.message.includes("not retrying") && errors[0]!.message.includes("Internal server error"),
+      JSON.stringify(notifications),
+    );
+  }
+
+  state.unknownErrorWaitingEnabled = true;
+  __setNonRetryableTuningForTests(1_000_000, 5_000);
+  state.sharedCtx = previousCtx;
+  state.primaryModel = previousPrimary;
+}
+
 section("retry-period session summary lifecycle");
 {
   type LifecycleHandler = (event: unknown, ctx: unknown) => unknown;

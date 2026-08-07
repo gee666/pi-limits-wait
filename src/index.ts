@@ -50,7 +50,16 @@ export {
   streamWithLimitsRetry,
   streamWithRateLimitRetry,
 } from "./stream.js";
-export { freezingEnabled, loadUnknownErrorRetrySettings, waitForRateLimit, waitForRetry } from "./ui.js";
+export {
+  clearLivelinessStatus,
+  freezingEnabled,
+  isNonInteractiveHost,
+  loadUnknownErrorRetrySettings,
+  notifyFinalFailure,
+  notifyLiveliness,
+  waitForRateLimit,
+  waitForRetry,
+} from "./ui.js";
 export type { FallbackModel } from "./types.js";
 
 export default function (pi: ExtensionAPI) {

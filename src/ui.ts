@@ -1,8 +1,11 @@
 import {
+  DEFAULT_LIVELINESS_INTERVAL_MS,
   DEFAULT_UNKNOWN_ERROR_MAX_RETRIES,
   DEFAULT_UNKNOWN_ERROR_RETRY_INTERVAL_MS,
   DEFAULT_WAITING_ENV_VAR,
   FREEZING_ENV_VAR,
+  LIVELINESS_INTERVAL_ENV_VAR,
+  LIVELINESS_STATUS_KEY,
   MAX_RETRY_ENV_VAR,
   RETRY_INTERVAL_ENV_VAR,
 } from "./constants.js";
@@ -11,6 +14,7 @@ import {
   createWaitId,
   emitWaitTelemetry,
   waitModel,
+  type LimitsWaitModel,
   type LimitsWaitWaitEndPayload,
   type LimitsWaitWaitOutcome,
   type LimitsWaitWaitStartPayload,
@@ -76,6 +80,102 @@ export function loadUnknownErrorRetrySettings(): void {
     Math.floor(2_147_483_647 / 1_000),
   );
   state.nonRetryableRetryDelayMs = intervalSeconds * 1_000;
+}
+
+/**
+ * True when the host cannot render the TUI countdown (RPC/JSON clients).
+ * Such hosts learn about progress only from notifications and status updates,
+ * so a retry must never be announced as an error there.
+ */
+export function isNonInteractiveHost(): boolean {
+  const mode = state.sharedCtx?.mode;
+  return mode === "rpc" || mode === "json";
+}
+
+function livelinessIntervalMs(): number {
+  const seconds = envNonNegativeInteger(
+    process.env[LIVELINESS_INTERVAL_ENV_VAR],
+    DEFAULT_LIVELINESS_INTERVAL_MS / 1_000,
+    Math.floor(2_147_483_647 / 1_000),
+  );
+  return Math.max(1_000, seconds * 1_000);
+}
+
+function describeModel(model: Pick<LimitsWaitModel, "provider" | "id"> | undefined): string {
+  return model ? `${model.provider}/${model.id}` : "model";
+}
+
+/**
+ * Progress notice for a retry the extension still intends to perform. It is
+ * informational for non-interactive hosts: only a final give-up is an error.
+ */
+export function notifyLiveliness(message: string): void {
+  const ctx = state.sharedCtx;
+  if (!ctx) return;
+  const nonInteractive = isNonInteractiveHost();
+  try { ctx.ui.notify(message, nonInteractive ? "info" : "warning"); } catch { /* UI unavailable */ }
+  if (!nonInteractive) return;
+  try { ctx.ui.setStatus(LIVELINESS_STATUS_KEY, message); } catch { /* UI unavailable */ }
+}
+
+/** Clear any liveliness status entry left behind by a retry wait. */
+export function clearLivelinessStatus(): void {
+  const ctx = state.sharedCtx;
+  if (!ctx || !isNonInteractiveHost()) return;
+  try { ctx.ui.setStatus(LIVELINESS_STATUS_KEY, undefined); } catch { /* UI unavailable */ }
+}
+
+/**
+ * Terminal failure notice: the extension has stopped retrying. This is the only
+ * place where an error-level notification is emitted.
+ */
+export function notifyFinalFailure(message: string): void {
+  const ctx = state.sharedCtx;
+  if (!ctx) return;
+  clearLivelinessStatus();
+  if (!isNonInteractiveHost()) return;
+  // In TUI the terminal error event is already rendered in the transcript.
+  try { ctx.ui.notify(message, "error"); } catch { /* UI unavailable */ }
+}
+
+function livelinessText(
+  reason: RetryReason,
+  remainingMs: number,
+  model?: Pick<LimitsWaitModel, "provider" | "id">,
+  error?: string,
+): string {
+  const why = error ? ` Why: ${formatErrorDetail(error)}` : "";
+  return (
+    `⏳ pi-limits-wait: ${reasonLabel(reason).toLowerCase()} on ${describeModel(model)}; ` +
+    `still alive, waiting ${formatDuration(remainingMs)} before the next retry.${why}`
+  );
+}
+
+/**
+ * Publish periodic liveliness notices for hosts without the TUI countdown.
+ * Returns a cleanup function.
+ */
+function startLivelinessReporting(
+  reason: RetryReason,
+  deadline: number,
+  model?: Pick<LimitsWaitModel, "provider" | "id">,
+  error?: string,
+): () => void {
+  if (!isNonInteractiveHost()) return () => undefined;
+
+  const report = () => {
+    const remaining = Math.max(0, deadline - Date.now());
+    notifyLiveliness(livelinessText(reason, remaining, model, error));
+  };
+  report();
+  const ticker = setInterval(() => {
+    if (Date.now() >= deadline) return;
+    report();
+  }, livelinessIntervalMs());
+  return () => {
+    clearInterval(ticker);
+    clearLivelinessStatus();
+  };
 }
 
 function countdownText(reason: RetryReason, deadline: number, allowSkip: boolean): string {
@@ -151,6 +251,7 @@ export function waitForRetry(
   return new Promise((resolve) => {
     const ctx = state.sharedCtx;
     let done = false;
+    const stopLiveliness = startLivelinessReporting(reason, plannedDeadline, model, telemetry?.error);
     let unsubInput: (() => void) | undefined;
     let ticker: ReturnType<typeof setInterval> | undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -160,6 +261,7 @@ export function waitForRetry(
     function cleanup() {
       if (ticker) clearInterval(ticker);
       if (timer) clearTimeout(timer);
+      try { stopLiveliness(); } catch { /* UI unavailable */ }
       signal?.removeEventListener("abort", onAbort);
       try { unsubInput?.(); } catch { /* UI unavailable */ }
       try { ctx?.ui.setWorkingMessage(); } catch { /* UI unavailable */ }

@@ -16,6 +16,7 @@ import {
   configuredAttempt,
   earliestCandidateDeadline,
   fallbackEnabled,
+  formatModel,
   getPrimaryModel,
   initialAttempt,
   isFallbackEligibleModel,
@@ -33,7 +34,15 @@ import type { RetryPeriodTracker } from "./retry-summary.js";
 import { loadFallbackSettings } from "./settings.js";
 import { state } from "./state.js";
 import type { FallbackModel, RetryReason, RetryableError, RuntimeStreamSimpleFn } from "./types.js";
-import { clearModelStatus, freezingEnabled, reasonLabel, waitForRetry } from "./ui.js";
+import {
+  clearLivelinessStatus,
+  clearModelStatus,
+  formatErrorDetail,
+  freezingEnabled,
+  notifyFinalFailure,
+  reasonLabel,
+  waitForRetry,
+} from "./ui.js";
 
 export function __setNonRetryableTuningForTests(maxAttempts: number, retryDelayMs: number): void {
   state.nonRetryableMaxAttempts = maxAttempts;
@@ -221,6 +230,7 @@ export function streamWithLimitsRetry(
 
     const pushAbort = (message: string) => {
       retryPeriod?.finalize();
+      clearLivelinessStatus();
       if (!committed) {
         output.push({ type: "start", partial: freshMessage(attempt.model) });
         committed = true;
@@ -364,6 +374,7 @@ export function streamWithLimitsRetry(
                     return;
                   }
                   retryPeriod?.finalize();
+                  clearLivelinessStatus();
                   if (buffer.length > 0) flush(buffer);
                   else {
                     output.push({ type: "start", partial: freshMessage(attempt.model) });
@@ -406,7 +417,10 @@ export function streamWithLimitsRetry(
                 output.push({ type: "start", partial: freshMessage(attempt.model) });
                 committed = true;
               }
-              if (event.type === "done") retryPeriod?.finalize();
+              if (event.type === "done") {
+                retryPeriod?.finalize();
+                clearLivelinessStatus();
+              }
               output.push(event);
               if (event.type === "done") {
                 finished = true;
@@ -417,7 +431,10 @@ export function streamWithLimitsRetry(
             }
 
             if (event.type === "error") retryPeriod?.recordReason(event.error.errorMessage ?? "Provider stream error");
-            if (event.type === "done" || event.type === "error") retryPeriod?.finalize();
+            if (event.type === "done" || event.type === "error") {
+              retryPeriod?.finalize();
+              clearLivelinessStatus();
+            }
             output.push(event);
             if (event.type === "done" || event.type === "error") {
               finished = true;
@@ -468,6 +485,7 @@ export function streamWithLimitsRetry(
             return;
           }
           retryPeriod?.finalize();
+          clearLivelinessStatus();
           if (!committed) {
             if (buffer.length > 0) flush(buffer);
             else {
@@ -502,6 +520,11 @@ export function streamWithLimitsRetry(
         const emitFailure = () => {
           retryPeriod?.recordReason(failureMessage);
           retryPeriod?.finalize();
+          // No further wait/retry is planned: this is the only error surfaced
+          // to non-interactive hosts for this request.
+          notifyFinalFailure(
+            `${formatModel(attempt.model)} failed and pi-limits-wait is not retrying: ${formatErrorDetail(failureMessage, Number.MAX_SAFE_INTEGER)}`,
+          );
           if (!committed) {
             if (buffer.length > 0) flush(buffer);
             else {
@@ -620,6 +643,11 @@ export function streamWithLimitsRetry(
     retryPeriod?.finalize();
     const failure = freshMessage(model);
     failure.stopReason = signal?.aborted ? "aborted" : "error";
+    if (failure.stopReason === "error") {
+      notifyFinalFailure(
+        `${formatModel(model)} failed and pi-limits-wait is not retrying: ${formatErrorDetail(errorMessageWithCauses(error), Number.MAX_SAFE_INTEGER)}`,
+      );
+    } else clearLivelinessStatus();
     failure.errorMessage = errorMessageWithCauses(error);
     output.push({ type: "start", partial: freshMessage(model) });
     output.push({ type: "error", reason: failure.stopReason, error: failure });
