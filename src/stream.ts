@@ -680,6 +680,23 @@ interface InterceptionSlot {
 }
 type InterceptablePrototype = ModelRuntime & { [INTERCEPTION_SYMBOL]?: InterceptionSlot };
 
+/**
+ * Deactivate the currently installed retry handler, if any. This is used by
+ * the all-waiting kill switch so reloading from an enabled extension instance
+ * cannot leave its process-wide interception active.
+ */
+export function disableModelRuntimeInterception(): void {
+  const prototype = ModelRuntime.prototype as InterceptablePrototype;
+  const slot = prototype[INTERCEPTION_SYMBOL];
+  if (!slot || prototype.streamSimple !== slot.wrapper) return;
+
+  const abortOwner = slot.abortOwner;
+  slot.owner = undefined;
+  slot.abortOwner = undefined;
+  slot.handler = undefined;
+  abortOwner?.();
+}
+
 /** Install one stable, reload-safe process-wide trampoline. */
 export function installModelRuntimeInterception(
   createRetryPeriod?: () => RetryPeriodTracker,

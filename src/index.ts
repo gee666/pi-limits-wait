@@ -3,9 +3,9 @@ import { isInternalSyntheticModel } from "./models.js";
 import { sanitiseAnthropicPayloadSystem } from "./prompt.js";
 import { RetrySummaryCoordinator } from "./retry-summary.js";
 import { loadFallbackSettings } from "./settings.js";
-import { loadUnknownErrorRetrySettings } from "./ui.js";
+import { allWaitingDisabled, loadUnknownErrorRetrySettings } from "./ui.js";
 import { consumeExpectedModelSelection, state } from "./state.js";
-import { installModelRuntimeInterception } from "./stream.js";
+import { disableModelRuntimeInterception, installModelRuntimeInterception } from "./stream.js";
 
 export { sanitiseAnthropicPayloadSystem, sanitiseSystemPrompt } from "./prompt.js";
 export {
@@ -46,11 +46,13 @@ export type { LimitsWaitSessionEntryData } from "./retry-summary.js";
 export {
   __configureFallbackModelsForTests,
   __setNonRetryableTuningForTests,
+  disableModelRuntimeInterception,
   installModelRuntimeInterception,
   streamWithLimitsRetry,
   streamWithRateLimitRetry,
 } from "./stream.js";
 export {
+  allWaitingDisabled,
   clearLivelinessStatus,
   freezingEnabled,
   isNonInteractiveHost,
@@ -63,15 +65,23 @@ export {
 export type { FallbackModel } from "./types.js";
 
 export default function (pi: ExtensionAPI) {
+  // Current pi-ai inserts the Claude Code identity as the first system block
+  // for Anthropic OAuth. Sanitise only that exact payload shape; authentication,
+  // identity insertion, Anthropic headers, and all other request composition
+  // remain owned by ModelRuntime.
+  pi.on("before_provider_request", (event) => sanitiseAnthropicPayloadSystem(event.payload));
+
+  // Keep prompt sanitisation and the runtime's normal Anthropic header path,
+  // but install no retry/error interception or retry-related lifecycle hooks.
+  if (allWaitingDisabled()) {
+    disableModelRuntimeInterception();
+    return;
+  }
+
   state.extensionApi = pi;
   loadUnknownErrorRetrySettings();
   const retrySummaries = new RetrySummaryCoordinator(pi);
   const releaseInterception = installModelRuntimeInterception(() => retrySummaries.createStream());
-
-  // Current pi-ai inserts the Claude Code identity as the first system block
-  // for Anthropic OAuth. Sanitise only that exact payload shape; authentication,
-  // identity insertion and all request composition remain owned by ModelRuntime.
-  pi.on("before_provider_request", (event) => sanitiseAnthropicPayloadSystem(event.payload));
 
   pi.on("model_select", (event) => {
     if (consumeExpectedModelSelection(event.model)) return;

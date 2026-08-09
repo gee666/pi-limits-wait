@@ -160,6 +160,7 @@ The extension rereads these files before every LLM call, so changes made during 
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `PI_LIMITS_WAIT_DISABLE_ALL_WAITING` | `false` | Master kill switch for this extension's error handling, retries, fallbacks, freezing, waiting, notifications, telemetry, and retry summaries. Set to `true` (also accepts `1`, `yes`, `on`) to leave only Anthropic OAuth system-prompt cleaning enabled; requests continue through Pi's normal runtime, including its normal Anthropic headers. This takes precedence over every setting below. |
 | `PI_LIMITS_WAIT_DEFAULT_WAITING` | `true` | Whether unclassified/unknown provider errors enter the wait-and-retry cycle. Set to `false` (also accepts `0`, `no`, `off`) to surface the error immediately. Rate-limit, overload, authentication, and network retry behavior is unchanged. |
 | `PI_LIMITS_WAIT_MAX_RETRY` | `999999` | Maximum extension-created retries for an unclassified/unknown provider error. The initial failed request and provider-internal retries do not count. HTTP 400/403 remain eligible. Must be a non-negative integer. |
 | `PI_LIMITS_WAIT_LIVELINESS_INTERVAL` | `15` | Seconds between liveliness notifications published while waiting in non-interactive (`rpc`/`json`) modes. Must be a non-negative integer; values below 1 second are clamped to 1 second. Ignored in TUI mode. |

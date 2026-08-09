@@ -3,6 +3,7 @@ import {
   DEFAULT_UNKNOWN_ERROR_MAX_RETRIES,
   DEFAULT_UNKNOWN_ERROR_RETRY_INTERVAL_MS,
   DEFAULT_WAITING_ENV_VAR,
+  DISABLE_ALL_WAITING_ENV_VAR,
   FREEZING_ENV_VAR,
   LIVELINESS_INTERVAL_ENV_VAR,
   LIVELINESS_STATUS_KEY,
@@ -55,6 +56,10 @@ function envNonNegativeInteger(raw: string | undefined, defaultValue: number, ma
   if (raw === undefined || !/^\d+$/.test(raw.trim())) return defaultValue;
   const value = Number(raw);
   return Number.isSafeInteger(value) ? Math.min(value, maximum) : defaultValue;
+}
+
+export function allWaitingDisabled(): boolean {
+  return envBoolean(process.env[DISABLE_ALL_WAITING_ENV_VAR], false);
 }
 
 export function freezingEnabled(): boolean {

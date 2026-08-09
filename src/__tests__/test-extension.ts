@@ -17,6 +17,7 @@ import limitsWaitExtension, {
   __configureFallbackModelsForTests,
   __readFallbackSettingsForTests,
   __setNonRetryableTuningForTests,
+  allWaitingDisabled,
   freezingEnabled,
   getRetryableError,
   installModelRuntimeInterception,
@@ -142,6 +143,13 @@ ok("preserves the unknown-error retry default", DEFAULT_UNKNOWN_ERROR_MAX_RETRIE
   ok("freezing environment switch works", !freezingEnabled());
   if (previous === undefined) delete process.env.PI_LIMITS_WAIT_FREEZING_ENABLED;
   else process.env.PI_LIMITS_WAIT_FREEZING_ENABLED = previous;
+}
+{
+  const previous = process.env.PI_LIMITS_WAIT_DISABLE_ALL_WAITING;
+  process.env.PI_LIMITS_WAIT_DISABLE_ALL_WAITING = "true";
+  ok("all-waiting environment switch works", allWaitingDisabled());
+  if (previous === undefined) delete process.env.PI_LIMITS_WAIT_DISABLE_ALL_WAITING;
+  else process.env.PI_LIMITS_WAIT_DISABLE_ALL_WAITING = previous;
 }
 {
   const previous = {
@@ -330,6 +338,45 @@ async function createRuntime(
     });
   }
   return runtime;
+}
+
+section("disable-all-waiting mode");
+{
+  const calls: Record<string, ProviderCall[]> = {};
+  let attempts = 0;
+  const runtime = await createRuntime({
+    anthropic(model) {
+      attempts++;
+      return streamFrom([startEvent(model), errorEvent(model, "HTTP 429 retry-after 60")]);
+    },
+  }, calls);
+  const model = runtime.getModel("anthropic", "anthropic-model")!;
+
+  // Start enabled to prove the disabled extension reload removes an existing
+  // process-wide retry handler rather than merely declining to install another.
+  const oldRelease = installModelRuntimeInterception();
+  const handlers = new Map<string, (event: { payload: unknown }) => unknown>();
+  const pi = {
+    on: (event: string, handler: (event: { payload: unknown }) => unknown) => {
+      handlers.set(event, handler);
+    },
+  } as unknown as ExtensionAPI;
+  const previous = process.env.PI_LIMITS_WAIT_DISABLE_ALL_WAITING;
+  process.env.PI_LIMITS_WAIT_DISABLE_ALL_WAITING = "true";
+  limitsWaitExtension(pi);
+  if (previous === undefined) delete process.env.PI_LIMITS_WAIT_DISABLE_ALL_WAITING;
+  else process.env.PI_LIMITS_WAIT_DISABLE_ALL_WAITING = previous;
+
+  const events = await collect(runtime.streamSimple(model, context));
+  ok("disable-all mode surfaces the first provider failure without handling or waiting", attempts === 1 && events.at(-1)?.type === "error");
+  ok("disable-all mode registers only prompt sanitisation", handlers.size === 1 && handlers.has("before_provider_request"));
+  ok("disable-all mode preserves normal Anthropic configured headers", calls.anthropic?.[0]?.options?.headers?.["x-anthropic"] === "configured");
+
+  const identity = { type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude." };
+  const payload = { system: [identity, { type: "text", text: "You are pi, a coding agent.\n\nKeep this." }] };
+  const sanitised = handlers.get("before_provider_request")?.({ payload }) as typeof payload | undefined;
+  ok("disable-all mode keeps Anthropic system-prompt cleaning", sanitised !== payload && sanitised?.system[1]?.text === "Keep this.");
+  oldRelease();
 }
 
 section("Pi-owned context-overflow handling");
