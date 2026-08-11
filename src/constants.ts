@@ -35,6 +35,12 @@ export const DEFAULT_UNKNOWN_ERROR_RETRY_INTERVAL_MS = 5 * 1_000; // 5 seconds
 export const LIVELINESS_STATUS_KEY = "oira666.pi-limits-wait";
 export const DEFAULT_LIVELINESS_INTERVAL_MS = 15 * 1_000; // 15 seconds
 
+/** Machine-readable sibling of LIVELINESS_STATUS_KEY. Compact JSON, never prose. */
+export const LIVELINESS_JSON_STATUS_KEY = "oira666.pi-limits-wait.json";
+/** Payload schema version for LIVELINESS_JSON_STATUS_KEY. Bump only on a breaking change. */
+export const LIVELINESS_JSON_VERSION = 1;
+export const EXTENSION_VERSION = "0.5.7";
+
 export const SETTINGS_FILE_NAME = "limits-wait.json";
 export const FALLBACK_MODELS_KEY = "fallback-models";
 export const DISABLE_ALL_WAITING_ENV_VAR = "PI_LIMITS_WAIT_DISABLE_ALL_WAITING";
@@ -43,3 +49,7 @@ export const DEFAULT_WAITING_ENV_VAR = "PI_LIMITS_WAIT_DEFAULT_WAITING";
 export const MAX_RETRY_ENV_VAR = "PI_LIMITS_WAIT_MAX_RETRY";
 export const RETRY_INTERVAL_ENV_VAR = "PI_LIMITS_WAIT_RETRY_INTERVAL";
 export const LIVELINESS_INTERVAL_ENV_VAR = "PI_LIMITS_WAIT_LIVELINESS_INTERVAL";
+/** Set to false/0/no/off to suppress the structured status channel. */
+export const STATUS_JSON_ENV_VAR = "PI_LIMITS_WAIT_STATUS_JSON";
+/** Absolute path of the out-of-band control file polled while waiting. Unset => no control. */
+export const CONTROL_FILE_ENV_VAR = "PI_LIMITS_WAIT_CONTROL_FILE";

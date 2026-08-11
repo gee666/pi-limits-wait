@@ -214,12 +214,18 @@ export function streamWithLimitsRetry(
       return switchPiModel(attempt, signal, canSelect);
     };
 
-    const managedWait = async (reason: RetryReason, waitMs: number, error: string) =>
+    const managedWait = async (
+      reason: RetryReason,
+      waitMs: number,
+      error: string,
+      counters?: { attempt: number; maxAttempts: number },
+    ) =>
       waitForRetry(reason, waitMs, signal, {
         periodId: retryPeriod?.periodId,
         model: attempt.model,
         error,
         events: retryPeriod?.events,
+        ...(counters ?? {}),
         onEnd: (elapsedMs) => retryPeriod?.recordWait(elapsedMs),
       });
 
@@ -524,6 +530,7 @@ export function streamWithLimitsRetry(
           // to non-interactive hosts for this request.
           notifyFinalFailure(
             `${formatModel(attempt.model)} failed and pi-limits-wait is not retrying: ${formatErrorDetail(failureMessage, Number.MAX_SAFE_INTEGER)}`,
+            failureMessage,
           );
           if (!committed) {
             if (buffer.length > 0) flush(buffer);
@@ -549,7 +556,10 @@ export function streamWithLimitsRetry(
           if (attempts < state.nonRetryableMaxAttempts) {
             notifyRetryingAfterError(attempt.model, state.nonRetryableRetryDelayMs, failureMessage);
             retryPeriod?.beginRetry(failureMessage);
-            const wait = await managedWait("retry", state.nonRetryableRetryDelayMs, failureMessage);
+            const wait = await managedWait("retry", state.nonRetryableRetryDelayMs, failureMessage, {
+              attempt: attempts,
+              maxAttempts: state.nonRetryableMaxAttempts,
+            });
             if (wait === "aborted" || signal?.aborted) {
               pushAbort("Request aborted while retrying after error.");
               return;
@@ -646,6 +656,7 @@ export function streamWithLimitsRetry(
     if (failure.stopReason === "error") {
       notifyFinalFailure(
         `${formatModel(model)} failed and pi-limits-wait is not retrying: ${formatErrorDetail(errorMessageWithCauses(error), Number.MAX_SAFE_INTEGER)}`,
+        errorMessageWithCauses(error),
       );
     } else clearLivelinessStatus();
     failure.errorMessage = errorMessageWithCauses(error);

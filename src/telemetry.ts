@@ -54,6 +54,9 @@ export type WaitTelemetryOptions = {
   model?: Pick<Model<Api>, "provider" | "id">;
   error?: string;
   events?: EventBus;
+  /** Extension-created attempt counters, when the call site tracks them. */
+  attempt?: number;
+  maxAttempts?: number;
   onEnd?: (actualElapsedMs: number, outcome: LimitsWaitWaitOutcome) => void;
 };
 

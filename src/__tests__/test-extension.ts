@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -33,8 +33,18 @@ import limitsWaitExtension, {
   sanitiseSystemPrompt,
   streamWithLimitsRetry,
   waitForRateLimit,
+  waitForRetry,
+  notifyFinalFailure,
+  clearStatusJson,
+  publishStatusJson,
+  statusPayload,
+  LIVELINESS_JSON_STATUS_KEY,
+  LIVELINESS_STATUS_KEY,
+  type LimitsWaitStatusContext,
+  type LimitsWaitStatusPayload,
 } from "../index.js";
 import { DEFAULT_UNKNOWN_ERROR_MAX_RETRIES } from "../constants.js";
+import { isSkipToken } from "../status-json.js";
 import { withAttemptResponseObserver } from "../response-observer.js";
 import { loadFallbackSettings } from "../settings.js";
 import { consumeExpectedModelSelection, expectModelSelection, state } from "../state.js";
@@ -1394,6 +1404,324 @@ section("abort and commitment semantics");
   release();
   __configureFallbackModelsForTests([]);
   __setNonRetryableTuningForTests(3, 2);
+}
+
+section("structured status channel and out-of-band skip");
+{
+  type StatusEntry = { key: string; text: string | undefined };
+  type Note = { message: string; type?: string };
+  const jsonEntries = (entries: StatusEntry[]) => entries.filter((entry) => entry.key === LIVELINESS_JSON_STATUS_KEY);
+  const proseEntries = (entries: StatusEntry[]) => entries.filter((entry) => entry.key === LIVELINESS_STATUS_KEY);
+  const frames = (entries: StatusEntry[]): LimitsWaitStatusPayload[] => jsonEntries(entries)
+    .filter((entry) => typeof entry.text === "string")
+    .map((entry) => JSON.parse(entry.text as string) as LimitsWaitStatusPayload);
+  const makeCtx = (entries: StatusEntry[], notes: Note[], mode = "rpc") => ({
+    cwd: process.cwd(),
+    mode,
+    hasUI: true,
+    isProjectTrusted: () => true,
+    ui: {
+      notify: (message: string, type?: string) => { notes.push({ message, type }); },
+      setStatus: (key: string, text: string | undefined) => { entries.push({ key, text }); },
+      setWorkingMessage: () => undefined,
+      onTerminalInput: () => () => undefined,
+    },
+  } as unknown as ExtensionContext);
+  const collectingApi = (payloads: Array<Record<string, unknown>>) => ({
+    events: {
+      emit: (_channel: string, payload: unknown) => payloads.push(payload as Record<string, unknown>),
+      on: () => () => undefined,
+    },
+  } as unknown as ExtensionAPI);
+
+  const previousCtx = state.sharedCtx;
+  const previousApi = state.extensionApi;
+  const previousPrimary = state.primaryModel;
+  const previousEnv = {
+    interval: process.env.PI_LIMITS_WAIT_LIVELINESS_INTERVAL,
+    control: process.env.PI_LIMITS_WAIT_CONTROL_FILE,
+    json: process.env.PI_LIMITS_WAIT_STATUS_JSON,
+    disabled: process.env.PI_LIMITS_WAIT_DISABLE_ALL_WAITING,
+  };
+  const root = mkdtempSync(join(tmpdir(), "limits-wait-control-"));
+  process.env.PI_LIMITS_WAIT_LIVELINESS_INTERVAL = "1";
+  delete process.env.PI_LIMITS_WAIT_CONTROL_FILE;
+  delete process.env.PI_LIMITS_WAIT_STATUS_JSON;
+  delete process.env.PI_LIMITS_WAIT_DISABLE_ALL_WAITING;
+
+  const sampleContext: LimitsWaitStatusContext = {
+    waitId: "wait-sample",
+    periodId: "period-1",
+    reason: "rate-limit",
+    error: "HTTP 429 retry-after-ms 724000",
+    model: { provider: "anthropic", id: "claude-sonnet-4-5" },
+    plannedDurationMs: 1_800_000,
+    plannedDeadline: 1_786_000_000_000,
+    startedAt: 1_785_998_200_000,
+    attempt: null,
+    maxAttempts: null,
+    livelinessIntervalMs: 15_000,
+    controlFile: "/tmp/limits-wait.control",
+  };
+
+  try {
+    {
+      const entries: StatusEntry[] = [];
+      const notes: Note[] = [];
+      state.sharedCtx = makeCtx(entries, notes);
+      publishStatusJson(statusPayload(sampleContext, "wait", "⏳ pi-limits-wait: still alive", 724_000));
+      const payload = frames(entries)[0];
+      ok(
+        "structured status publishes v:1 JSON under its own key",
+        entries.length === 1 && entries[0]!.key === LIVELINESS_JSON_STATUS_KEY
+          && payload?.v === 1 && payload.ext === "0.5.7" && payload.event === "wait"
+          && payload.waitId === "wait-sample" && payload.periodId === "period-1"
+          && payload.reason === "rate-limit" && payload.remainingMs === 724_000
+          && payload.model?.id === "claude-sonnet-4-5" && payload.controlFile === "/tmp/limits-wait.control",
+        entries[0]?.text,
+      );
+      ok(
+        "structured status is a single minified line and never touches the prose key",
+        typeof entries[0]!.text === "string" && !entries[0]!.text.includes("\n")
+          && proseEntries(entries).length === 0 && notes.length === 0,
+      );
+      clearStatusJson();
+      ok("structured status clears to a blank statusText", entries.length === 2 && entries[1]!.text === undefined);
+    }
+
+    {
+      const entries: StatusEntry[] = [];
+      state.sharedCtx = makeCtx(entries, []);
+      process.env.PI_LIMITS_WAIT_STATUS_JSON = "false";
+      publishStatusJson(statusPayload(sampleContext, "wait", "message", 1));
+      clearStatusJson();
+      delete process.env.PI_LIMITS_WAIT_STATUS_JSON;
+      ok("PI_LIMITS_WAIT_STATUS_JSON=false restores 0.5.6 wire behaviour", entries.length === 0);
+    }
+
+    {
+      const entries: StatusEntry[] = [];
+      state.sharedCtx = makeCtx(entries, [], "interactive");
+      publishStatusJson(statusPayload(sampleContext, "wait", "message", 1));
+      ok("interactive hosts never receive the structured frame", entries.length === 0);
+    }
+
+    {
+      const entries: StatusEntry[] = [];
+      const notes: Note[] = [];
+      const payloads: Array<Record<string, unknown>> = [];
+      state.sharedCtx = makeCtx(entries, notes);
+      state.extensionApi = collectingApi(payloads);
+      const outcome = await waitForRetry("rate-limit", 2_400, undefined, {
+        model: { provider: "anthropic", id: "claude-sonnet-4-5" },
+        error: "HTTP 429 retry-after-ms 2400",
+      });
+      const waitFrames = frames(entries).filter((frame) => frame.event === "wait");
+      const endFrames = frames(entries).filter((frame) => frame.event === "wait_end");
+      ok(
+        "a wait publishes one structured frame immediately and one per liveliness interval",
+        outcome === "waited" && waitFrames.length >= 3
+          && waitFrames.every((frame) => frame.waitId === waitFrames[0]!.waitId)
+          && waitFrames.every((frame, index) => index === 0 || frame.remainingMs! < waitFrames[index - 1]!.remainingMs!),
+        JSON.stringify(waitFrames.map((frame) => frame.remainingMs)),
+      );
+      ok(
+        "structured wait frames carry the reason, model, schedule and null counters",
+        waitFrames[0]?.reason === "rate-limit" && waitFrames[0].model?.provider === "anthropic"
+          && waitFrames[0].plannedDurationMs === 2_400 && waitFrames[0].livelinessIntervalMs === 1_000
+          && waitFrames[0].attempt === null && waitFrames[0].maxAttempts === null
+          && waitFrames[0].controlFile === null && waitFrames[0].error === "HTTP 429 retry-after-ms 2400",
+        JSON.stringify(waitFrames[0]),
+      );
+      ok(
+        "a wait publishes exactly one wait_end and then clears both keys",
+        endFrames.length === 1 && endFrames[0]!.outcome === "waited"
+          && endFrames[0]!.remainingMs === 0
+          && Number(endFrames[0]!.actualElapsedMs) >= 2_000
+          && jsonEntries(entries).at(-1)?.text === undefined
+          && proseEntries(entries).at(-1)?.text === undefined,
+        JSON.stringify(endFrames),
+      );
+      ok(
+        "the prose channel keeps its 0.5.6 text, level and cadence",
+        notes.length === waitFrames.length && notes.every((note) => note.type === "info")
+          && proseEntries(entries).filter((entry) => typeof entry.text === "string").length === waitFrames.length
+          && notes.every((note, index) => note.message === waitFrames[index]!.message)
+          && notes.every((note, index) => proseEntries(entries)[index]!.text === note.message)
+          && /^⏳ pi-limits-wait: rate limited on anthropic\/claude-sonnet-4-5; still alive, waiting .* before the next retry\./.test(notes[0]!.message),
+        JSON.stringify(notes),
+      );
+      ok(
+        "the in-process bus payloads are unchanged by the structured channel",
+        payloads.length === 2 && payloads[0]!.phase === "start" && payloads[1]!.phase === "end"
+          && payloads[1]!.outcome === "waited" && !("event" in payloads[0]!) && !("attempt" in payloads[0]!),
+        JSON.stringify(payloads),
+      );
+    }
+
+    {
+      const entries: StatusEntry[] = [];
+      const notes: Note[] = [];
+      state.sharedCtx = makeCtx(entries, notes);
+      notifyFinalFailure("anthropic/claude-sonnet-4-5 failed and pi-limits-wait is not retrying: HTTP 400 boom", "HTTP 400 boom");
+      const giveUp = frames(entries).filter((frame) => frame.event === "give_up");
+      ok(
+        "giving up publishes one terminal give_up frame and then clears both keys",
+        giveUp.length === 1 && giveUp[0]!.waitId === null && giveUp[0]!.reason === null
+          && giveUp[0]!.error === "HTTP 400 boom" && giveUp[0]!.remainingMs === null
+          && giveUp[0]!.plannedDeadline === null && giveUp[0]!.message.includes("not retrying")
+          && jsonEntries(entries).at(-1)?.text === undefined
+          && proseEntries(entries).some((entry) => entry.text === undefined),
+        JSON.stringify(frames(entries)),
+      );
+      ok(
+        "giving up still notifies exactly one error with the unchanged prose text",
+        notes.length === 1 && notes[0]!.type === "error" && notes[0]!.message.includes("HTTP 400 boom"),
+        JSON.stringify(notes),
+      );
+    }
+
+    {
+      const controlFile = join(root, "limits-wait.control");
+      process.env.PI_LIMITS_WAIT_CONTROL_FILE = controlFile;
+      const entries: StatusEntry[] = [];
+      const payloads: Array<Record<string, unknown>> = [];
+      state.sharedCtx = makeCtx(entries, []);
+      state.extensionApi = collectingApi(payloads);
+      const started = Date.now();
+      const pending = waitForRetry("rate-limit", 30_000, undefined, { error: "HTTP 429" });
+      const waitId = frames(entries)[0]?.waitId;
+      writeFileSync(controlFile, JSON.stringify({ action: "skip", waitId, issuedAt: Date.now(), by: "ramcore" }));
+      const outcome = await pending;
+      const elapsed = Date.now() - started;
+      const end = payloads.at(-1);
+      ok(
+        "a matching skip token settles the wait as skipped within about a second",
+        outcome === "skipped" && elapsed < 4_000 && end?.phase === "end" && end.outcome === "skipped"
+          && frames(entries).some((frame) => frame.event === "wait_end" && frame.outcome === "skipped"),
+        `outcome=${outcome} elapsed=${elapsed}`,
+      );
+      ok("the consumed skip token is unlinked", !existsSync(controlFile));
+      ok(
+        "the control file path is advertised in the structured frame",
+        frames(entries)[0]?.controlFile === controlFile,
+      );
+    }
+
+    {
+      const controlFile = join(root, "limits-wait.control");
+      process.env.PI_LIMITS_WAIT_CONTROL_FILE = controlFile;
+      const entries: StatusEntry[] = [];
+      state.sharedCtx = makeCtx(entries, []);
+      writeFileSync(controlFile, JSON.stringify({ action: "skip", waitId: "wait-from-an-earlier-wait", issuedAt: Date.now(), by: "ramcore" }));
+      const outcome = await waitForRetry("rate-limit", 2_400);
+      ok(
+        "a token left over from an earlier wait never skips a later wait",
+        outcome === "waited" && existsSync(controlFile),
+        `outcome=${outcome}`,
+      );
+
+      writeFileSync(controlFile, JSON.stringify({ action: "skip", waitId: "*", issuedAt: Date.now() - 60_000, by: "ramcore" }));
+      const staleWildcard = await waitForRetry("rate-limit", 2_400);
+      ok(
+        "a wildcard token issued before this wait started is ignored",
+        staleWildcard === "waited" && existsSync(controlFile),
+        `outcome=${staleWildcard}`,
+      );
+
+      writeFileSync(controlFile, "not json at all");
+      const malformed = await waitForRetry("rate-limit", 1_400);
+      ok("a malformed control file is ignored", malformed === "waited" && existsSync(controlFile));
+
+      rmSync(controlFile, { force: true });
+      const missing = await waitForRetry("rate-limit", 1_400);
+      ok("a missing control file is ignored", missing === "waited");
+
+      process.env.PI_LIMITS_WAIT_CONTROL_FILE = join(root, "no-such-directory", "limits-wait.control");
+      const unreadable = await waitForRetry("rate-limit", 1_400);
+      ok("an unreadable control path is ignored", unreadable === "waited");
+    }
+
+    {
+      const now = Date.now();
+      ok("skip tokens require the current waitId or the wildcard",
+        isSkipToken({ action: "skip", waitId: "wait-1", issuedAt: now }, "wait-1", now - 10)
+        && isSkipToken({ action: "skip", waitId: "*", issuedAt: now }, "wait-1", now - 10)
+        && !isSkipToken({ action: "skip", waitId: "wait-2", issuedAt: now }, "wait-1", now - 10));
+      ok("skip tokens require issuedAt at or after the wait start",
+        !isSkipToken({ action: "skip", waitId: "*", issuedAt: now - 1 }, "wait-1", now)
+        && isSkipToken({ action: "skip", waitId: "*", issuedAt: now }, "wait-1", now));
+      ok("non-skip, malformed and non-object tokens are rejected",
+        !isSkipToken({ action: "stop", waitId: "*", issuedAt: now }, "wait-1", 0)
+        && !isSkipToken({ action: "skip", waitId: "*" }, "wait-1", 0)
+        && !isSkipToken("skip", "wait-1", 0) && !isSkipToken(null, "wait-1", 0));
+    }
+
+    {
+      const controlFile = join(root, "untouched.control");
+      delete process.env.PI_LIMITS_WAIT_CONTROL_FILE;
+      writeFileSync(controlFile, JSON.stringify({ action: "skip", waitId: "*", issuedAt: Date.now(), by: "ramcore" }));
+      state.sharedCtx = makeCtx([], []);
+      const outcome = await waitForRetry("rate-limit", 1_400);
+      ok(
+        "without PI_LIMITS_WAIT_CONTROL_FILE no token is read or consumed",
+        outcome === "waited" && existsSync(controlFile),
+        `outcome=${outcome}`,
+      );
+
+      process.env.PI_LIMITS_WAIT_CONTROL_FILE = controlFile;
+      process.env.PI_LIMITS_WAIT_DISABLE_ALL_WAITING = "true";
+      const entries: StatusEntry[] = [];
+      state.sharedCtx = makeCtx(entries, []);
+      const disabled = await waitForRetry("rate-limit", 1_400);
+      delete process.env.PI_LIMITS_WAIT_DISABLE_ALL_WAITING;
+      ok(
+        "the master kill switch emits no structured frame and polls no control file",
+        disabled === "waited" && jsonEntries(entries).length === 0 && existsSync(controlFile),
+        JSON.stringify(entries.map((entry) => entry.key)),
+      );
+      delete process.env.PI_LIMITS_WAIT_CONTROL_FILE;
+    }
+
+    {
+      const entries: StatusEntry[] = [];
+      const rpcModel = { provider: "rpc", id: "rpc-model", api: "openai-completions" } as Model<Api>;
+      state.sharedCtx = makeCtx(entries, []);
+      state.extensionApi = undefined;
+      state.primaryModel = rpcModel;
+      state.unknownErrorWaitingEnabled = true;
+      __setNonRetryableTuningForTests(2, 20);
+      let attempts = 0;
+      const delegate = ((model: Model<Api>) => {
+        attempts++;
+        return attempts === 1
+          ? streamFrom([startEvent(model), errorEvent(model, "Internal server error")])
+          : streamFrom([startEvent(model), doneEvent(model)]);
+      }) as Parameters<typeof streamWithLimitsRetry>[1];
+      await collect(streamWithLimitsRetry({} as ModelRuntime, delegate, rpcModel, context));
+      const retryFrame = frames(entries).find((frame) => frame.event === "wait");
+      ok(
+        "the unknown-error path serialises its attempt counters",
+        attempts === 2 && retryFrame?.reason === "retry" && retryFrame.attempt === 1 && retryFrame.maxAttempts === 2,
+        JSON.stringify(retryFrame),
+      );
+      __setNonRetryableTuningForTests(1_000_000, 5_000);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    for (const [name, value] of [
+      ["PI_LIMITS_WAIT_LIVELINESS_INTERVAL", previousEnv.interval],
+      ["PI_LIMITS_WAIT_CONTROL_FILE", previousEnv.control],
+      ["PI_LIMITS_WAIT_STATUS_JSON", previousEnv.json],
+      ["PI_LIMITS_WAIT_DISABLE_ALL_WAITING", previousEnv.disabled],
+    ] as const) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    state.sharedCtx = previousCtx;
+    state.extensionApi = previousApi;
+    state.primaryModel = previousPrimary;
+  }
 }
 
 console.log(`\n${"═".repeat(64)}`);

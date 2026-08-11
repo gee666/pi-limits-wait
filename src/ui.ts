@@ -1,3 +1,4 @@
+import { readFile, unlink } from "node:fs/promises";
 import {
   DEFAULT_LIVELINESS_INTERVAL_MS,
   DEFAULT_UNKNOWN_ERROR_MAX_RETRIES,
@@ -11,6 +12,14 @@ import {
   RETRY_INTERVAL_ENV_VAR,
 } from "./constants.js";
 import { state } from "./state.js";
+import {
+  clearStatusJson,
+  controlFilePath,
+  isSkipToken,
+  publishStatusJson,
+  statusPayload,
+  type LimitsWaitStatusContext,
+} from "./status-json.js";
 import {
   createWaitId,
   emitWaitTelemetry,
@@ -46,7 +55,7 @@ export function reasonLabel(reason: RetryReason): string {
   return "Rate limited";
 }
 
-function envBoolean(raw: string | undefined, defaultValue: boolean): boolean {
+export function envBoolean(raw: string | undefined, defaultValue: boolean): boolean {
   if (raw === undefined) return defaultValue;
   const value = raw.trim().toLowerCase();
   return !(value === "false" || value === "0" || value === "no" || value === "off");
@@ -128,19 +137,38 @@ export function clearLivelinessStatus(): void {
   const ctx = state.sharedCtx;
   if (!ctx || !isNonInteractiveHost()) return;
   try { ctx.ui.setStatus(LIVELINESS_STATUS_KEY, undefined); } catch { /* UI unavailable */ }
+  clearStatusJson();
+}
+
+/** Structured-channel context for an event that happens outside a wait. */
+function standaloneStatusContext(error?: string): LimitsWaitStatusContext {
+  return {
+    waitId: null,
+    reason: null,
+    error: error ? formatErrorDetail(error) : null,
+    plannedDurationMs: null,
+    plannedDeadline: null,
+    startedAt: null,
+    attempt: null,
+    maxAttempts: null,
+    livelinessIntervalMs: livelinessIntervalMs(),
+    controlFile: controlFilePath() ?? null,
+  };
 }
 
 /**
  * Terminal failure notice: the extension has stopped retrying. This is the only
  * place where an error-level notification is emitted.
  */
-export function notifyFinalFailure(message: string): void {
+export function notifyFinalFailure(message: string, error?: string): void {
   const ctx = state.sharedCtx;
   if (!ctx) return;
   clearLivelinessStatus();
   if (!isNonInteractiveHost()) return;
   // In TUI the terminal error event is already rendered in the transcript.
   try { ctx.ui.notify(message, "error"); } catch { /* UI unavailable */ }
+  publishStatusJson(statusPayload(standaloneStatusContext(error ?? message), "give_up", message, null));
+  clearStatusJson();
 }
 
 function livelinessText(
@@ -161,6 +189,7 @@ function livelinessText(
  * Returns a cleanup function.
  */
 function startLivelinessReporting(
+  context: LimitsWaitStatusContext,
   reason: RetryReason,
   deadline: number,
   model?: Pick<LimitsWaitModel, "provider" | "id">,
@@ -170,7 +199,9 @@ function startLivelinessReporting(
 
   const report = () => {
     const remaining = Math.max(0, deadline - Date.now());
-    notifyLiveliness(livelinessText(reason, remaining, model, error));
+    const message = livelinessText(reason, remaining, model, error);
+    notifyLiveliness(message);
+    publishStatusJson(statusPayload(context, "wait", message, remaining));
   };
   report();
   const ticker = setInterval(() => {
@@ -253,10 +284,27 @@ export function waitForRetry(
   };
   emitWaitTelemetry(events, { ...common, phase: "start" } satisfies LimitsWaitWaitStartPayload);
 
+  // Resolved once per wait so a /reload picks up a new value.
+  const controlFile = controlFilePath();
+  const statusContext: LimitsWaitStatusContext = {
+    waitId,
+    ...(telemetry?.periodId ? { periodId: telemetry.periodId } : {}),
+    reason,
+    error: telemetry?.error ? formatErrorDetail(telemetry.error) : null,
+    ...(model ? { model } : {}),
+    plannedDurationMs: waitMs,
+    plannedDeadline,
+    startedAt,
+    attempt: telemetry?.attempt ?? null,
+    maxAttempts: telemetry?.maxAttempts ?? null,
+    livelinessIntervalMs: livelinessIntervalMs(),
+    controlFile: controlFile ?? null,
+  };
+
   return new Promise((resolve) => {
     const ctx = state.sharedCtx;
     let done = false;
-    const stopLiveliness = startLivelinessReporting(reason, plannedDeadline, model, telemetry?.error);
+    const stopLiveliness = startLivelinessReporting(statusContext, reason, plannedDeadline, model, telemetry?.error);
     let unsubInput: (() => void) | undefined;
     let ticker: ReturnType<typeof setInterval> | undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -273,12 +321,38 @@ export function waitForRetry(
       try { clearAmbientRetryStatus(); } catch { /* UI unavailable */ }
     }
 
+    /**
+     * Out-of-band "retry now": polled from the existing 1 s ticker, so there is
+     * no new timer, no new teardown path, and no cost outside a wait. Mapped
+     * onto the same settle("skipped") path the Enter key uses.
+     */
+    async function pollControlFile(): Promise<void> {
+      if (!controlFile || done) return;
+      let raw: string;
+      try { raw = await readFile(controlFile, "utf8"); } catch { return; }
+      if (done) return;
+      let token: unknown;
+      try { token = JSON.parse(raw); } catch { return; }
+      if (!isSkipToken(token, waitId, startedAt)) return;
+      void unlink(controlFile).catch(() => undefined);
+      settle("skipped");
+    }
+
     function settle(outcome: LimitsWaitWaitOutcome) {
       if (done) return;
       done = true;
-      cleanup();
       const endedAt = Date.now();
       const actualElapsedMs = Math.max(0, endedAt - startedAt);
+      // Published before cleanup so the consumer learns the outcome first and
+      // the cleared key stays the end-of-window marker.
+      publishStatusJson(statusPayload(
+        statusContext,
+        "wait_end",
+        livelinessText(reason, Math.max(0, plannedDeadline - endedAt), model, telemetry?.error),
+        0,
+        { outcome, actualElapsedMs },
+      ));
+      cleanup();
       try { telemetry?.onEnd?.(actualElapsedMs, outcome); } catch { /* observational callback */ }
       emitWaitTelemetry(events, {
         ...common,
@@ -326,6 +400,7 @@ export function waitForRetry(
     tick();
     if (done) return;
     ticker = setInterval(() => {
+      void pollControlFile();
       if (Date.now() >= plannedDeadline) settle("waited");
       else tick();
     }, 1_000);

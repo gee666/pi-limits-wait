@@ -55,6 +55,89 @@ Liveliness messages include the retry reason, the model, the remaining wait, and
 
 Interactive (TUI) behavior is unchanged: retry notices remain `warning`-level chat notifications with the live countdown, and no duplicate error notification is added because the terminal error event is already rendered in the transcript.
 
+### Structured status channel
+
+Since 0.5.7 the extension publishes a **second, machine-readable** `setStatus` entry beside the prose one, under its own key:
+
+```
+{"type":"extension_ui_request","id":"<uuid>","method":"setStatus",
+ "statusKey":"oira666.pi-limits-wait.json","statusText":"<minified JSON>"}
+```
+
+The prose key `oira666.pi-limits-wait` is **unchanged** in text, key, cadence and clearing semantics, so a host that only knows 0.5.6 is unaffected. The JSON key is published on exactly the same schedule as the prose notice (immediately when a wait starts, then every `PI_LIMITS_WAIT_LIVELINESS_INTERVAL` seconds while waiting) and only in non-interactive (`rpc`/`json`) hosts. A blank/absent `statusText` under this key is the end-of-window marker.
+
+`statusText` is one minified JSON line:
+
+```json
+{"v":1,"ext":"0.5.7","event":"wait","waitId":"wait-mfk3z1-7","periodId":"period-3","reason":"rate-limit","message":"⏳ pi-limits-wait: rate limited on anthropic/claude-sonnet-4-5; still alive, waiting 12m 04s before the next retry. Why: HTTP 429 retry-after-ms 724000","error":"HTTP 429 retry-after-ms 724000","model":{"provider":"anthropic","id":"claude-sonnet-4-5"},"plannedDurationMs":1800000,"plannedDeadline":1786000000000,"startedAt":1785998200000,"remainingMs":724000,"attempt":null,"maxAttempts":null,"livelinessIntervalMs":15000,"controlFile":"/tmp/ram-pi-.../limits-wait.control"}
+```
+
+End of a wait (published once, immediately before both keys are cleared):
+
+```json
+{"v":1,"ext":"0.5.7","event":"wait_end","waitId":"wait-mfk3z1-7","reason":"rate-limit","message":"…","error":"…","plannedDurationMs":1800000,"plannedDeadline":1786000000000,"startedAt":1785998200000,"remainingMs":0,"attempt":null,"maxAttempts":null,"livelinessIntervalMs":15000,"controlFile":"…","outcome":"skipped","actualElapsedMs":41233}
+```
+
+Terminal give-up (the extension has stopped retrying and surfaces the final error):
+
+```json
+{"v":1,"ext":"0.5.7","event":"give_up","waitId":null,"reason":null,"message":"anthropic/claude-sonnet-4-5 failed and pi-limits-wait is not retrying: …","error":"…","plannedDurationMs":null,"plannedDeadline":null,"startedAt":null,"remainingMs":null,"attempt":null,"maxAttempts":null,"livelinessIntervalMs":15000,"controlFile":"…"}
+```
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `v` | `1` | Payload schema version. Bumped only on a breaking change. |
+| `ext` | string | Extension version that produced the frame, e.g. `"0.5.7"`. |
+| `event` | `"wait"` \| `"wait_end"` \| `"give_up"` | Liveliness tick, end of a wait, or terminal give-up. |
+| `waitId` | string \| null | Correlates every frame of one wait. `null` only for `give_up`. |
+| `periodId` | string (optional) | Retry-period id, when the wait belongs to one. |
+| `reason` | `"rate-limit"` \| `"overloaded"` \| `"authentication"` \| `"model-frozen"` \| `"network"` \| `"retry"` \| null | `null` only for `give_up`. |
+| `message` | string | The same human text published on the prose channel (≤500 chars, single line). |
+| `error` | string \| null | Normalised originating provider error (≤500 chars). |
+| `model` | `{provider,id}` (optional) | Model the wait applies to, when known. |
+| `plannedDurationMs` | number \| null | Planned wait length. |
+| `plannedDeadline` | number \| null | Epoch ms when the retry is planned. |
+| `startedAt` | number \| null | Epoch ms when the wait began. |
+| `remainingMs` | number \| null | `max(0, plannedDeadline - now)` at publish time; `0` on `wait_end`. |
+| `attempt` | number \| null | 1-based extension-created attempt. Only the unknown-error path counts attempts; classified waits send `null`. |
+| `maxAttempts` | number \| null | `PI_LIMITS_WAIT_MAX_RETRY + 1`, or `null` when not applicable. |
+| `livelinessIntervalMs` | number | Publishing interval, so a consumer can compute staleness itself. |
+| `controlFile` | string \| null | The path this process polls for skip tokens, or `null` when disabled. |
+| `outcome` | `"waited"` \| `"skipped"` \| `"aborted"` (optional) | `wait_end` only. |
+| `actualElapsedMs` | number (optional) | `wait_end` only. |
+
+Set `PI_LIMITS_WAIT_STATUS_JSON=false` to suppress this channel entirely and restore exact 0.5.6 wire behavior. `PI_LIMITS_WAIT_DISABLE_ALL_WAITING=true` also suppresses it (nothing is published and no control file is polled).
+
+The payload type is exported for TypeScript hosts:
+
+```ts
+import {
+  LIVELINESS_JSON_STATUS_KEY,
+  type LimitsWaitStatusPayload,
+} from "oira666_pi-limits-wait";
+```
+
+### Skipping a wait from the host
+
+In `rpc`/`json` mode there is no terminal, so the interactive "press Enter to retry now" affordance is unavailable. Instead, set `PI_LIMITS_WAIT_CONTROL_FILE` to an absolute path (one per pi process; the extension echoes it back as `controlFile` in every structured frame). While — and only while — a wait is in progress, the extension polls that path once per second from the countdown ticker it already runs. Signals are deliberately **not** used: `SIGUSR2` with no handler installed terminates the process, and a signal cannot carry a `waitId`.
+
+Write a token to make the extension stop waiting and retry immediately:
+
+```json
+{"action":"skip","waitId":"wait-mfk3z1-7","issuedAt":1785998240123,"by":"ramcore"}
+```
+
+- `action` must be `"skip"`; anything else is ignored.
+- `waitId` must equal the current wait's `waitId` (from the structured frame), or the wildcard `"*"` for "skip whichever wait is current".
+- `issuedAt` is epoch ms and must be `>= startedAt` of the current wait.
+- Writers should write a temp file and rename it into place (atomic move) so a partial read is impossible.
+
+An accepted token is consumed: the file is unlinked and the wait settles with `outcome: "skipped"` — the exact same path the Enter key uses, so the retry proceeds normally and a `wait_end` frame with `"outcome":"skipped"` is published.
+
+Three independent guards ensure a leftover token can never skip a **later** legitimate wait: (a) `waitId` equality — a token written for wait *N* cannot match wait *N+1*'s freshly generated id; (b) `issuedAt >= startedAt` — a `"*"` token issued before this wait began is ignored; (c) the file is unlinked when consumed. The extension deliberately does not unlink at wait start, because that would race with a token written microseconds earlier.
+
+A missing, unreadable, malformed or non-matching file is silently ignored. If `PI_LIMITS_WAIT_CONTROL_FILE` is unset (or all waiting is disabled), no filesystem access happens at all.
+
 ## Wait event contract
 
 Every positive extension-managed wait emits public telemetry on Pi's shared event bus. Import the channel constant and payload union from the package entry point:
@@ -163,7 +246,9 @@ The extension rereads these files before every LLM call, so changes made during 
 | `PI_LIMITS_WAIT_DISABLE_ALL_WAITING` | `false` | Master kill switch for this extension's error handling, retries, fallbacks, freezing, waiting, notifications, telemetry, and retry summaries. Set to `true` (also accepts `1`, `yes`, `on`) to leave only Anthropic OAuth system-prompt cleaning enabled; requests continue through Pi's normal runtime, including its normal Anthropic headers. This takes precedence over every setting below. |
 | `PI_LIMITS_WAIT_DEFAULT_WAITING` | `true` | Whether unclassified/unknown provider errors enter the wait-and-retry cycle. Set to `false` (also accepts `0`, `no`, `off`) to surface the error immediately. Rate-limit, overload, authentication, and network retry behavior is unchanged. |
 | `PI_LIMITS_WAIT_MAX_RETRY` | `999999` | Maximum extension-created retries for an unclassified/unknown provider error. The initial failed request and provider-internal retries do not count. HTTP 400/403 remain eligible. Must be a non-negative integer. |
-| `PI_LIMITS_WAIT_LIVELINESS_INTERVAL` | `15` | Seconds between liveliness notifications published while waiting in non-interactive (`rpc`/`json`) modes. Must be a non-negative integer; values below 1 second are clamped to 1 second. Ignored in TUI mode. |
+| `PI_LIMITS_WAIT_LIVELINESS_INTERVAL` | `15` | Seconds between liveliness notifications published while waiting in non-interactive (`rpc`/`json`) modes. Must be a non-negative integer; values below 1 second are clamped to 1 second. Ignored in TUI mode. Also drives the structured status channel and is reported inside it as `livelinessIntervalMs`. |
+| `PI_LIMITS_WAIT_STATUS_JSON` | `true` | Whether the machine-readable status channel (`statusKey` `oira666.pi-limits-wait.json`) is published in non-interactive modes. Set to `false` (also accepts `0`, `no`, `off`) to restore exact 0.5.6 wire behavior. The prose channel is never affected. |
+| `PI_LIMITS_WAIT_CONTROL_FILE` | *(unset)* | Absolute path of the out-of-band control file polled once per second **while waiting**, used by the host to skip the current wait and retry immediately. Unset disables the feature and all filesystem access. See [Skipping a wait from the host](#skipping-a-wait-from-the-host). |
 | `PI_LIMITS_WAIT_RETRY_INTERVAL` | `5` | Seconds to wait between unclassified/unknown provider-error retries. Must be a non-negative integer (values above 2147483 are capped to Node's maximum reliable timer delay). This does not affect model-limit wait intervals. |
 | `PI_LIMITS_WAIT_FREEZING_ENABLED` | `true` | When a model keeps failing with a non-retryable error, it is normally "frozen" for 10 minutes and skipped in favour of other configured models. Set this to `false` (also accepts `0`, `no`, `off`) to disable freezing entirely: the extension will instead try each configured candidate once (after the bounded retries) and then surface the error, never blocking on a long "model-frozen" wait. Useful for non-interactive / subagent runs where no one can press Enter to skip. |
 

@@ -31,6 +31,26 @@ export {
 export {
   LIMITS_WAIT_EVENT_CHANNEL,
 } from "./telemetry.js";
+export {
+  CONTROL_FILE_ENV_VAR,
+  EXTENSION_VERSION,
+  LIVELINESS_JSON_STATUS_KEY,
+  LIVELINESS_JSON_VERSION,
+  LIVELINESS_STATUS_KEY,
+  STATUS_JSON_ENV_VAR,
+} from "./constants.js";
+export {
+  clearStatusJson,
+  controlFilePath,
+  publishStatusJson,
+  statusJsonEnabled,
+  statusPayload,
+} from "./status-json.js";
+export type {
+  LimitsWaitStatusContext,
+  LimitsWaitStatusEvent,
+  LimitsWaitStatusPayload,
+} from "./status-json.js";
 export type {
   LimitsWaitEndEventPayload,
   LimitsWaitEventPayload,
