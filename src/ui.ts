@@ -347,9 +347,12 @@ export function waitForRetry(
 
     const onAbort = () => settle("aborted");
 
+    const skipWait = () => settle("skipped");
+
     function cleanup() {
       if (ticker) clearInterval(ticker);
       if (timer) clearTimeout(timer);
+      state.activeWaitSkips.delete(skipWait);
       try { stopLiveliness(false); } catch { /* UI unavailable */ }
       signal?.removeEventListener("abort", onAbort);
       try { unsubInput?.(); } catch { /* UI unavailable */ }
@@ -434,10 +437,18 @@ export function waitForRetry(
       return;
     }
 
+    state.activeWaitSkips.add(skipWait);
+
     try {
       const unsubscribe = ctx?.ui.onTerminalInput((data) => {
         if (done) return undefined;
         if (data === "\r" || data === "\n") {
+          // Enter belongs to the editor whenever it contains text. In
+          // particular, slash-command autocomplete needs Enter to confirm and
+          // then execute a command; do not steal either press from it.
+          let editorText = "";
+          try { editorText = ctx?.ui.getEditorText() ?? ""; } catch { /* UI unavailable */ }
+          if (editorText.length > 0) return undefined;
           settle("skipped");
           return { consume: true };
         }

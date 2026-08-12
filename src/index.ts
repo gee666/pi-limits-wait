@@ -103,11 +103,16 @@ export default function (pi: ExtensionAPI) {
   const retrySummaries = new RetrySummaryCoordinator(pi);
   const releaseInterception = installModelRuntimeInterception(() => retrySummaries.createStream());
 
-  pi.on("model_select", (event) => {
+  pi.on("model_select", (event, ctx) => {
+    state.sharedCtx = ctx;
     if (consumeExpectedModelSelection(event.model)) return;
     if (isInternalSyntheticModel(event.model)) return;
     state.primaryModel = event.model;
     state.primaryThinkingLevel = pi.getThinkingLevel();
+    state.userModelSelectionGeneration++;
+    // A user-selected model takes precedence over a pending retry. Wake every
+    // wait so its stream can adopt the new primary model immediately.
+    for (const skip of [...state.activeWaitSkips]) skip();
   });
 
   pi.on("before_agent_start", (_event, ctx) => {
@@ -140,6 +145,7 @@ export default function (pi: ExtensionAPI) {
     state.ambientStatusCleanup?.();
     state.modelStatusCleanup?.();
     state.expectedModelSelections.clear();
+    state.activeWaitSkips.clear();
     state.sharedCtx = undefined;
     state.extensionApi = undefined;
   });

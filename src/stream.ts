@@ -198,6 +198,7 @@ export function streamWithLimitsRetry(
       : { model, reasoningEffort: state.primaryThinkingLevel };
     const nonRetryableAttempts = new Map<string, number>();
     const triedModels = new Set<string>();
+    let observedUserModelSelection = state.userModelSelectionGeneration;
 
     const prepareAttemptForPi = async (): Promise<boolean> => {
       const originalKey = modelKey(model);
@@ -219,8 +220,11 @@ export function streamWithLimitsRetry(
       waitMs: number,
       error: string,
       counters?: { attempt: number; maxAttempts: number },
-    ) =>
-      waitForRetry(reason, waitMs, signal, {
+    ) => {
+      // The selection may have happened after this attempt started but before
+      // its failure reached us, when there was no active wait to wake.
+      if (observedUserModelSelection !== state.userModelSelectionGeneration) return "skipped" as const;
+      return waitForRetry(reason, waitMs, signal, {
         periodId: retryPeriod?.periodId,
         model: attempt.model,
         error,
@@ -228,6 +232,7 @@ export function streamWithLimitsRetry(
         ...(counters ?? {}),
         onEnd: (elapsedMs) => retryPeriod?.recordWait(elapsedMs),
       });
+    };
 
     const flush = (buffer: AssistantMessageEvent[]) => {
       for (const event of buffer) output.push(event);
@@ -250,6 +255,17 @@ export function streamWithLimitsRetry(
     };
 
     while (true) {
+      if (observedUserModelSelection !== state.userModelSelectionGeneration) {
+        observedUserModelSelection = state.userModelSelectionGeneration;
+        const selected = state.primaryModel ?? state.sharedCtx?.model;
+        if (selected) {
+          // User model selection always supersedes the retry/fallback attempt
+          // chosen before the wait. Subsequent retries start from that model.
+          attempt = configuredAttempt(selected);
+          triedModels.clear();
+        }
+      }
+
       if (signal?.aborted) {
         pushAbort("Operation aborted before provider attempt.");
         return;

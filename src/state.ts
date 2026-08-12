@@ -16,6 +16,8 @@ export const state = {
   primaryModel: undefined as Model<Api> | undefined,
   primaryThinkingLevel: undefined as ModelThinkingLevel | undefined,
   expectedModelSelections: new Map<string, Set<symbol>>(),
+  userModelSelectionGeneration: 0,
+  activeWaitSkips: new Set<() => void>(),
   settingsSignature: undefined as string | undefined,
   rateLimitMemory: new Map<string, RateLimitMemory>(),
   nonRetryableFailureMemory: new Map<string, NonRetryableFailureMemory>(),
@@ -56,6 +58,8 @@ export function resetRuntimeStateForTests(models: FallbackModel[], ctx?: Extensi
   state.rateLimitMemory.clear();
   state.nonRetryableFailureMemory.clear();
   state.expectedModelSelections.clear();
+  state.userModelSelectionGeneration = 0;
+  state.activeWaitSkips.clear();
   state.ambientStatusCleanup?.();
   state.modelStatusCleanup?.();
 }

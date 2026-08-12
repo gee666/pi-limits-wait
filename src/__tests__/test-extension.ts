@@ -185,6 +185,29 @@ ok("preserves the unknown-error retry default", DEFAULT_UNKNOWN_ERROR_MAX_RETRIE
   ok("pre-aborted wait resolves immediately", await waitForRateLimit(60_000, controller.signal) === "aborted");
 }
 {
+  const previousCtx = state.sharedCtx;
+  let editorText = "/model";
+  let enterResult: unknown;
+  state.sharedCtx = {
+    mode: "tui",
+    ui: {
+      getEditorText: () => editorText,
+      onTerminalInput: (handler: (data: string) => unknown) => {
+        enterResult = handler("\r");
+        return () => undefined;
+      },
+      setWorkingMessage: () => undefined,
+    },
+  } as unknown as ExtensionContext;
+  const commandWait = await waitForRateLimit(5);
+  ok("Enter is left to slash-command autocomplete while the editor has text", commandWait === "waited" && enterResult === undefined);
+
+  editorText = "";
+  const retryWait = await waitForRateLimit(1_000);
+  ok("Enter still retries immediately when the editor is empty", retryWait === "skipped" && (enterResult as { consume?: boolean })?.consume === true);
+  state.sharedCtx = previousCtx;
+}
+{
   const previousApi = state.extensionApi;
   const previousCtx = state.sharedCtx;
   const telemetry: Array<{ channel: string; payload: Record<string, unknown> }> = [];
@@ -1247,6 +1270,50 @@ section("real ModelRuntime fallback and option isolation");
   ok("same-provider fallback isolates source credentials and provider options", !fallbackOptions?.headers?.authorization && !("SAME_SOURCE_SECRET" in (fallbackOptions?.env ?? {})) && !fallbackOptions?.headers?.["x-source-only"] && !fallbackOptions?.headers?.["x-source-transform"] && fallbackOptions?.sourceProviderOption === undefined);
   release();
   __configureFallbackModelsForTests([]);
+}
+
+section("user model changes during retry");
+{
+  const oldModel = { provider: "selection-change", id: "old", api: "openai-completions" } as Model<Api>;
+  const newModel = { provider: "selection-change", id: "new", api: "openai-completions" } as Model<Api>;
+  const calls: string[] = [];
+  const previousCtx = state.sharedCtx;
+  const previousPrimary = state.primaryModel;
+  const previousGeneration = state.userModelSelectionGeneration;
+  const mutableCtx = {
+    model: oldModel,
+    ui: {
+      notify: () => undefined,
+      setWorkingMessage: () => undefined,
+      getEditorText: () => "",
+      onTerminalInput: () => () => undefined,
+    },
+  } as unknown as ExtensionContext;
+  state.sharedCtx = mutableCtx;
+  state.primaryModel = oldModel;
+  state.userModelSelectionGeneration = 0;
+
+  const delegate = ((model: Model<Api>) => {
+    calls.push(model.id);
+    if (model.id === oldModel.id) {
+      setTimeout(() => {
+        (mutableCtx as unknown as { model: Model<Api> }).model = newModel;
+        state.primaryModel = newModel;
+        state.userModelSelectionGeneration++;
+        for (const skip of [...state.activeWaitSkips]) skip();
+      }, 5);
+      return streamFrom([startEvent(model), errorEvent(model, "HTTP 429 retry-after 60")]);
+    }
+    return streamFrom([startEvent(model), doneEvent(model)]);
+  }) as Parameters<typeof streamWithLimitsRetry>[1];
+
+  const events = await collect(streamWithLimitsRetry({} as ModelRuntime, delegate, oldModel, context));
+  ok("a model change wakes the wait and retries with the newly selected model", calls.join(",") === "old,new" && events.at(-1)?.type === "done", `calls=${calls.join(",")}`);
+
+  state.sharedCtx = previousCtx;
+  state.primaryModel = previousPrimary;
+  state.userModelSelectionGeneration = previousGeneration;
+  state.activeWaitSkips.clear();
 }
 
 section("concurrent model selection tracking");
