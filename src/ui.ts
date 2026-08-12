@@ -1,4 +1,5 @@
-import { readFile, unlink } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { readFile, rename, unlink } from "node:fs/promises";
 import {
   DEFAULT_LIVELINESS_INTERVAL_MS,
   DEFAULT_UNKNOWN_ERROR_MAX_RETRIES,
@@ -194,7 +195,7 @@ function startLivelinessReporting(
   deadline: number,
   model?: Pick<LimitsWaitModel, "provider" | "id">,
   error?: string,
-): () => void {
+): (clearStatus?: boolean) => void {
   if (!isNonInteractiveHost()) return () => undefined;
 
   const report = () => {
@@ -208,9 +209,9 @@ function startLivelinessReporting(
     if (Date.now() >= deadline) return;
     report();
   }, livelinessIntervalMs());
-  return () => {
+  return (clearStatus = true) => {
     clearInterval(ticker);
-    clearLivelinessStatus();
+    if (clearStatus) clearLivelinessStatus();
   };
 }
 
@@ -256,6 +257,41 @@ export function clearAmbientRetryStatus(): void {
 
 export function clearModelStatus(): void {
   state.modelStatusCleanup?.();
+}
+
+/**
+ * Atomically claim the canonical control path before inspecting its contents.
+ * The writer may immediately replace the canonical path; cleanup only ever
+ * touches the unique claimed path in the same directory.
+ */
+export async function claimControlFile(controlFile: string, waitId: string): Promise<string | undefined> {
+  const claimedFile = `${controlFile}.consumed-${waitId}-${randomUUID()}`;
+  try {
+    await rename(controlFile, claimedFile);
+    return claimedFile;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return undefined;
+    return undefined;
+  }
+}
+
+/** Coalesce timer ticks while an asynchronous filesystem poll is still running. */
+export function createSerializedAsyncRunner<T>(task: () => Promise<T>): {
+  run: () => Promise<T>;
+  pending: () => Promise<T> | undefined;
+} {
+  let inFlight: Promise<T> | undefined;
+  return {
+    run: () => {
+      if (inFlight) return inFlight;
+      const current = task().finally(() => {
+        if (inFlight === current) inFlight = undefined;
+      });
+      inFlight = current;
+      return current;
+    },
+    pending: () => inFlight,
+  };
 }
 
 export function waitForRetry(
@@ -314,7 +350,7 @@ export function waitForRetry(
     function cleanup() {
       if (ticker) clearInterval(ticker);
       if (timer) clearTimeout(timer);
-      try { stopLiveliness(); } catch { /* UI unavailable */ }
+      try { stopLiveliness(false); } catch { /* UI unavailable */ }
       signal?.removeEventListener("abort", onAbort);
       try { unsubInput?.(); } catch { /* UI unavailable */ }
       try { ctx?.ui.setWorkingMessage(); } catch { /* UI unavailable */ }
@@ -322,46 +358,75 @@ export function waitForRetry(
     }
 
     /**
-     * Out-of-band "retry now": polled from the existing 1 s ticker, so there is
-     * no new timer, no new teardown path, and no cost outside a wait. Mapped
-     * onto the same settle("skipped") path the Enter key uses.
+     * Out-of-band "retry now": atomically move the observed canonical path to
+     * a unique consumed path before reading it. Invalid claims are discarded;
+     * cleanup can therefore never unlink a newer token renamed into place.
      */
-    async function pollControlFile(): Promise<void> {
-      if (!controlFile || done) return;
-      let raw: string;
-      try { raw = await readFile(controlFile, "utf8"); } catch { return; }
-      if (done) return;
-      let token: unknown;
-      try { token = JSON.parse(raw); } catch { return; }
-      if (!isSkipToken(token, waitId, startedAt)) return;
-      void unlink(controlFile).catch(() => undefined);
-      settle("skipped");
-    }
+    let pendingClaim: Promise<void> | undefined;
+    async function pollControlFile(): Promise<boolean> {
+      if (!controlFile || done) return false;
+      let finishClaim!: () => void;
+      const claimBarrier = new Promise<void>((resolveClaim) => { finishClaim = resolveClaim; });
+      pendingClaim = claimBarrier;
+      const claimedFile = await claimControlFile(controlFile, waitId).finally(() => {
+        finishClaim();
+        if (pendingClaim === claimBarrier) pendingClaim = undefined;
+      });
+      if (!claimedFile) return false;
 
-    function settle(outcome: LimitsWaitWaitOutcome) {
+      let accepted = false;
+      try {
+        const raw = await readFile(claimedFile, "utf8");
+        const token: unknown = JSON.parse(raw);
+        accepted = isSkipToken(token, waitId, startedAt);
+      } catch { /* unreadable and malformed claims are discarded */ }
+
+      await unlink(claimedFile).catch(() => undefined);
+      return accepted;
+    }
+    const controlPoll = createSerializedAsyncRunner(pollControlFile);
+
+    function settle(requestedOutcome: LimitsWaitWaitOutcome) {
       if (done) return;
       done = true;
-      const endedAt = Date.now();
-      const actualElapsedMs = Math.max(0, endedAt - startedAt);
-      // Published before cleanup so the consumer learns the outcome first and
-      // the cleared key stays the end-of-window marker.
-      publishStatusJson(statusPayload(
-        statusContext,
-        "wait_end",
-        livelinessText(reason, Math.max(0, plannedDeadline - endedAt), model, telemetry?.error),
-        0,
-        { outcome, actualElapsedMs },
-      ));
+      const pendingPoll = controlPoll.pending();
+      const claimBarrier = pendingClaim;
       cleanup();
-      try { telemetry?.onEnd?.(actualElapsedMs, outcome); } catch { /* observational callback */ }
-      emitWaitTelemetry(events, {
-        ...common,
-        phase: "end",
-        endedAt,
-        actualElapsedMs,
-        outcome,
-      } satisfies LimitsWaitWaitEndPayload);
-      resolve(outcome);
+
+      void (async () => {
+        // Do not let wait N resolve (and wait N+1 begin) while N can still
+        // rename the canonical path. A token claimed at the deadline wins over
+        // the timer. Explicit skip/abort only drain the bounded claim phase;
+        // later reads and unique-path cleanup cannot affect a replacement.
+        let acceptedAtSettlement = false;
+        if (requestedOutcome === "waited") {
+          acceptedAtSettlement = await pendingPoll?.catch(() => false) ?? false;
+        } else {
+          await claimBarrier?.catch(() => undefined);
+        }
+        const outcome = acceptedAtSettlement ? "skipped" : requestedOutcome;
+        const endedAt = Date.now();
+        const actualElapsedMs = Math.max(0, endedAt - startedAt);
+        // Published before status cleanup so the consumer learns the outcome
+        // first and the cleared key stays the end-of-window marker.
+        publishStatusJson(statusPayload(
+          statusContext,
+          "wait_end",
+          livelinessText(reason, Math.max(0, plannedDeadline - endedAt), model, telemetry?.error),
+          0,
+          { outcome, actualElapsedMs },
+        ));
+        try { stopLiveliness(); } catch { /* UI unavailable */ }
+        try { telemetry?.onEnd?.(actualElapsedMs, outcome); } catch { /* observational callback */ }
+        emitWaitTelemetry(events, {
+          ...common,
+          phase: "end",
+          endedAt,
+          actualElapsedMs,
+          outcome,
+        } satisfies LimitsWaitWaitEndPayload);
+        resolve(outcome);
+      })();
     }
 
     if (signal?.aborted) {
@@ -400,7 +465,10 @@ export function waitForRetry(
     tick();
     if (done) return;
     ticker = setInterval(() => {
-      void pollControlFile();
+      const poll = controlPoll.run();
+      void poll.then((accepted) => {
+        if (accepted && !done) settle("skipped");
+      });
       if (Date.now() >= plannedDeadline) settle("waited");
       else tick();
     }, 1_000);

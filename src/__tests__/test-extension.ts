@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -48,6 +48,7 @@ import { isSkipToken } from "../status-json.js";
 import { withAttemptResponseObserver } from "../response-observer.js";
 import { loadFallbackSettings } from "../settings.js";
 import { consumeExpectedModelSelection, expectModelSelection, state } from "../state.js";
+import { claimControlFile, createSerializedAsyncRunner } from "../ui.js";
 
 let passed = 0;
 let failed = 0;
@@ -1492,6 +1493,42 @@ section("structured status channel and out-of-band skip");
     {
       const entries: StatusEntry[] = [];
       state.sharedCtx = makeCtx(entries, []);
+      publishStatusJson(statusPayload(sampleContext, "wait", "message", 1));
+      process.env.PI_LIMITS_WAIT_STATUS_JSON = "false";
+      clearStatusJson();
+      clearStatusJson();
+      delete process.env.PI_LIMITS_WAIT_STATUS_JSON;
+      ok(
+        "an active structured status clears exactly once after its enable flag changes",
+        entries.length === 2 && entries[0]!.text !== undefined && entries[1]!.text === undefined,
+      );
+    }
+
+    {
+      const entries: StatusEntry[] = [];
+      let clearAttempts = 0;
+      state.sharedCtx = {
+        ...makeCtx(entries, []),
+        ui: {
+          ...makeCtx([], []).ui,
+          setStatus: (key: string, text: string | undefined) => {
+            if (text === undefined && clearAttempts++ === 0) throw new Error("temporarily unavailable");
+            entries.push({ key, text });
+          },
+        },
+      } as ExtensionContext;
+      publishStatusJson(statusPayload(sampleContext, "wait", "message", 1));
+      clearStatusJson();
+      clearStatusJson();
+      ok(
+        "a failed structured-status clear retains ownership and retries",
+        clearAttempts === 2 && entries.length === 2 && entries[1]!.text === undefined,
+      );
+    }
+
+    {
+      const entries: StatusEntry[] = [];
+      state.sharedCtx = makeCtx(entries, []);
       process.env.PI_LIMITS_WAIT_STATUS_JSON = "false";
       publishStatusJson(statusPayload(sampleContext, "wait", "message", 1));
       clearStatusJson();
@@ -1582,6 +1619,40 @@ section("structured status channel and out-of-band skip");
     }
 
     {
+      const controlFile = join(root, "claim-race.control");
+      const consumedToken = JSON.stringify({ action: "skip", waitId: "wait-claim-race", issuedAt: Date.now() });
+      const replacementToken = JSON.stringify({ action: "skip", waitId: "wait-newer", issuedAt: Date.now() + 1 });
+      writeFileSync(controlFile, consumedToken);
+      const claimedFile = await claimControlFile(controlFile, "wait-claim-race");
+      if (claimedFile) {
+        // Simulate the writer's atomic rename immediately after the extension's claim.
+        writeFileSync(controlFile, replacementToken);
+        rmSync(claimedFile, { force: true });
+      }
+      ok(
+        "claimed-token cleanup cannot unlink an immediate canonical-path replacement",
+        Boolean(claimedFile) && !existsSync(claimedFile!) && readFileSync(controlFile, "utf8") === replacementToken,
+      );
+      rmSync(controlFile, { force: true });
+
+      let calls = 0;
+      let releaseFirst!: () => void;
+      const firstPoll = new Promise<void>((resolve) => { releaseFirst = resolve; });
+      const pollRunner = createSerializedAsyncRunner(async () => {
+        calls++;
+        if (calls === 1) await firstPoll;
+      });
+      const slowPoll = pollRunner.run();
+      const overlappingTick = pollRunner.run();
+      const coalesced = calls === 1 && slowPoll === overlappingTick && pollRunner.pending() === slowPoll;
+      releaseFirst();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      pollRunner.run();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      ok("a slow control-file poll cannot overlap the next ticker poll", coalesced && calls === 2, `calls=${calls}`);
+    }
+
+    {
       const controlFile = join(root, "limits-wait.control");
       process.env.PI_LIMITS_WAIT_CONTROL_FILE = controlFile;
       const entries: StatusEntry[] = [];
@@ -1616,22 +1687,22 @@ section("structured status channel and out-of-band skip");
       writeFileSync(controlFile, JSON.stringify({ action: "skip", waitId: "wait-from-an-earlier-wait", issuedAt: Date.now(), by: "ramcore" }));
       const outcome = await waitForRetry("rate-limit", 2_400);
       ok(
-        "a token left over from an earlier wait never skips a later wait",
-        outcome === "waited" && existsSync(controlFile),
+        "a token left over from an earlier wait is discarded without skipping a later wait",
+        outcome === "waited" && !existsSync(controlFile),
         `outcome=${outcome}`,
       );
 
       writeFileSync(controlFile, JSON.stringify({ action: "skip", waitId: "*", issuedAt: Date.now() - 60_000, by: "ramcore" }));
       const staleWildcard = await waitForRetry("rate-limit", 2_400);
       ok(
-        "a wildcard token issued before this wait started is ignored",
-        staleWildcard === "waited" && existsSync(controlFile),
+        "a wildcard token issued before this wait started is discarded without skipping",
+        staleWildcard === "waited" && !existsSync(controlFile),
         `outcome=${staleWildcard}`,
       );
 
       writeFileSync(controlFile, "not json at all");
       const malformed = await waitForRetry("rate-limit", 1_400);
-      ok("a malformed control file is ignored", malformed === "waited" && existsSync(controlFile));
+      ok("a malformed control file is discarded without skipping", malformed === "waited" && !existsSync(controlFile));
 
       rmSync(controlFile, { force: true });
       const missing = await waitForRetry("rate-limit", 1_400);

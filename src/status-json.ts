@@ -87,25 +87,35 @@ export function statusPayload(
   };
 }
 
+let statusJsonActive = false;
+
 /** No-op unless the host is non-interactive and the channel is enabled. */
 export function publishStatusJson(payload: LimitsWaitStatusPayload): void {
   const ctx = state.sharedCtx;
   if (!ctx || !isNonInteractiveHost() || !statusJsonEnabled()) return;
-  try { ctx.ui.setStatus(LIVELINESS_JSON_STATUS_KEY, JSON.stringify(payload)); } catch { /* UI unavailable */ }
+  try {
+    ctx.ui.setStatus(LIVELINESS_JSON_STATUS_KEY, JSON.stringify(payload));
+    statusJsonActive = true;
+  } catch { /* UI unavailable */ }
 }
 
-/** A blank status under the JSON key is the end-of-window marker. */
+/** Clear a status this instance published, even if its enable flags changed meanwhile. */
 export function clearStatusJson(): void {
+  if (!statusJsonActive) return;
   const ctx = state.sharedCtx;
-  if (!ctx || !isNonInteractiveHost() || !statusJsonEnabled()) return;
-  try { ctx.ui.setStatus(LIVELINESS_JSON_STATUS_KEY, undefined); } catch { /* UI unavailable */ }
+  if (!ctx) return;
+  try {
+    ctx.ui.setStatus(LIVELINESS_JSON_STATUS_KEY, undefined);
+    statusJsonActive = false;
+  } catch { /* retain ownership so a later cleanup can retry */ }
 }
 
 /**
  * Accept an out-of-band skip token only for the wait it was issued for.
- * Three independent guards keep a leftover token from skipping a later wait:
- * waitId equality (or the explicit "*" wildcard), issuedAt >= this wait's
- * startedAt, and unlinking the file when it is consumed.
+ * A claimed token is accepted only when waitId equality (or the explicit "*"
+ * wildcard) and issuedAt >= this wait's startedAt both hold. The caller
+ * discards every claimed file, valid or invalid, without touching a replacement
+ * at the canonical path.
  */
 export function isSkipToken(token: unknown, waitId: string, startedAt: number): boolean {
   if (!token || typeof token !== "object") return false;

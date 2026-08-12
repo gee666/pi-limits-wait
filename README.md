@@ -132,11 +132,11 @@ Write a token to make the extension stop waiting and retry immediately:
 - `issuedAt` is epoch ms and must be `>= startedAt` of the current wait.
 - Writers should write a temp file and rename it into place (atomic move) so a partial read is impossible.
 
-An accepted token is consumed: the file is unlinked and the wait settles with `outcome: "skipped"` — the exact same path the Enter key uses, so the retry proceeds normally and a `wait_end` frame with `"outcome":"skipped"` is published.
+The extension consumes a token by atomically renaming the canonical control path to a unique `.consumed-<waitId>-<random>` path in the same directory, then reading and validating that claimed file. It removes only the unique claimed path. A writer may therefore rename a newer token onto the canonical path immediately after the claim without cleanup deleting that replacement. An accepted claim settles the wait with `outcome: "skipped"` — the exact same path the Enter key uses, so the retry proceeds normally and a `wait_end` frame with `"outcome":"skipped"` is published. Polls are serialized; a slow filesystem operation cannot overlap the next one-second tick.
 
-Three independent guards ensure a leftover token can never skip a **later** legitimate wait: (a) `waitId` equality — a token written for wait *N* cannot match wait *N+1*'s freshly generated id; (b) `issuedAt >= startedAt` — a `"*"` token issued before this wait began is ignored; (c) the file is unlinked when consumed. The extension deliberately does not unlink at wait start, because that would race with a token written microseconds earlier.
+Two content guards ensure a claimed leftover token can never skip a **later** legitimate wait: (a) `waitId` equality — a token written for wait *N* cannot match wait *N+1*'s freshly generated id; (b) `issuedAt >= startedAt` — a `"*"` token issued before this wait began is rejected. Claimed malformed, stale, and non-matching files are discarded, while any newer token at the canonical path is left untouched. The extension deliberately does not unlink the canonical path at wait start, because that would race with a token written microseconds earlier.
 
-A missing, unreadable, malformed or non-matching file is silently ignored. If `PI_LIMITS_WAIT_CONTROL_FILE` is unset (or all waiting is disabled), no filesystem access happens at all.
+A missing or unclaimable control path is silently ignored. If `PI_LIMITS_WAIT_CONTROL_FILE` is unset (or all waiting is disabled), no filesystem access happens at all.
 
 ## Wait event contract
 
