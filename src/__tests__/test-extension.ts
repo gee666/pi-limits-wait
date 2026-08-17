@@ -186,25 +186,22 @@ ok("preserves the unknown-error retry default", DEFAULT_UNKNOWN_ERROR_MAX_RETRIE
 }
 {
   const previousCtx = state.sharedCtx;
-  let editorText = "/model";
-  let enterResult: unknown;
+  let subscribedToRawInput = false;
   state.sharedCtx = {
     mode: "tui",
     ui: {
-      getEditorText: () => editorText,
-      onTerminalInput: (handler: (data: string) => unknown) => {
-        enterResult = handler("\r");
+      onTerminalInput: () => {
+        subscribedToRawInput = true;
         return () => undefined;
       },
       setWorkingMessage: () => undefined,
     },
   } as unknown as ExtensionContext;
   const commandWait = await waitForRateLimit(5);
-  ok("Enter is left to slash-command autocomplete while the editor has text", commandWait === "waited" && enterResult === undefined);
-
-  editorText = "";
-  const retryWait = await waitForRateLimit(1_000);
-  ok("Enter still retries immediately when the editor is empty", retryWait === "skipped" && (enterResult as { consume?: boolean })?.consume === true);
+  ok(
+    "retry waits never intercept input needed by /model and other focused selectors",
+    commandWait === "waited" && !subscribedToRawInput,
+  );
   state.sharedCtx = previousCtx;
 }
 {
@@ -222,15 +219,11 @@ ok("preserves the unknown-error retry default", DEFAULT_UNKNOWN_ERROR_MAX_RETRIE
   await waitForRateLimit(0);
   const waited = await waitForRateLimit(5);
   state.sharedCtx = {
-    ui: {
-      onTerminalInput: (handler: (data: string) => unknown) => {
-        handler("\n");
-        return () => undefined;
-      },
-      setWorkingMessage: () => undefined,
-    },
+    ui: { setWorkingMessage: () => undefined },
   } as unknown as ExtensionContext;
-  const skipped = await waitForRateLimit(1_000);
+  const pendingSkip = waitForRateLimit(1_000);
+  for (const skip of [...state.activeWaitSkips]) skip();
+  const skipped = await pendingSkip;
   const abortedController = new AbortController();
   abortedController.abort();
   const aborted = await waitForRateLimit(1_000, abortedController.signal);

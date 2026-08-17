@@ -215,15 +215,12 @@ function startLivelinessReporting(
   };
 }
 
-function countdownText(reason: RetryReason, deadline: number, allowSkip: boolean): string {
+function countdownText(reason: RetryReason, deadline: number): string {
   const remaining = Math.max(0, deadline - Date.now());
   const totalSecs = Math.ceil(remaining / 1_000);
   const mins = Math.floor(totalSecs / 60);
   const secs = (totalSecs % 60).toString().padStart(2, "0");
-  return (
-    `⏳ ${reasonLabel(reason)} — next retry in ${mins}m ${secs}s` +
-    (allowSkip ? "  (Enter to retry now)" : "")
-  );
+  return `⏳ ${reasonLabel(reason)} — next retry in ${mins}m ${secs}s`;
 }
 
 export function showAmbientRetryStatus(reason: RetryReason, waitMs: number): void {
@@ -239,7 +236,7 @@ export function showAmbientRetryStatus(reason: RetryReason, waitMs: number): voi
       state.ambientStatusCleanup?.();
       return;
     }
-    ctx.ui.setWorkingMessage(countdownText(reason, deadline, false));
+    ctx.ui.setWorkingMessage(countdownText(reason, deadline));
   };
 
   tick();
@@ -341,7 +338,6 @@ export function waitForRetry(
     const ctx = state.sharedCtx;
     let done = false;
     const stopLiveliness = startLivelinessReporting(statusContext, reason, plannedDeadline, model, telemetry?.error);
-    let unsubInput: (() => void) | undefined;
     let ticker: ReturnType<typeof setInterval> | undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
 
@@ -355,7 +351,6 @@ export function waitForRetry(
       state.activeWaitSkips.delete(skipWait);
       try { stopLiveliness(false); } catch { /* UI unavailable */ }
       signal?.removeEventListener("abort", onAbort);
-      try { unsubInput?.(); } catch { /* UI unavailable */ }
       try { ctx?.ui.setWorkingMessage(); } catch { /* UI unavailable */ }
       try { clearAmbientRetryStatus(); } catch { /* UI unavailable */ }
     }
@@ -437,31 +432,11 @@ export function waitForRetry(
       return;
     }
 
+    // Raw terminal listeners run before whichever component currently owns
+    // focus. Consuming Enter here would steal confirmation from built-in
+    // selectors such as /model. Model changes and the out-of-band control
+    // channel call this skip function directly instead.
     state.activeWaitSkips.add(skipWait);
-
-    try {
-      const unsubscribe = ctx?.ui.onTerminalInput((data) => {
-        if (done) return undefined;
-        if (data === "\r" || data === "\n") {
-          // Enter belongs to the editor whenever it contains text. In
-          // particular, slash-command autocomplete needs Enter to confirm and
-          // then execute a command; do not steal either press from it.
-          let editorText = "";
-          try { editorText = ctx?.ui.getEditorText() ?? ""; } catch { /* UI unavailable */ }
-          if (editorText.length > 0) return undefined;
-          settle("skipped");
-          return { consume: true };
-        }
-        if (data === "\x1b") {
-          settle("aborted");
-          return { consume: true };
-        }
-        return undefined;
-      });
-      if (done) unsubscribe?.();
-      else unsubInput = unsubscribe;
-    } catch { /* UI unavailable */ }
-    if (done) return;
 
     signal?.addEventListener("abort", onAbort);
     if (signal?.aborted) {
@@ -470,7 +445,7 @@ export function waitForRetry(
     }
 
     const tick = () => {
-      try { ctx?.ui.setWorkingMessage(countdownText(reason, plannedDeadline, Boolean(unsubInput))); } catch { /* UI unavailable */ }
+      try { ctx?.ui.setWorkingMessage(countdownText(reason, plannedDeadline)); } catch { /* UI unavailable */ }
     };
 
     tick();
