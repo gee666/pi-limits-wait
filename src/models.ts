@@ -37,10 +37,16 @@ export function configuredAttempt(model: Model<Api>): FallbackModel {
     ?? { model, reasoningEffort: state.primaryThinkingLevel };
 }
 
+/**
+ * Listed models are authoritative, top to bottom. An explicitly selected
+ * model outside the list stays first; the configured list is used only if
+ * that selection fails. Unrelated calls are excluded by isFallbackEligibleModel.
+ */
 export function candidateOrder(current: Model<Api>): FallbackModel[] {
   const primary = getPrimaryModel(current);
-  const order: FallbackModel[] = [configuredAttempt(primary)];
-  const seen = new Set([modelKey(primary)]);
+  const listed = state.fallbackModels.some((entry) => modelKey(entry.model) === modelKey(primary));
+  const order: FallbackModel[] = listed ? [] : [configuredAttempt(primary)];
+  const seen = new Set(order.map((entry) => modelKey(entry.model)));
   for (const entry of state.fallbackModels) {
     const key = modelKey(entry.model);
     if (seen.has(key)) continue;
@@ -54,7 +60,6 @@ export function activeLimit(model: Model<Api>) {
   const entry = state.rateLimitMemory.get(modelKey(model));
   if (!entry) return undefined;
   if (Date.now() >= entry.deadline) {
-    state.rateLimitMemory.delete(modelKey(model));
     return undefined;
   }
   return entry;
@@ -75,6 +80,15 @@ export function notifyRetryingAfterError(model: Model<Api>, waitMs: number, erro
   notifyLiveliness(`${formatModel(model)} retrying after error in ${formatDuration(waitMs)}. Error: ${formatErrorDetail(errorMessage, Number.MAX_SAFE_INTEGER)}`);
 }
 
+function notifyProbe(model: Model<Api>, remainingMs: number): void {
+  const ctx = state.sharedCtx;
+  if (!ctx) return;
+  const remaining = remainingMs > 0 ? ` (${formatDuration(remainingMs)} left on its remembered limit)` : "";
+  try {
+    ctx.ui.notify(`Probing higher-priority model ${formatModel(model)}${remaining}.`, "info");
+  } catch { /* UI unavailable */ }
+}
+
 export function rememberRateLimit(model: Model<Api>, retryable: RetryableError, errorMessage?: string): void {
   const deadline = Date.now() + retryable.waitMs;
   state.rateLimitMemory.set(modelKey(model), { reason: retryable.reason, limitedAt: Date.now(), deadline });
@@ -86,7 +100,6 @@ export function activeNonRetryableFailure(model: Model<Api>) {
   const entry = state.nonRetryableFailureMemory.get(modelKey(model));
   if (!entry) return undefined;
   if (Date.now() >= entry.deadline) {
-    state.nonRetryableFailureMemory.delete(modelKey(model));
     return undefined;
   }
   return entry;
@@ -96,8 +109,91 @@ export function hasNonRetryableFailure(model: Model<Api>): boolean {
   return Boolean(activeNonRetryableFailure(model));
 }
 
-export function nextAvailableCandidate(current: Model<Api>): FallbackModel | undefined {
-  return candidateOrder(current).find((entry) => !activeLimit(entry.model) && !hasNonRetryableFailure(entry.model));
+export function probeIntervalMs(): number {
+  return Math.max(0, state.probeIntervalMs);
+}
+
+/**
+ * Remembered unusability of a model, merged across the rate-limit and frozen
+ * memories, plus the moment it becomes worth re-probing. Remembered deadlines
+ * are estimates (`retry-after` is often pessimistic, or absent and defaulted),
+ * so a blocked model is re-probed periodically instead of being trusted until
+ * its deadline.
+ */
+export function blockedState(model: Model<Api>): { deadline: number; probeAt: number } | undefined {
+  const limit = activeLimit(model);
+  const frozen = activeNonRetryableFailure(model);
+  if (!limit && !frozen) return undefined;
+  const deadline = Math.max(limit?.deadline ?? 0, frozen?.deadline ?? 0);
+  // Probe timing follows the most recent evidence of unusability, so a probe
+  // that fails again postpones the next probe.
+  const lastEvidence = Math.max(
+    limit ? limit.lastProbeAt ?? limit.limitedAt : 0,
+    frozen ? frozen.lastProbeAt ?? frozen.failedAt : 0,
+  );
+  const interval = probeIntervalMs();
+  const probeAt = interval > 0 ? Math.min(lastEvidence + interval, deadline) : deadline;
+  return { deadline, probeAt };
+}
+
+export function isModelBlocked(model: Model<Api>): boolean {
+  return Boolean(blockedState(model));
+}
+
+/** Capture record identities before invoking a provider, for concurrency-safe clearing. */
+export function unavailabilitySnapshot(model: Model<Api>) {
+  const key = modelKey(model);
+  return { limit: state.rateLimitMemory.get(key), frozen: state.nonRetryableFailureMemory.get(key) };
+}
+
+/** Successful output clears only the failure evidence known to that attempt. */
+export function clearUnavailability(model: Model<Api>, snapshot: ReturnType<typeof unavailabilitySnapshot>): void {
+  const key = modelKey(model);
+  // Each new failure replaces its record. Older output cannot erase newer evidence.
+  if (state.rateLimitMemory.get(key) === snapshot.limit) state.rateLimitMemory.delete(key);
+  if (state.nonRetryableFailureMemory.get(key) === snapshot.frozen) state.nonRetryableFailureMemory.delete(key);
+}
+
+/** Record that a blocked model was just re-probed, so probes stay rate-limited. */
+export function markProbeAttempt(model: Model<Api>, now = Date.now()): void {
+  const remainingMs = (blockedState(model)?.deadline ?? now) - now;
+  postponeProbe(model, now);
+  notifyProbe(model, remainingMs);
+}
+
+/** Postpone probing existing evidence without creating or extending a freeze. */
+export function postponeProbe(model: Model<Api>, now = Date.now()): void {
+  const key = modelKey(model);
+  const limit = state.rateLimitMemory.get(key);
+  if (limit) limit.lastProbeAt = now;
+  const frozen = state.nonRetryableFailureMemory.get(key);
+  if (frozen) frozen.lastProbeAt = now;
+}
+
+/**
+ * The model to use right now, in strict configured priority order: the first
+ * candidate that is usable, or - ahead of any lower-priority usable candidate -
+ * the first blocked candidate whose probe is due. This is what makes the top
+ * model reclaim traffic as soon as it works again.
+ */
+export function nextAttemptCandidate(
+  current: Model<Api>,
+  excluded?: ReadonlySet<string>,
+): { entry: FallbackModel; probe: boolean } | undefined {
+  const now = Date.now();
+  for (const entry of candidateOrder(current)) {
+    if (excluded?.has(modelKey(entry.model))) continue;
+    const blocked = blockedState(entry.model);
+    if (!blocked) return { entry, probe: false };
+    if (probeIntervalMs() > 0 && now >= blocked.probeAt) {
+      return { entry, probe: true };
+    }
+  }
+  return undefined;
+}
+
+export function nextAvailableCandidate(current: Model<Api>, excluded?: ReadonlySet<string>): FallbackModel | undefined {
+  return nextAttemptCandidate(current, excluded)?.entry;
 }
 
 export function rememberNonRetryableFailure(model: Model<Api>, errorMessage: string): void {
@@ -114,10 +210,28 @@ export function earliestCandidateDeadline(current: Model<Api>): number | undefin
   return deadlines.length > 0 ? Math.min(...deadlines) : undefined;
 }
 
-export function initialAttempt(model: Model<Api>): FallbackModel {
+/**
+ * When to stop waiting while every candidate is blocked: the earliest of all
+ * remembered deadlines and all due-probe times, so a wait never outlives the
+ * next chance to reclaim a higher-priority model.
+ */
+export function earliestCandidateWakeup(current: Model<Api>, excluded?: ReadonlySet<string>): number | undefined {
+  const wakeups = candidateOrder(current)
+    .filter((entry) => !excluded?.has(modelKey(entry.model)))
+    .map((entry) => blockedState(entry.model)?.probeAt)
+    .filter((wakeup): wakeup is number => typeof wakeup === "number");
+  return wakeups.length > 0 ? Math.min(...wakeups) : undefined;
+}
+
+/**
+ * Every request restarts from the top of the priority order, so work returns to
+ * the highest-priority usable model on its own instead of sticking to whatever
+ * fallback happened to answer last.
+ */
+export function initialAttempt(model: Model<Api>): FallbackModel | undefined {
   const current = configuredAttempt(model);
-  if (!fallbackEnabled() || (!activeLimit(model) && !hasNonRetryableFailure(model))) return current;
-  return nextAvailableCandidate(model) ?? current;
+  if (!fallbackEnabled()) return current;
+  return nextAvailableCandidate(model);
 }
 
 let modelSwitchQueue = Promise.resolve();

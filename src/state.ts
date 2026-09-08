@@ -1,6 +1,10 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Api, Model, ModelThinkingLevel } from "@earendil-works/pi-ai";
-import { DEFAULT_UNKNOWN_ERROR_MAX_RETRIES, DEFAULT_UNKNOWN_ERROR_RETRY_INTERVAL_MS } from "./constants.js";
+import {
+  DEFAULT_PROBE_INTERVAL_MS,
+  DEFAULT_UNKNOWN_ERROR_MAX_RETRIES,
+  DEFAULT_UNKNOWN_ERROR_RETRY_INTERVAL_MS,
+} from "./constants.js";
 import type { FallbackModel, NonRetryableFailureMemory, RateLimitMemory } from "./types.js";
 
 export const state = {
@@ -13,6 +17,8 @@ export const state = {
   // Includes the initial request, so the default is one more than max retries.
   nonRetryableMaxAttempts: DEFAULT_UNKNOWN_ERROR_MAX_RETRIES + 1,
   nonRetryableRetryDelayMs: DEFAULT_UNKNOWN_ERROR_RETRY_INTERVAL_MS,
+  // How often a still-limited higher-priority model is re-probed. 0 disables.
+  probeIntervalMs: DEFAULT_PROBE_INTERVAL_MS,
   primaryModel: undefined as Model<Api> | undefined,
   primaryThinkingLevel: undefined as ModelThinkingLevel | undefined,
   expectedModelSelections: new Map<string, Set<symbol>>(),
@@ -52,6 +58,7 @@ export function consumeExpectedModelSelection(model: Pick<Model<Api>, "provider"
 
 export function resetRuntimeStateForTests(models: FallbackModel[], ctx?: ExtensionContext): void {
   state.fallbackModels = models;
+  state.probeIntervalMs = DEFAULT_PROBE_INTERVAL_MS;
   state.sharedCtx = ctx;
   state.primaryModel = undefined;
   state.primaryThinkingLevel = undefined;

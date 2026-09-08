@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { readFile, rename, unlink } from "node:fs/promises";
 import {
   DEFAULT_LIVELINESS_INTERVAL_MS,
+  DEFAULT_PROBE_INTERVAL_MS,
   DEFAULT_UNKNOWN_ERROR_MAX_RETRIES,
   DEFAULT_UNKNOWN_ERROR_RETRY_INTERVAL_MS,
   DEFAULT_WAITING_ENV_VAR,
@@ -10,6 +11,7 @@ import {
   LIVELINESS_INTERVAL_ENV_VAR,
   LIVELINESS_STATUS_KEY,
   MAX_RETRY_ENV_VAR,
+  PROBE_INTERVAL_ENV_VAR,
   RETRY_INTERVAL_ENV_VAR,
 } from "./constants.js";
 import { state } from "./state.js";
@@ -62,7 +64,7 @@ export function envBoolean(raw: string | undefined, defaultValue: boolean): bool
   return !(value === "false" || value === "0" || value === "no" || value === "off");
 }
 
-function envNonNegativeInteger(raw: string | undefined, defaultValue: number, maximum = Number.MAX_SAFE_INTEGER): number {
+export function envNonNegativeInteger(raw: string | undefined, defaultValue: number, maximum = Number.MAX_SAFE_INTEGER): number {
   if (raw === undefined || !/^\d+$/.test(raw.trim())) return defaultValue;
   const value = Number(raw);
   return Number.isSafeInteger(value) ? Math.min(value, maximum) : defaultValue;
@@ -95,6 +97,24 @@ export function loadUnknownErrorRetrySettings(): void {
     Math.floor(2_147_483_647 / 1_000),
   );
   state.nonRetryableRetryDelayMs = intervalSeconds * 1_000;
+  state.probeIntervalMs = configuredProbeIntervalMs();
+}
+
+/**
+ * Probe interval in ms. `PI_LIMITS_WAIT_PROBE_INTERVAL` (seconds) wins over the
+ * `probe-interval-seconds` settings key; 0 disables probing entirely.
+ */
+export function configuredProbeIntervalMs(settingSeconds?: number): number {
+  const maximum = Math.floor(2_147_483_647 / 1_000);
+  const fallbackSeconds = settingSeconds !== undefined && Number.isSafeInteger(settingSeconds) && settingSeconds >= 0
+    ? Math.min(settingSeconds, maximum)
+    : DEFAULT_PROBE_INTERVAL_MS / 1_000;
+  const seconds = envNonNegativeInteger(
+    process.env[PROBE_INTERVAL_ENV_VAR],
+    fallbackSeconds,
+    maximum,
+  );
+  return seconds * 1_000;
 }
 
 /**

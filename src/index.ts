@@ -21,8 +21,19 @@ export {
 export {
   __readFallbackSettingsForTests,
   configFileCandidates,
+  parseProbeIntervalSeconds,
   readFallbackSettings,
 } from "./settings.js";
+export {
+  blockedState,
+  candidateOrder,
+  earliestCandidateWakeup,
+  initialAttempt,
+  isModelBlocked,
+  nextAttemptCandidate,
+  nextAvailableCandidate,
+  probeIntervalMs,
+} from "./models.js";
 export {
   __createRetrySummaryCoordinatorForTests,
   LIMITS_WAIT_ENTRY_TYPE,
@@ -37,6 +48,7 @@ export {
   LIVELINESS_JSON_STATUS_KEY,
   LIVELINESS_JSON_VERSION,
   LIVELINESS_STATUS_KEY,
+  PROBE_INTERVAL_ENV_VAR,
   STATUS_JSON_ENV_VAR,
 } from "./constants.js";
 export {
@@ -66,6 +78,7 @@ export type { LimitsWaitSessionEntryData } from "./retry-summary.js";
 export {
   __configureFallbackModelsForTests,
   __setNonRetryableTuningForTests,
+  __setProbeIntervalForTests,
   disableModelRuntimeInterception,
   installModelRuntimeInterception,
   streamWithLimitsRetry,
@@ -74,6 +87,7 @@ export {
 export {
   allWaitingDisabled,
   clearLivelinessStatus,
+  configuredProbeIntervalMs,
   freezingEnabled,
   isNonInteractiveHost,
   loadUnknownErrorRetrySettings,

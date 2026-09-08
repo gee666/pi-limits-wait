@@ -30,12 +30,16 @@ export type RateLimitMemory = {
   reason: RetryReason;
   limitedAt: number;
   deadline: number;
+  /** Last time this model was re-probed while still remembered as limited. */
+  lastProbeAt?: number;
 };
 
 export type NonRetryableFailureMemory = {
   failedAt: number;
   deadline: number;
   errorMessage: string;
+  /** Last time this model was re-probed while still remembered as frozen. */
+  lastProbeAt?: number;
 };
 
 export type RuntimeStreamSimpleFn = (

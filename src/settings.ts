@@ -3,10 +3,19 @@ import { homedir } from "os";
 import { join, resolve } from "path";
 import { getAgentDir, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
-import { FALLBACK_MODELS_KEY, SETTINGS_FILE_NAME } from "./constants.js";
+import { FALLBACK_MODELS_KEY, PROBE_INTERVAL_KEY, SETTINGS_FILE_NAME } from "./constants.js";
 import { formatModel, modelKey } from "./models.js";
 import { state } from "./state.js";
 import type { ConfiguredModel } from "./types.js";
+import { configuredProbeIntervalMs } from "./ui.js";
+
+export function parseProbeIntervalSeconds(raw: unknown): number | undefined {
+  const record = raw && typeof raw === "object" ? raw as Record<string, unknown> : undefined;
+  const value = record?.[PROBE_INTERVAL_KEY] ?? record?.probeIntervalSeconds;
+  const seconds = typeof value === "string" && /^\d+$/.test(value.trim()) ? Number(value.trim()) : value;
+  if (typeof seconds === "number" && Number.isSafeInteger(seconds) && seconds >= 0) return seconds;
+  return undefined;
+}
 
 function isThinkingLevel(value: unknown): value is ModelThinkingLevel {
   return ["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(String(value));
@@ -108,6 +117,8 @@ export function loadFallbackSettings(ctx: ExtensionContext): void {
     const content = JSON.stringify({ config, loadedPaths, warnings });
     const shouldNotify = state.settingsSignature !== content;
     state.settingsSignature = content;
+
+    state.probeIntervalMs = configuredProbeIntervalMs(parseProbeIntervalSeconds(config));
 
     const configured = parseConfiguredModels(config);
     if (configured.length === 0) {

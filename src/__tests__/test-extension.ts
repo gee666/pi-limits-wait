@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
+import { mock } from "node:test";
 import { join } from "node:path";
 import { ModelRuntime, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
@@ -17,7 +18,17 @@ import limitsWaitExtension, {
   __configureFallbackModelsForTests,
   __readFallbackSettingsForTests,
   __setNonRetryableTuningForTests,
+  __setProbeIntervalForTests,
   allWaitingDisabled,
+  blockedState,
+  candidateOrder,
+  initialAttempt,
+  configuredProbeIntervalMs,
+  earliestCandidateWakeup,
+  isModelBlocked,
+  nextAttemptCandidate,
+  parseProbeIntervalSeconds,
+  probeIntervalMs,
   freezingEnabled,
   getRetryableError,
   installModelRuntimeInterception,
@@ -36,6 +47,7 @@ import limitsWaitExtension, {
   waitForRetry,
   notifyFinalFailure,
   clearStatusJson,
+  EXTENSION_VERSION,
   publishStatusJson,
   statusPayload,
   LIVELINESS_JSON_STATUS_KEY,
@@ -45,6 +57,7 @@ import limitsWaitExtension, {
 } from "../index.js";
 import { DEFAULT_UNKNOWN_ERROR_MAX_RETRIES } from "../constants.js";
 import { isSkipToken } from "../status-json.js";
+import type { RateLimitMemory } from "../types.js";
 import { withAttemptResponseObserver } from "../response-observer.js";
 import { loadFallbackSettings } from "../settings.js";
 import { consumeExpectedModelSelection, expectModelSelection, state } from "../state.js";
@@ -1265,6 +1278,480 @@ section("real ModelRuntime fallback and option isolation");
   __configureFallbackModelsForTests([]);
 }
 
+section("configured model priority and higher-priority probing");
+{
+  const previousCtx = state.sharedCtx;
+  const previousApi = state.extensionApi;
+  const previousPrimary = state.primaryModel;
+  const makeProbesDue = () => {
+    for (const limit of state.rateLimitMemory.values()) {
+      limit.limitedAt = Date.now() - 60_001;
+      delete limit.lastProbeAt;
+    }
+  };
+  const model = (id: string) => ({ provider: "prio", id, api: "openai-completions" } as Model<Api>);
+  const primary = model("primary");
+  const second = model("second");
+  const third = model("third");
+  const status: Record<string, "ok" | "limited"> = { primary: "ok", second: "ok", third: "ok" };
+  let calls: string[] = [];
+  const mutableCtx = {
+    model: primary,
+    ui: {
+      notify: () => undefined,
+      setWorkingMessage: () => undefined,
+      setStatus: () => undefined,
+      getEditorText: () => "",
+      onTerminalInput: () => () => undefined,
+    },
+  } as unknown as ExtensionContext;
+  const setCurrent = (next: Model<Api>) => { (mutableCtx as unknown as { model: Model<Api> }).model = next; };
+  const delegate = ((requested: Model<Api>) => {
+    calls.push(requested.id);
+    return status[requested.id] === "ok"
+      ? streamFrom([startEvent(requested), doneEvent(requested)])
+      : streamFrom([startEvent(requested), errorEvent(requested, "HTTP 429 retry-after 60")]);
+  }) as Parameters<typeof streamWithLimitsRetry>[1];
+  const request = async (from: Model<Api>) => {
+    calls = [];
+    const events = await collect(streamWithLimitsRetry({} as ModelRuntime, delegate, from, context));
+    return { trace: calls.join(","), events };
+  };
+  const configure = (fallbacks: Model<Api>[], probeMs: number) => {
+    __configureFallbackModelsForTests(fallbacks.map((entry) => ({ model: entry })), mutableCtx);
+    __setProbeIntervalForTests(probeMs);
+    state.primaryModel = primary;
+    setCurrent(primary);
+    state.rateLimitMemory.clear();
+    state.nonRetryableFailureMemory.clear();
+  };
+
+  state.extensionApi = {
+    setModel: async (next: Model<Api>) => { setCurrent(next); return true; },
+    setThinkingLevel: () => undefined,
+  } as unknown as typeof state.extensionApi;
+
+  {
+    // Probing disabled: priority must still be re-evaluated per request, so an
+    // expired limit alone brings work back to the top model.
+    configure([second], 0);
+    status.primary = "limited";
+    const fellBack = await request(primary);
+    const committedFallback = mutableCtx.model;
+    const stuck = await request(mutableCtx.model!);
+    status.primary = "ok";
+    state.rateLimitMemory.get("prio/primary")!.deadline = Date.now() - 1;
+    const recovered = await request(mutableCtx.model!);
+    ok(
+      "a rate-limited primary hands over to the next configured model",
+      fellBack.trace === "primary,second" && committedFallback === second
+        && fellBack.events.at(-1)?.type === "done",
+      `trace=${fellBack.trace}, committed=${committedFallback?.id}`,
+    );
+    ok(
+      "a lower-priority model keeps serving only while the primary is known limited",
+      stuck.trace === "second",
+      `trace=${stuck.trace}`,
+    );
+    ok(
+      "work returns to the primary on the first request after its limit expires",
+      recovered.trace === "primary" && mutableCtx.model === primary,
+      `trace=${recovered.trace}, current=${mutableCtx.model?.id}`,
+    );
+  }
+
+  {
+    // The remembered deadline is only an estimate, so a still-limited primary
+    // is re-probed and reclaimed as soon as it actually answers.
+    configure([second], 60_000);
+    status.primary = "limited";
+    const fellBack = await request(primary);
+    const beforeProbe = await request(mutableCtx.model!);
+    makeProbesDue();
+    status.primary = "ok";
+    const probed = await request(mutableCtx.model!);
+    const afterProbe = await request(mutableCtx.model!);
+    ok(
+      "a due probe reclaims the primary long before its remembered deadline",
+      fellBack.trace === "primary,second" && beforeProbe.trace === "second"
+        && probed.trace === "primary" && mutableCtx.model === primary
+        && !state.rateLimitMemory.has("prio/primary") && afterProbe.trace === "primary",
+      `fellBack=${fellBack.trace}, beforeProbe=${beforeProbe.trace}, probed=${probed.trace}, afterProbe=${afterProbe.trace}`,
+    );
+  }
+
+  {
+    // A failed probe must cost one request, then postpone the next probe.
+    configure([second], 60_000);
+    status.primary = "limited";
+    await request(primary);
+    makeProbesDue();
+    const failedProbe = await request(mutableCtx.model!);
+    const postponed = await request(mutableCtx.model!);
+    ok(
+      "a failed probe falls back again and postpones the next probe",
+      failedProbe.trace === "primary,second" && postponed.trace === "second"
+        && failedProbe.events.at(-1)?.type === "done",
+      `failedProbe=${failedProbe.trace}, postponed=${postponed.trace}`,
+    );
+  }
+
+  {
+    // Strict ordering: recovery jumps as high as possible, never sideways.
+    configure([second, third], 60_000);
+    status.primary = "limited";
+    status.second = "limited";
+    const fellBack = await request(primary);
+    makeProbesDue();
+    status.second = "ok";
+    const climbed = await request(mutableCtx.model!);
+    ok(
+      "recovery climbs to the highest available model instead of staying lower",
+      fellBack.trace === "primary,second,third" && climbed.trace === "primary,second"
+        && mutableCtx.model === second,
+      `fellBack=${fellBack.trace}, climbed=${climbed.trace}, current=${mutableCtx.model?.id}`,
+    );
+    status.second = "ok";
+  }
+
+  {
+    configure([second], 60_000);
+    for (const entry of [primary, second]) state.rateLimitMemory.set(`prio/${entry.id}`, {
+      reason: "rate-limit", limitedAt: Date.now(), deadline: Date.now() + 3_600_000,
+    });
+    calls = [];
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 2_000);
+    try {
+      const pending = collect(streamWithLimitsRetry({} as ModelRuntime, delegate, primary, context, { signal: controller.signal }));
+      ok("all-blocked initial request waits without invoking a provider", calls.length === 0 && state.activeWaitSkips.size > 0);
+      controller.abort();
+      const events = await pending;
+      ok("all-blocked wait has bounded cancellation", events.at(-1)?.type === "error" && calls.length === 0);
+    } finally { clearTimeout(timeout); controller.abort(); }
+  }
+
+  {
+    configure([primary, second], 60_000);
+    const controller = new AbortController();
+    const safety = setTimeout(() => controller.abort(), 2_000);
+    mock.timers.enable({ apis: ["Date", "setTimeout", "setInterval"], now: Date.now() });
+    try {
+      for (const entry of [primary, second]) state.rateLimitMemory.set(`prio/${entry.id}`, {
+        reason: "rate-limit", limitedAt: Date.now(), deadline: Date.now() + 3_600_000,
+      });
+      status.primary = "ok";
+      calls = [];
+      const pending = collect(streamWithLimitsRetry({} as ModelRuntime, delegate, primary, context, { signal: controller.signal }));
+      mock.timers.tick(59_999);
+      ok("all-blocked initial wait does not invoke a provider before the probe is due", calls.length === 0);
+      mock.timers.tick(1);
+      const events = await pending;
+      ok("all-blocked wait wakes exactly at the early probe, not Retry-After", calls.join(",") === "primary" && events.at(-1)?.type === "done");
+    } finally { controller.abort(); mock.timers.reset(); clearTimeout(safety); }
+  }
+
+  {
+    configure([second], 60_000);
+    const limit: RateLimitMemory = {
+      reason: "rate-limit",
+      limitedAt: Date.now(),
+      deadline: Date.now() + 3_600_000,
+    };
+    state.rateLimitMemory.set("prio/primary", limit);
+    const blocked = blockedState(primary)!;
+    const wakeup = earliestCandidateWakeup(primary)!;
+    ok(
+      "a pending probe defines the wakeup time instead of the remembered deadline",
+      isModelBlocked(primary) && !isModelBlocked(second)
+        && blocked.probeAt - Date.now() <= 60_000 && wakeup === blocked.probeAt
+        && blocked.deadline === limit.deadline
+        && nextAttemptCandidate(primary)?.entry.model === second,
+      `probeIn=${blocked.probeAt - Date.now()}, wakeupIn=${wakeup - Date.now()}`,
+    );
+    limit.limitedAt = Date.now() - 60_001;
+    delete limit.lastProbeAt;
+    ok(
+      "probe selection is pure and does not consume the due probe",
+      nextAttemptCandidate(primary)?.entry.model === primary
+        && nextAttemptCandidate(primary)?.entry.model === primary && limit.lastProbeAt === undefined,
+    );
+    __setProbeIntervalForTests(0);
+    ok(
+      "probing can be disabled entirely",
+      probeIntervalMs() === 0 && blockedState(primary)?.probeAt === blockedState(primary)?.deadline
+        && nextAttemptCandidate(primary)?.entry.model === second,
+    );
+  }
+
+  {
+    configure([second, primary, third], 60_000);
+    status.second = "ok";
+    const preferred = await request(primary);
+    ok("a primary listed lower never jumps ahead of configured priority", preferred.trace === "second"
+      && candidateOrder(primary).map((entry) => entry.model.id).join(",") === "second,primary,third");
+    configure([second, third], 60_000);
+    status.primary = "ok";
+    ok("an explicit out-of-list selection stays first", (await request(primary)).trace === "primary");
+    calls = [];
+    await collect(streamWithLimitsRetry({} as ModelRuntime, ((requested: Model<Api>) => {
+      calls.push(requested.id);
+      return streamFrom([doneEvent(requested)]);
+    }) as typeof delegate, model("unrelated"), context));
+    ok("unrelated calls are never routed through the fallback list", calls.join(",") === "unrelated");
+  }
+
+  {
+    configure([primary, second], 60_000);
+    const limit: RateLimitMemory = { reason: "rate-limit", limitedAt: Date.now() - 60_001, deadline: Date.now() + 3_600_000 };
+    state.rateLimitMemory.set("prio/primary", limit);
+    const controller = new AbortController();
+    controller.abort();
+    calls = [];
+    const selected = initialAttempt(primary);
+    await collect(streamWithLimitsRetry({} as ModelRuntime, delegate, primary, context, { signal: controller.signal }));
+    ok("pre-cancelled calls and initial selection do not reserve probes", selected?.model === primary && calls.length === 0 && limit.lastProbeAt === undefined);
+  }
+
+  for (const failure of ["HTTP 403 Forbidden", "fetch failed", "unclassified provider failure"]) {
+    configure([primary, second], 60_000);
+    state.rateLimitMemory.set("prio/primary", { reason: "rate-limit", limitedAt: Date.now() - 60_001, deadline: Date.now() + 3_600_000 });
+    calls = [];
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 2_000);
+    try {
+      const events = await collect(streamWithLimitsRetry({} as ModelRuntime, ((requested: Model<Api>) => {
+        calls.push(requested.id);
+        if (requested === primary) throw new Error(failure);
+        return streamFrom([doneEvent(requested)]);
+      }) as typeof delegate, second, context, { signal: controller.signal }));
+      ok(`failed probe bypasses normal retry loops: ${failure}`, calls.join(",") === "primary,second" && events.at(-1)?.type === "done"
+        && nextAttemptCandidate(primary)?.entry.model === second);
+    } finally { clearTimeout(timeout); controller.abort(); }
+  }
+
+  {
+    configure([primary, second, third], 60_000);
+    state.rateLimitMemory.set("prio/primary", { reason: "rate-limit", limitedAt: Date.now(), deadline: Date.now() + 3_600_000 });
+    calls = [];
+    const controller = new AbortController();
+    const safety = setTimeout(() => controller.abort(), 2_000);
+    try {
+      const events = await collect(streamWithLimitsRetry({} as ModelRuntime, ((requested: Model<Api>, _context: Context, options?: ModelsSimpleStreamOptions) => {
+        calls.push(requested.id);
+        if (requested === second) {
+          makeProbesDue();
+          return streamFrom([errorEvent(requested, "HTTP 429 retry-after 3600")]);
+        }
+        if (requested === third) return streamFrom([doneEvent(requested)]);
+        const stream = createAssistantMessageEventStream();
+        void (async () => {
+          try { await options?.onResponse?.({ status: 403, headers: {} }, requested); }
+          catch (error) { stream.push(errorEvent(requested, String(error))); }
+          finally { stream.end(); }
+        })();
+        return stream;
+      }) as typeof delegate, second, context, { signal: controller.signal }));
+      ok("a probe selected after fallback failure retains identity through canonical HTTP 403", calls.join(",") === "second,primary,third" && events.at(-1)?.type === "done");
+    } finally { controller.abort(); clearTimeout(safety); }
+  }
+
+  for (const failure of ["Operation aborted", "prompt is too long: 200000 tokens > 100000 maximum"]) {
+    configure([primary, second], 60_000);
+    state.rateLimitMemory.set("prio/primary", { reason: "rate-limit", limitedAt: Date.now() - 60_001, deadline: Date.now() + 3_600_000 });
+    calls = [];
+    const events = await collect(streamWithLimitsRetry({} as ModelRuntime, ((requested: Model<Api>) => {
+      calls.push(requested.id);
+      return streamFrom([errorEvent(requested, failure)]);
+    }) as typeof delegate, primary, context));
+    ok(`probe preserves terminal handling: ${failure}`, calls.join(",") === "primary" && events.at(-1)?.type === "error");
+  }
+
+  {
+    configure([primary, second], 60_000);
+    state.rateLimitMemory.set("prio/primary", { reason: "rate-limit", limitedAt: Date.now() - 60_001, deadline: Date.now() + 3_600_000 });
+    const held = createAssistantMessageEventStream();
+    const traces: string[] = [];
+    const concurrent = ((requested: Model<Api>) => {
+      traces.push(requested.id);
+      return requested === primary ? held : streamFrom([doneEvent(requested)]);
+    }) as typeof delegate;
+    const older = collect(streamWithLimitsRetry({} as ModelRuntime, concurrent, primary, context));
+    await collect(streamWithLimitsRetry({} as ModelRuntime, concurrent, primary, context));
+    ok("concurrent calls reserve a due probe only once", traces.join(",") === "primary,second");
+    const newerLimit: RateLimitMemory = { reason: "rate-limit", limitedAt: Date.now(), deadline: Date.now() + 3_600_000 };
+    const newerFreeze = { failedAt: Date.now(), deadline: Date.now() + 3_600_000, errorMessage: "new failure" };
+    state.rateLimitMemory.set("prio/primary", newerLimit);
+    state.nonRetryableFailureMemory.set("prio/primary", newerFreeze);
+    held.push(doneEvent(primary));
+    held.end();
+    await older;
+    ok("older successful output cannot clear newer concurrent limit or freeze", state.rateLimitMemory.get("prio/primary") === newerLimit
+      && state.nonRetryableFailureMemory.get("prio/primary") === newerFreeze);
+  }
+
+  {
+    configure([primary, second], 60_000);
+    state.rateLimitMemory.set("prio/primary", { reason: "rate-limit", limitedAt: Date.now(), deadline: Date.now() + 3_600_000 });
+    const held = createAssistantMessageEventStream();
+    calls = [];
+    const stream = streamWithLimitsRetry({} as ModelRuntime, ((requested: Model<Api>) => {
+      calls.push(requested.id);
+      return held;
+    }) as typeof delegate, second, context);
+    held.push(startEvent(second));
+    held.push(textEvent(second));
+    const iterator = stream[Symbol.asyncIterator]();
+    await iterator.next();
+    await iterator.next();
+    makeProbesDue();
+    held.push(doneEvent(second));
+    held.end();
+    await iterator.next();
+    ok("a probe becoming due never interrupts a committed fallback stream", calls.join(",") === "second");
+    status.primary = "ok";
+    ok("the next LLM call reclaims the highest due model", (await request(second)).trace === "primary");
+  }
+
+  {
+    const previousFreeze = process.env.PI_LIMITS_WAIT_FREEZING_ENABLED;
+    const previousAttempts = state.nonRetryableMaxAttempts;
+    const previousDelay = state.nonRetryableRetryDelayMs;
+    const previousWaiting = state.unknownErrorWaitingEnabled;
+    process.env.PI_LIMITS_WAIT_FREEZING_ENABLED = "false";
+    state.unknownErrorWaitingEnabled = true;
+    // Bound even a microtask hot loop: a timer alone cannot interrupt one.
+    const boundedRequest = async (provider: typeof delegate, onImmediateRetry?: () => void) => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 2_000);
+      calls = [];
+      try {
+        return await collect(streamWithLimitsRetry({} as ModelRuntime, ((...args: Parameters<typeof delegate>) => {
+          calls.push(args[0].id);
+          if (calls.length >= 8) controller.abort();
+          return provider.call({} as ModelRuntime, ...args);
+        }) as typeof delegate, second, context, { signal: controller.signal }, undefined, onImmediateRetry ? {
+          periodId: "competing-probe",
+          events: { emit: () => undefined, on: () => () => undefined },
+          beginRetry: () => undefined,
+          completeRetry: () => undefined,
+          recordWait: () => undefined,
+          recordImmediateRetry: onImmediateRetry,
+          recordReason: () => undefined,
+          finalize: () => undefined,
+        } : undefined));
+      } finally { controller.abort(); clearTimeout(timer); }
+    };
+    try {
+      for (const thirdSucceeds of [true, false]) {
+        configure([primary, second, third], 60_000);
+        __setNonRetryableTuningForTests(1, 0);
+        state.rateLimitMemory.set("prio/primary", { reason: "rate-limit", limitedAt: Date.now(), deadline: Date.now() + 3_600_000 });
+        const events = await boundedRequest(((requested: Model<Api>) => streamFrom([
+          requested === third && thirdSucceeds ? doneEvent(requested) : errorEvent(requested, "unknown provider failure"),
+        ])) as typeof delegate);
+        const terminal = events.at(-1);
+        ok(`no-freeze exhaustion skips blocked top and exhausted second (${thirdSucceeds ? "third succeeds" : "terminal exhaustion"})`,
+          calls.join(",") === "second,third" && (thirdSucceeds ? terminal?.type === "done" : terminal?.type === "error" && terminal.reason === "error")
+          && state.nonRetryableFailureMemory.size === 0 && state.activeWaitSkips.size === 0,
+          `trace=${calls.join(",")}`);
+      }
+
+      {
+        configure([primary, second, third], 60_000);
+        __setNonRetryableTuningForTests(1, 0);
+        const limit: RateLimitMemory = { reason: "rate-limit", limitedAt: Date.now(), deadline: Date.now() + 3_600_000 };
+        state.rateLimitMemory.set("prio/primary", limit);
+        const events = await boundedRequest(((requested: Model<Api>) => {
+          if (requested === second) {
+            makeProbesDue();
+            return streamFrom([errorEvent(requested, "unknown provider failure")]);
+          }
+          return streamFrom([doneEvent(requested)]);
+        }) as typeof delegate, () => {
+          // Simulate another caller reserving top after selection but before invocation.
+          limit.lastProbeAt = Date.now();
+        });
+        ok("invocation-time re-selection excludes exhausted candidates after a competing probe reservation",
+          calls.join(",") === "second,third" && events.at(-1)?.type === "done", `trace=${calls.join(",")}`);
+      }
+
+      for (const failure of ["HTTP 403 Forbidden", "unknown provider failure"]) {
+        configure([primary, second, third], 60_000);
+        __setNonRetryableTuningForTests(999_999, 0);
+        const limit: RateLimitMemory = { reason: "rate-limit", limitedAt: Date.now() - 60_001, deadline: Date.now() + 3_600_000 };
+        const deadline = limit.deadline;
+        state.rateLimitMemory.set("prio/primary", limit);
+        const events = await boundedRequest(((requested: Model<Api>) => streamFrom([
+          requested === primary ? errorEvent(requested, failure) : doneEvent(requested),
+        ])) as typeof delegate);
+        ok(`no-freeze failed probe postpones without freezing or retry budget: ${failure}`,
+          calls.join(",") === "primary,second" && events.at(-1)?.type === "done"
+          && state.nonRetryableFailureMemory.size === 0 && limit.deadline === deadline
+          && limit.lastProbeAt !== undefined && nextAttemptCandidate(primary)?.entry.model === second,
+          `trace=${calls.join(",")}`);
+        // A later request can probe again; request-local exhaustion must not stick.
+        limit.lastProbeAt = Date.now() - 60_001;
+        const recovered = await boundedRequest(((requested: Model<Api>) => streamFrom([doneEvent(requested)])) as typeof delegate);
+        ok(`no-freeze probe exhaustion is request-local: ${failure}`, calls.join(",") === "primary" && recovered.at(-1)?.type === "done");
+      }
+
+      configure([primary, second, third], 60_000);
+      __setNonRetryableTuningForTests(1, 0);
+      state.rateLimitMemory.set("prio/primary", { reason: "rate-limit", limitedAt: Date.now() - 60_001, deadline: Date.now() + 3_600_000 });
+      const events = await boundedRequest(((requested: Model<Api>) => streamFrom([errorEvent(requested, "HTTP 403 Forbidden")])) as typeof delegate);
+      const terminal = events.at(-1);
+      ok("no-freeze failed probe plus exhausted fallbacks terminates without a freeze or wait",
+        calls.join(",") === "primary,second,third" && terminal?.type === "error" && terminal.reason === "error"
+        && state.nonRetryableFailureMemory.size === 0 && state.activeWaitSkips.size === 0,
+        `trace=${calls.join(",")}`);
+    } finally {
+      if (previousFreeze === undefined) delete process.env.PI_LIMITS_WAIT_FREEZING_ENABLED;
+      else process.env.PI_LIMITS_WAIT_FREEZING_ENABLED = previousFreeze;
+      __setNonRetryableTuningForTests(previousAttempts, previousDelay);
+      state.unknownErrorWaitingEnabled = previousWaiting;
+    }
+  }
+
+  {
+    const previousEnv = process.env.PI_LIMITS_WAIT_PROBE_INTERVAL;
+    process.env.PI_LIMITS_WAIT_PROBE_INTERVAL = "3";
+    loadUnknownErrorRetrySettings();
+    const envApplied = state.probeIntervalMs === 3_000 && configuredProbeIntervalMs(10) === 3_000;
+    delete process.env.PI_LIMITS_WAIT_PROBE_INTERVAL;
+    const settingApplied = configuredProbeIntervalMs(10) === 10_000 && configuredProbeIntervalMs() === 60_000;
+    ok(
+      "the probe interval is configurable by environment and settings file",
+      envApplied && settingApplied
+        && parseProbeIntervalSeconds({ "probe-interval-seconds": 7 }) === 7
+        && parseProbeIntervalSeconds({ probeIntervalSeconds: "9" }) === 9
+        && parseProbeIntervalSeconds({}) === undefined,
+    );
+    const invalid = [-1, 1.5, Infinity, Number.MAX_SAFE_INTEGER + 1, "Infinity", "1.5", "99999999999999999999999999999"];
+    ok("probe settings reject fractional, infinite, negative and unsafe values", invalid.every((value) => parseProbeIntervalSeconds({ "probe-interval-seconds": value }) === undefined)
+      && [1.5, Infinity, -1, Number.MAX_SAFE_INTEGER + 1].every((value) => configuredProbeIntervalMs(value) === 60_000));
+    const cap = 2_147_483_000;
+    const fileCapped = configuredProbeIntervalMs(Number.MAX_SAFE_INTEGER) === cap;
+    process.env.PI_LIMITS_WAIT_PROBE_INTERVAL = String(Number.MAX_SAFE_INTEGER);
+    const envCapped = configuredProbeIntervalMs(1) === cap;
+    process.env.PI_LIMITS_WAIT_PROBE_INTERVAL = "Infinity";
+    const invalidEnvFallback = configuredProbeIntervalMs(7) === 7_000;
+    process.env.PI_LIMITS_WAIT_PROBE_INTERVAL = "0";
+    ok("probe interval applies the same timer cap to file and environment and supports zero override", fileCapped && envCapped && invalidEnvFallback && configuredProbeIntervalMs(7) === 0);
+    if (previousEnv === undefined) delete process.env.PI_LIMITS_WAIT_PROBE_INTERVAL;
+    else process.env.PI_LIMITS_WAIT_PROBE_INTERVAL = previousEnv;
+    loadUnknownErrorRetrySettings();
+  }
+
+  __configureFallbackModelsForTests([]);
+  state.rateLimitMemory.clear();
+  state.nonRetryableFailureMemory.clear();
+  state.expectedModelSelections.clear();
+  state.sharedCtx = previousCtx;
+  state.extensionApi = previousApi;
+  state.primaryModel = previousPrimary;
+}
+
 section("user model changes during retry");
 {
   const oldModel = { provider: "selection-change", id: "old", api: "openai-completions" } as Model<Api>;
@@ -1467,6 +1954,93 @@ section("abort and commitment semantics");
   __setNonRetryableTuningForTests(3, 2);
 }
 
+section("end-to-end HTTP priority recovery");
+{
+  const requests: string[] = [];
+  const limited = new Set<string>(["top"]);
+  const sse = (id: string) => [
+    `data: ${JSON.stringify({ id: "r", object: "chat.completion.chunk", created: 1, model: `${id}-model`, choices: [{ index: 0, delta: { role: "assistant", content: id }, finish_reason: null }] })}`,
+    `data: ${JSON.stringify({ id: "r", object: "chat.completion.chunk", created: 1, model: `${id}-model`, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}`,
+    "data: [DONE]",
+    "",
+  ].join("\n\n");
+  const server = createServer((request, response) => {
+    const id = request.url?.includes("/top/") ? "top" : "spare";
+    requests.push(id);
+    if (limited.has(id)) {
+      // A pessimistic one-hour reset: only probing can reclaim this model.
+      response.writeHead(429, { "content-type": "application/json", "retry-after": "3600" });
+      response.end(JSON.stringify({ error: { message: "limited", type: "rate_limit_error" } }));
+      return;
+    }
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end(sse(id));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const previousCtx = state.sharedCtx;
+  const previousApi = state.extensionApi;
+  const previousPrimary = state.primaryModel;
+  try {
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("test server did not bind");
+    const runtime = await ModelRuntime.create({ modelsPath: null, allowModelNetwork: false });
+    for (const id of ["top", "spare"] as const) {
+      runtime.registerProvider(id, {
+        baseUrl: `http://127.0.0.1:${address.port}/${id}/v1`,
+        apiKey: `${id}-key`,
+        api: "openai-completions",
+        models: [{
+          id: `${id}-model`, name: `${id} model`, reasoning: false, input: ["text"],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128_000, maxTokens: 4096,
+        }],
+      });
+    }
+    const top = runtime.getModel("top", "top-model")!;
+    const spare = runtime.getModel("spare", "spare-model")!;
+    const httpCtx = { model: top, ui: { notify: () => undefined, setWorkingMessage: () => undefined } } as unknown as ExtensionContext;
+    __configureFallbackModelsForTests([{ model: top }, { model: spare }], httpCtx);
+    __setProbeIntervalForTests(60_000);
+    state.primaryModel = top;
+    state.extensionApi = {
+      setModel: async (next: Model<Api>) => { (httpCtx as unknown as { model: Model<Api> }).model = next; return true; },
+      setThinkingLevel: () => undefined,
+    } as unknown as typeof state.extensionApi;
+    const release = installModelRuntimeInterception();
+    const ask = async (text: string) => {
+      requests.length = 0;
+      const events = await collect(runtime.streamSimple(httpCtx.model!, { messages: [{ role: "user", content: text, timestamp: Date.now() }] }, {
+        maxRetries: 0,
+        signal: AbortSignal.timeout(5_000),
+      }));
+      return { trace: requests.join(","), last: events.at(-1)?.type, model: httpCtx.model?.id };
+    };
+
+    const first = await ask("one");
+    const second = await ask("two");
+    for (const limit of state.rateLimitMemory.values()) limit.limitedAt = Date.now() - 60_001;
+    limited.delete("top");
+    const third = await ask("three");
+    const fourth = await ask("four");
+    ok(
+      "over real HTTP a 429'd top model hands over, is probed, and takes traffic back",
+      first.trace === "top,spare" && first.model === "spare-model"
+        && second.trace === "spare" && second.model === "spare-model"
+        && third.trace === "top" && third.model === "top-model"
+        && fourth.trace === "top" && fourth.last === "done",
+      `first=${first.trace}/${first.model}, second=${second.trace}, third=${third.trace}/${third.model}, fourth=${fourth.trace}`,
+    );
+    release();
+  } finally {
+    __configureFallbackModelsForTests([]);
+    state.rateLimitMemory.clear();
+    state.expectedModelSelections.clear();
+    state.sharedCtx = previousCtx;
+    state.extensionApi = previousApi;
+    state.primaryModel = previousPrimary;
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+}
+
 section("structured status channel and out-of-band skip");
 {
   type StatusEntry = { key: string; text: string | undefined };
@@ -1535,7 +2109,7 @@ section("structured status channel and out-of-band skip");
       ok(
         "structured status publishes v:1 JSON under its own key",
         entries.length === 1 && entries[0]!.key === LIVELINESS_JSON_STATUS_KEY
-          && payload?.v === 1 && payload.ext === "0.5.7" && payload.event === "wait"
+          && payload?.v === 1 && payload.ext === EXTENSION_VERSION && payload.event === "wait"
           && payload.waitId === "wait-sample" && payload.periodId === "period-1"
           && payload.reason === "rate-limit" && payload.remainingMs === 724_000
           && payload.model?.id === "claude-sonnet-4-5" && payload.controlFile === "/tmp/limits-wait.control",

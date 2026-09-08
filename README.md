@@ -18,7 +18,7 @@ Restart Pi or run `/reload` after installing.
 - Intercepts the current runtime without registering synthetic providers; every retry and fallback re-enters Pi's normal provider/auth/base URL/configured-header composition, including OAuth refresh checks.
 - Reload-safe ownership ensures `/reload` transfers interception cleanly and aborts waits still owned by the previous extension instance. The interception has one process-global active extension owner, matching the interactive Pi CLI's single active session runtime lifecycle; SDK processes running multiple concurrent Pi sessions are not supported.
 - On rate-limit errors (`429`, `rate_limit`, `too many requests`, quota/reset messages), waits and retries in a loop.
-- Uses provider retry timing when exposed through response callbacks or provider errors (`retry-after`, `retry-after-ms`, `retry in ...`, reset messages).
+- Remembers provider retry timing exposed through response callbacks or provider errors (`retry-after`, `retry-after-ms`, `retry in ...`, reset messages). With fallback probing enabled, explicit Retry-After deadlines may intentionally be probed early; set the probe interval to `0` to honor those deadlines (unless a wait is manually skipped).
 - If no retry timing is available for a rate limit, waits 30 minutes before retrying.
 - On `server_is_overloaded`, waits 5 minutes, then retries. If the provider is still overloaded after Pi's normal retries, it waits another 5 minutes and repeats.
 - On transient network/transport failures — including undici idle-timeout aborts (`UND_ERR_HEADERS_TIMEOUT` / `UND_ERR_BODY_TIMEOUT`), `fetch failed`, `terminated`, `ECONNRESET`, `ETIMEDOUT`, etc. — treats the error as retryable with a short backoff (default 15s, or the provider's `retry-after`) instead of giving up. This prevents a stalled streaming request from turning into a silent hang.
@@ -69,25 +69,25 @@ The prose key `oira666.pi-limits-wait` is **unchanged** in text, key, cadence an
 `statusText` is one minified JSON line:
 
 ```json
-{"v":1,"ext":"0.5.7","event":"wait","waitId":"wait-mfk3z1-7","periodId":"period-3","reason":"rate-limit","message":"⏳ pi-limits-wait: rate limited on anthropic/claude-sonnet-4-5; still alive, waiting 12m 04s before the next retry. Why: HTTP 429 retry-after-ms 724000","error":"HTTP 429 retry-after-ms 724000","model":{"provider":"anthropic","id":"claude-sonnet-4-5"},"plannedDurationMs":1800000,"plannedDeadline":1786000000000,"startedAt":1785998200000,"remainingMs":724000,"attempt":null,"maxAttempts":null,"livelinessIntervalMs":15000,"controlFile":"/tmp/ram-pi-.../limits-wait.control"}
+{"v":1,"ext":"0.6.0","event":"wait","waitId":"wait-mfk3z1-7","periodId":"period-3","reason":"rate-limit","message":"⏳ pi-limits-wait: rate limited on anthropic/claude-sonnet-4-5; still alive, waiting 12m 04s before the next retry. Why: HTTP 429 retry-after-ms 724000","error":"HTTP 429 retry-after-ms 724000","model":{"provider":"anthropic","id":"claude-sonnet-4-5"},"plannedDurationMs":1800000,"plannedDeadline":1786000000000,"startedAt":1785998200000,"remainingMs":724000,"attempt":null,"maxAttempts":null,"livelinessIntervalMs":15000,"controlFile":"/tmp/ram-pi-.../limits-wait.control"}
 ```
 
 End of a wait (published once, immediately before both keys are cleared):
 
 ```json
-{"v":1,"ext":"0.5.7","event":"wait_end","waitId":"wait-mfk3z1-7","reason":"rate-limit","message":"…","error":"…","plannedDurationMs":1800000,"plannedDeadline":1786000000000,"startedAt":1785998200000,"remainingMs":0,"attempt":null,"maxAttempts":null,"livelinessIntervalMs":15000,"controlFile":"…","outcome":"skipped","actualElapsedMs":41233}
+{"v":1,"ext":"0.6.0","event":"wait_end","waitId":"wait-mfk3z1-7","reason":"rate-limit","message":"…","error":"…","plannedDurationMs":1800000,"plannedDeadline":1786000000000,"startedAt":1785998200000,"remainingMs":0,"attempt":null,"maxAttempts":null,"livelinessIntervalMs":15000,"controlFile":"…","outcome":"skipped","actualElapsedMs":41233}
 ```
 
 Terminal give-up (the extension has stopped retrying and surfaces the final error):
 
 ```json
-{"v":1,"ext":"0.5.7","event":"give_up","waitId":null,"reason":null,"message":"anthropic/claude-sonnet-4-5 failed and pi-limits-wait is not retrying: …","error":"…","plannedDurationMs":null,"plannedDeadline":null,"startedAt":null,"remainingMs":null,"attempt":null,"maxAttempts":null,"livelinessIntervalMs":15000,"controlFile":"…"}
+{"v":1,"ext":"0.6.0","event":"give_up","waitId":null,"reason":null,"message":"anthropic/claude-sonnet-4-5 failed and pi-limits-wait is not retrying: …","error":"…","plannedDurationMs":null,"plannedDeadline":null,"startedAt":null,"remainingMs":null,"attempt":null,"maxAttempts":null,"livelinessIntervalMs":15000,"controlFile":"…"}
 ```
 
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `v` | `1` | Payload schema version. Bumped only on a breaking change. |
-| `ext` | string | Extension version that produced the frame, e.g. `"0.5.7"`. |
+| `ext` | string | Extension version that produced the frame, e.g. `"0.6.0"`. |
 | `event` | `"wait"` \| `"wait_end"` \| `"give_up"` | Liveliness tick, end of a wait, or terminal give-up. |
 | `waitId` | string \| null | Correlates every frame of one wait. `null` only for `give_up`. |
 | `periodId` | string (optional) | Retry-period id, when the wait belongs to one. |
@@ -207,6 +207,7 @@ Example:
 
 ```json
 {
+  "probe-interval-seconds": 60,
   "fallback-models": [
     {
       "provider": "anthropic",
@@ -221,21 +222,32 @@ Example:
 }
 ```
 
+`fallback-models` is an ordered priority list: the entry closest to the top is preferred whenever it is usable.
+
 Each `fallback-models` entry supports:
 
 - `provider` — required. The Pi provider name, for example `anthropic`, `openai`, `google`, etc.
 - `modelname` — required. The model id/name as Pi knows it.
 - `reasoning effort` — optional. One of `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. If omitted, Pi's current/default reasoning level is used.
 
-Fallback behavior:
+Top-level settings keys:
 
-1. Pi starts with the normal default or user-selected model.
-2. If that model is rate-limited, the extension tries models in this order:
-   - the original default/user-selected model;
-   - then every model from `fallback-models`, top to bottom.
-3. The first model that responds without a rate-limit becomes the active Pi model for the rest of the session/task.
-4. If that model later becomes rate-limited too, the extension starts again from the same ordered list.
-5. Rate-limit reset times are remembered only in memory, so known-limited models are skipped until their countdown expires. This memory is cleared when Pi restarts.
+- `probe-interval-seconds` — optional. How often a limited/frozen higher-priority model is re-probed. Default `60`, `0` disables probing. `PI_LIMITS_WAIT_PROBE_INTERVAL` overrides it. Both sources accept only safe non-negative integers (numeric strings are also accepted); values above 2147483 seconds are capped. Invalid file values use the default, and invalid environment values use the file value or default.
+
+Fallback behavior — strict priority, highest first:
+
+1. When the default/user-selected model is listed, `fallback-models` is authoritative, top to bottom—even if that selected model is lower in the list. A selection **outside** the list stays first; only on its failure does the configured fallback list apply. Unrelated model calls and internal synthetic models are not rerouted.
+2. Every LLM call restarts from the top of that order. The highest-priority model that is not known to be unavailable is used, so the first model runs whenever it can, and a lower-priority model is used **only** while every model above it is unavailable — and only for as long as that stays true.
+3. If the active model becomes rate-limited, the extension immediately moves down to the next usable model in the order.
+4. As soon as a higher-priority model works again, the next call goes back to it and Pi's active model is switched back automatically. That happens in three ways:
+   - the remembered limit for that model expires;
+   - the model answers a probe (see below);
+   - successful output clears the limit/freeze known when its attempt began, but never a newer concurrent failure. Committed streams are never interrupted to reclaim a model.
+5. A still-limited higher-priority model is eligible for a probe every **`probe-interval-seconds`** (default 60s), on the next LLM call or while waiting with all candidates blocked. This intentionally permits early probes even before an explicit provider `Retry-After` deadline; `0` disables early probes and honors remembered deadlines unless manually skipped. A probe is one normal request sent to that model instead of the current fallback:
+   - if it succeeds, the model is reclaimed immediately and the request continues on it;
+   - if it fails before output is committed, it costs just one attempt—even for HTTP 403, network or unknown errors—then falls back down the order and postpones the next probe by another interval. Abort and context-overflow errors remain terminal rather than triggering fallback. With freezing disabled, unknown/HTTP 403 probe failures only postpone probes of the existing limit (without extending its deadline or creating a freeze); that candidate is exhausted for the current request. Exhausted and not-yet-due blocked candidates are skipped, and if no eligible candidate remains the unknown error is surfaced rather than looping or waiting on a freeze.
+6. When *every* configured model is unavailable, the extension waits — but only until the earliest deadline **or the next due probe**, whichever comes first, so recovery is never delayed by a long remembered deadline.
+7. Rate-limit/freeze memory lives only in memory and is cleared when Pi restarts.
 
 The extension rereads these files before every LLM call, so changes made during a long-running task take effect on the next LLM call without restarting Pi or using `/reload`. Tool calls do not trigger a settings read. When the settings are loaded, the extension shows the full usable fallback model list. When models become rate-limited, it reports the wait in chat notifications.
 
@@ -249,6 +261,7 @@ The extension rereads these files before every LLM call, so changes made during 
 | `PI_LIMITS_WAIT_LIVELINESS_INTERVAL` | `15` | Seconds between liveliness notifications published while waiting in non-interactive (`rpc`/`json`) modes. Must be a non-negative integer; values below 1 second are clamped to 1 second. Ignored in TUI mode. Also drives the structured status channel and is reported inside it as `livelinessIntervalMs`. |
 | `PI_LIMITS_WAIT_STATUS_JSON` | `true` | Whether the machine-readable status channel (`statusKey` `oira666.pi-limits-wait.json`) is published in non-interactive modes. Set to `false` (also accepts `0`, `no`, `off`) to restore exact 0.5.6 wire behavior. The prose channel is never affected. |
 | `PI_LIMITS_WAIT_CONTROL_FILE` | *(unset)* | Absolute path of the out-of-band control file polled once per second **while waiting**, used by the host to skip the current wait and retry immediately. Unset disables the feature and all filesystem access. See [Skipping a wait from the host](#skipping-a-wait-from-the-host). |
+| `PI_LIMITS_WAIT_PROBE_INTERVAL` | `60` | Seconds between re-probes of a higher-priority model that is still remembered as rate-limited or frozen. Lower values return to the preferred model sooner at the cost of more rejected probe requests; `0` disables probing, so a model is only reconsidered when its remembered deadline expires. Overrides the `probe-interval-seconds` settings key. Must be a safe non-negative integer; fractions, Infinity and unsafe values are rejected. Both file and environment values above 2147483 seconds are capped to Node's reliable timeout range. Invalid environment values use the file setting (or default). |
 | `PI_LIMITS_WAIT_RETRY_INTERVAL` | `5` | Seconds to wait between unclassified/unknown provider-error retries. Must be a non-negative integer (values above 2147483 are capped to Node's maximum reliable timer delay). This does not affect model-limit wait intervals. |
 | `PI_LIMITS_WAIT_FREEZING_ENABLED` | `true` | When a model keeps failing with a non-retryable error, it is normally "frozen" for 10 minutes and skipped in favour of other configured models. Set this to `false` (also accepts `0`, `no`, `off`) to disable freezing entirely: the extension will instead try each configured candidate once (after the bounded retries) and then surface the error, never blocking on a long "model-frozen" wait. Useful for non-interactive / subagent runs where no one can press Enter to skip. |
 

@@ -1,4 +1,5 @@
 import { ModelRuntime, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { DEFAULT_PROBE_INTERVAL_MS } from "./constants.js";
 import {
   createAssistantMessageEventStream,
   isContextOverflow,
@@ -12,16 +13,20 @@ import {
   type ProviderResponse,
 } from "@earendil-works/pi-ai";
 import {
-  candidateOrder,
+  clearUnavailability,
+  blockedState,
+  markProbeAttempt,
+  nextAttemptCandidate as findAttemptCandidate,
+  postponeProbe,
+  unavailabilitySnapshot,
   configuredAttempt,
-  earliestCandidateDeadline,
+  earliestCandidateWakeup as findCandidateWakeup,
   fallbackEnabled,
   formatModel,
   getPrimaryModel,
   initialAttempt,
   isFallbackEligibleModel,
   modelKey,
-  nextAvailableCandidate,
   notifyRetryableError,
   notifyRetryingAfterError,
   rememberNonRetryableFailure,
@@ -49,8 +54,13 @@ export function __setNonRetryableTuningForTests(maxAttempts: number, retryDelayM
   state.nonRetryableRetryDelayMs = retryDelayMs;
 }
 
+export function __setProbeIntervalForTests(ms: number): void {
+  state.probeIntervalMs = ms;
+}
+
 export function __configureFallbackModelsForTests(models: FallbackModel[], ctx?: ExtensionContext): void {
   state.fallbackModels = models;
+  state.probeIntervalMs = DEFAULT_PROBE_INTERVAL_MS;
   state.sharedCtx = ctx;
   state.primaryModel = undefined;
   state.primaryThinkingLevel = undefined;
@@ -194,11 +204,19 @@ export function streamWithLimitsRetry(
     let finished = false;
     const allowFallback = fallbackEnabled() && isFallbackEligibleModel(model);
     let attempt: FallbackModel = allowFallback
-      ? initialAttempt(model)
+      ? initialAttempt(model) ?? configuredAttempt(model)
       : { model, reasoningEffort: state.primaryThinkingLevel };
     const nonRetryableAttempts = new Map<string, number>();
     const triedModels = new Set<string>();
+    let lastExhaustedFailure: string | undefined;
+    // Exhaustion is request-local when freezing is disabled. Every selection,
+    // including invocation-time re-selection, must use the same exclusions.
+    const exclusions = () => freezingEnabled() ? undefined : triedModels;
+    const nextAttemptCandidate = (current: Model<Api>) => findAttemptCandidate(current, exclusions());
+    const nextAvailableCandidate = (current: Model<Api>) => nextAttemptCandidate(current)?.entry;
+    const earliestCandidateWakeup = (current: Model<Api>) => findCandidateWakeup(current, exclusions());
     let observedUserModelSelection = state.userModelSelectionGeneration;
+    let forceAttemptAfterSkip = false;
 
     const prepareAttemptForPi = async (): Promise<boolean> => {
       const originalKey = modelKey(model);
@@ -224,7 +242,7 @@ export function streamWithLimitsRetry(
       // The selection may have happened after this attempt started but before
       // its failure reached us, when there was no active wait to wake.
       if (observedUserModelSelection !== state.userModelSelectionGeneration) return "skipped" as const;
-      return waitForRetry(reason, waitMs, signal, {
+      const outcome = await waitForRetry(reason, waitMs, signal, {
         periodId: retryPeriod?.periodId,
         model: attempt.model,
         error,
@@ -232,6 +250,8 @@ export function streamWithLimitsRetry(
         ...(counters ?? {}),
         onEnd: (elapsedMs) => retryPeriod?.recordWait(elapsedMs),
       });
+      forceAttemptAfterSkip = outcome === "skipped";
+      return outcome;
     };
 
     const flush = (buffer: AssistantMessageEvent[]) => {
@@ -259,10 +279,11 @@ export function streamWithLimitsRetry(
         observedUserModelSelection = state.userModelSelectionGeneration;
         const selected = state.primaryModel ?? state.sharedCtx?.model;
         if (selected) {
-          // User model selection always supersedes the retry/fallback attempt
-          // chosen before the wait. Subsequent retries start from that model.
-          attempt = configuredAttempt(selected);
+          // New selections supersede the old attempt. Listed selections still
+          // obey configured priority; an out-of-list selection stays first.
+          attempt = allowFallback ? initialAttempt(selected) ?? configuredAttempt(selected) : configuredAttempt(selected);
           triedModels.clear();
+          lastExhaustedFailure = undefined;
         }
       }
 
@@ -270,6 +291,27 @@ export function streamWithLimitsRetry(
         pushAbort("Operation aborted before provider attempt.");
         return;
       }
+
+      // Selection is pure. Recheck and reserve synchronously after cancellation,
+      // immediately before provider invocation (no await between here and delegate).
+      let probe = false;
+      if (allowFallback && (exclusions()?.has(modelKey(attempt.model)) || (!forceAttemptAfterSkip && blockedState(attempt.model)))) {
+        const next = nextAttemptCandidate(attempt.model);
+        if (!next) {
+          if (!freezingEnabled() && lastExhaustedFailure) throw new Error(lastExhaustedFailure);
+          const wakeup = earliestCandidateWakeup(attempt.model)!;
+          const wait = await managedWait("model-frozen", Math.max(0, wakeup - Date.now()), "All configured models are unavailable.");
+          if (wait === "aborted" || signal?.aborted) {
+            pushAbort("Request aborted while all fallback models were unavailable.");
+            return;
+          }
+          continue;
+        }
+        attempt = next.entry;
+        probe = next.probe;
+      }
+      forceAttemptAfterSkip = false;
+      const availability = unavailabilitySnapshot(attempt.model);
 
       const buffer: AssistantMessageEvent[] = [];
       let retryable: RetryableError | undefined;
@@ -364,7 +406,12 @@ export function streamWithLimitsRetry(
           });
           if (!response.ok) observedHttpError = responseErrorMessage(observed);
         }, async () => {
+          if (signal?.aborted) {
+            pushAbort("Operation aborted before provider invocation.");
+            return;
+          }
           const currentOptions = attemptOptions(model, attempt, options, signal, onPayload, onResponse);
+          if (probe) markProbeAttempt(attempt.model);
           const inner = delegate.call(runtime, attempt.model, context, currentOptions);
           for await (const event of inner) {
             if (signal?.aborted) {
@@ -428,6 +475,10 @@ export function streamWithLimitsRetry(
                   pushAbort("Request aborted before switching model.");
                   return;
                 }
+                // This model just produced real output: it is usable again, so
+                // drop any remembered limit/freeze that would otherwise keep
+                // sending later requests to a lower-priority model.
+                clearUnavailability(attempt.model, availability);
                 await prepareAttemptForPi();
                 if (signal?.aborted) {
                   pushAbort("Request aborted while switching model.");
@@ -536,6 +587,22 @@ export function streamWithLimitsRetry(
         return;
       }
 
+      if (probe && !committed) {
+        // A probe is exactly one request, regardless of HTTP/network/unknown
+        // classification. Abort and context overflow have already terminated.
+        const failure = retryableErrorMessage || nonRetryableError?.message || "Provider stream ended without a terminal event.";
+        if (retryable || freezingEnabled()) {
+          if (retryable) rememberRateLimit(attempt.model, retryable, failure);
+          else rememberNonRetryableFailure(attempt.model, failure);
+          retryPeriod?.recordImmediateRetry(failure);
+          attempt = nextAvailableCandidate(attempt.model) ?? attempt;
+          continue;
+        }
+        // No-freeze mode still postpones the next probe of existing evidence,
+        // but unknown probe failures exhaust this candidate for this request.
+        postponeProbe(attempt.model);
+      }
+
       if (!retryable) {
         const failureEvent = nonRetryableError?.event;
         const failureMessage = nonRetryableError?.message ?? "Provider stream ended without a terminal event.";
@@ -565,11 +632,11 @@ export function streamWithLimitsRetry(
           output.end();
         };
 
-        if (!committed && state.unknownErrorWaitingEnabled) {
+        if (!committed && (state.unknownErrorWaitingEnabled || probe)) {
           const key = modelKey(attempt.model);
           const attempts = (nonRetryableAttempts.get(key) ?? 0) + 1;
           nonRetryableAttempts.set(key, attempts);
-          if (attempts < state.nonRetryableMaxAttempts) {
+          if (!probe && attempts < state.nonRetryableMaxAttempts) {
             notifyRetryingAfterError(attempt.model, state.nonRetryableRetryDelayMs, failureMessage);
             retryPeriod?.beginRetry(failureMessage);
             const wait = await managedWait("retry", state.nonRetryableRetryDelayMs, failureMessage, {
@@ -585,6 +652,7 @@ export function streamWithLimitsRetry(
           }
 
           triedModels.add(key);
+          lastExhaustedFailure = failureMessage;
           if (allowFallback) {
             if (freezingEnabled()) {
               rememberNonRetryableFailure(attempt.model, failureMessage);
@@ -594,10 +662,10 @@ export function streamWithLimitsRetry(
                 attempt = next;
                 continue;
               }
-              const deadline = earliestCandidateDeadline(attempt.model);
-              if (deadline) {
+              const wakeup = earliestCandidateWakeup(attempt.model);
+              if (wakeup) {
                 retryPeriod?.beginRetry(failureMessage);
-                const wait = await managedWait("model-frozen", Math.max(0, deadline - Date.now()), failureMessage);
+                const wait = await managedWait("model-frozen", Math.max(0, wakeup - Date.now()), failureMessage);
                 if (wait === "aborted" || signal?.aborted) {
                   pushAbort("Request aborted while all fallback models were frozen.");
                   return;
@@ -608,7 +676,7 @@ export function streamWithLimitsRetry(
                 continue;
               }
             } else {
-              const next = candidateOrder(attempt.model).find((entry) => !triedModels.has(modelKey(entry.model)));
+              const next = nextAvailableCandidate(attempt.model);
               if (next) {
                 retryPeriod?.recordImmediateRetry(failureMessage);
                 attempt = next;
@@ -641,8 +709,8 @@ export function streamWithLimitsRetry(
           attempt = next;
           continue;
         }
-        const deadline = earliestCandidateDeadline(attempt.model);
-        const waitMs = deadline ? Math.max(0, deadline - Date.now()) : retryable.waitMs;
+        const wakeup = earliestCandidateWakeup(attempt.model);
+        const waitMs = wakeup ? Math.max(0, wakeup - Date.now()) : retryable.waitMs;
         retryPeriod?.beginRetry(retryableErrorMessage);
         const wait = await managedWait(retryable.reason, waitMs, retryableErrorMessage);
         if (wait === "aborted" || signal?.aborted) {
