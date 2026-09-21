@@ -410,6 +410,7 @@ section("disable-all-waiting mode");
   const events = await collect(runtime.streamSimple(model, context));
   ok("disable-all mode surfaces the first provider failure without handling or waiting", attempts === 1 && events.at(-1)?.type === "error");
   ok("disable-all mode registers only prompt sanitisation", handlers.size === 1 && handlers.has("before_provider_request"));
+  ok("disable-all mode leaves Pi's cache-warming policy untouched", !handlers.has("cache_warming_decision"));
   ok("disable-all mode preserves normal Anthropic configured headers", calls.anthropic?.[0]?.options?.headers?.["x-anthropic"] === "configured");
 
   const identity = { type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude." };
@@ -913,6 +914,18 @@ section("retry-period session summary lifecycle");
 
   __configureFallbackModelsForTests([]);
   limitsWaitExtension(pi);
+  const warmingHandlers = handlers.get("cache_warming_decision") ?? [];
+  for (const action of ["warm", "stop"] as const) {
+    const result = await warmingHandlers[0]?.({
+      type: "cache_warming_decision",
+      warmCost: 0.01,
+      missCost: 1,
+      continuationProbability: 1,
+      action,
+    }, {}) as { action?: string } | undefined;
+    ok(`enabled retry interception vetoes cache warming when Pi proposes ${action}`, warmingHandlers.length === 1 && result?.action === "stop");
+  }
+  ok("cache-warming veto creates no retry summaries or wait telemetry", entries.length === 0 && telemetry.length === 0);
   state.unknownErrorWaitingEnabled = true;
   __setNonRetryableTuningForTests(3, 10);
   let attempts = 0;

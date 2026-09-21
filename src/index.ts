@@ -117,6 +117,14 @@ export default function (pi: ExtensionAPI) {
   const retrySummaries = new RetrySummaryCoordinator(pi);
   const releaseInterception = installModelRuntimeInterception(() => retrySummaries.createStream());
 
+  // Pi 0.86+ warms caches through the same runtime as foreground requests.
+  // Stop background refreshes before they can enter our retry/fallback logic.
+  // Keep the older Pi dependency range: its event registry accepts this hook
+  // but never emits it. The narrow overload bridges the pre-0.86 typings.
+  (pi as ExtensionAPI & {
+    on(event: "cache_warming_decision", handler: () => { action: "stop" }): void;
+  }).on("cache_warming_decision", () => ({ action: "stop" }));
+
   pi.on("model_select", (event, ctx) => {
     state.sharedCtx = ctx;
     if (consumeExpectedModelSelection(event.model)) return;

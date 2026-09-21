@@ -43,7 +43,7 @@ export const DEFAULT_LIVELINESS_INTERVAL_MS = 15 * 1_000; // 15 seconds
 export const LIVELINESS_JSON_STATUS_KEY = "oira666.pi-limits-wait.json";
 /** Payload schema version for LIVELINESS_JSON_STATUS_KEY. Bump only on a breaking change. */
 export const LIVELINESS_JSON_VERSION = 1;
-export const EXTENSION_VERSION = "0.6.0";
+export const EXTENSION_VERSION = "0.6.2";
 
 export const SETTINGS_FILE_NAME = "limits-wait.json";
 export const FALLBACK_MODELS_KEY = "fallback-models";
