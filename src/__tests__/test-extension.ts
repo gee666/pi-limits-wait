@@ -1,11 +1,12 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
-import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 import { mock } from "node:test";
 import { join } from "node:path";
 import { ModelRuntime, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   createAssistantMessageEventStream,
+  InMemoryCredentialStore,
   isContextOverflow,
   type Api,
   type AssistantMessage,
@@ -62,6 +63,9 @@ import { withAttemptResponseObserver } from "../response-observer.js";
 import { loadFallbackSettings } from "../settings.js";
 import { consumeExpectedModelSelection, expectModelSelection, state } from "../state.js";
 import { claimControlFile, createSerializedAsyncRunner } from "../ui.js";
+
+const testTmpRoot = fileURLToPath(new URL("../../tmp/", import.meta.url));
+mkdirSync(testTmpRoot, { recursive: true });
 
 let passed = 0;
 let failed = 0;
@@ -256,7 +260,7 @@ ok("preserves the unknown-error retry default", DEFAULT_UNKNOWN_ERROR_MAX_RETRIE
   state.sharedCtx = previousCtx;
 }
 {
-  const root = mkdtempSync(join(tmpdir(), "limits-wait-"));
+  const root = mkdtempSync(join(testTmpRoot, "limits-wait-"));
   try {
     const home = join(root, "home");
     const agent = join(root, "agent");
@@ -278,7 +282,7 @@ ok("preserves the unknown-error retry default", DEFAULT_UNKNOWN_ERROR_MAX_RETRIE
   }
 }
 {
-  const root = mkdtempSync(join(tmpdir(), "limits-wait-runtime-trust-"));
+  const root = mkdtempSync(join(testTmpRoot, "limits-wait-runtime-trust-"));
   try {
     mkdirSync(join(root, ".pi"), { recursive: true });
     writeFileSync(join(root, ".pi", "limits-wait.json"), JSON.stringify({
@@ -306,7 +310,7 @@ ok("preserves the unknown-error retry default", DEFAULT_UNKNOWN_ERROR_MAX_RETRIE
   }
 }
 {
-  const root = mkdtempSync(join(tmpdir(), "limits-wait-refresh-"));
+  const root = mkdtempSync(join(testTmpRoot, "limits-wait-refresh-"));
   try {
     const settingsDir = join(root, ".pi");
     mkdirSync(settingsDir, { recursive: true });
@@ -355,7 +359,8 @@ async function createRuntime(
   handlers: Record<string, (model: Model<Api>, options?: ModelsSimpleStreamOptions) => ReturnType<typeof streamFrom>>,
   calls: Record<string, ProviderCall[]>,
 ): Promise<ModelRuntime> {
-  const runtime = await ModelRuntime.create({ modelsPath: null, allowModelNetwork: false });
+  // Never load the developer's saved credentials or refresh real OAuth tokens.
+  const runtime = await ModelRuntime.create({ credentials: new InMemoryCredentialStore(), modelsPath: null, allowModelNetwork: false });
   for (const [provider, handler] of Object.entries(handlers)) {
     runtime.registerProvider(provider, {
       baseUrl: `https://${provider}.example/v1`,
@@ -1134,7 +1139,7 @@ section("installed OpenAI provider HTTP integration");
   try {
     const address = server.address();
     if (!address || typeof address === "string") throw new Error("test server did not bind");
-    const runtime = await ModelRuntime.create({ modelsPath: null, allowModelNetwork: false });
+    const runtime = await ModelRuntime.create({ credentials: new InMemoryCredentialStore(), modelsPath: null, allowModelNetwork: false });
     runtime.registerProvider("http-openai", {
       baseUrl: `http://127.0.0.1:${address.port}/v1`,
       apiKey: "local-test-key",
@@ -1174,7 +1179,7 @@ section("installed OpenAI provider HTTP integration");
 
     requests = 0;
     providerStatuses = [429, 200];
-    const overrideRuntime = await ModelRuntime.create({ modelsPath: null, allowModelNetwork: false });
+    const overrideRuntime = await ModelRuntime.create({ credentials: new InMemoryCredentialStore(), modelsPath: null, allowModelNetwork: false });
     overrideRuntime.registerProvider("runtime-override", {
       baseUrl: "https://pre-prepare.invalid/v1",
       apiKey: "override-key",
@@ -1289,6 +1294,130 @@ section("real ModelRuntime fallback and option isolation");
   ok("same-provider fallback isolates source credentials and provider options", !fallbackOptions?.headers?.authorization && !("SAME_SOURCE_SECRET" in (fallbackOptions?.env ?? {})) && !fallbackOptions?.headers?.["x-source-only"] && !fallbackOptions?.headers?.["x-source-transform"] && fallbackOptions?.sourceProviderOption === undefined);
   release();
   __configureFallbackModelsForTests([]);
+}
+
+section("manual model selection and wait interruption");
+{
+  type Handler = (event: any, ctx: ExtensionContext) => unknown;
+  const handlers = new Map<string, Handler>();
+  const top = { provider: "manual", id: "top", api: "openai-completions" } as Model<Api>;
+  const chosen = { ...top, id: "chosen" };
+  const outside = { ...top, id: "outside" };
+  const ctx = {
+    model: top,
+    ui: { notify: () => undefined, setWorkingMessage: () => undefined, setStatus: () => undefined },
+  } as unknown as ExtensionContext;
+  const select = async (model: Model<Api>, source = "set") => {
+    (ctx as { model: Model<Api> }).model = model;
+    await handlers.get("model_select")!({ model, source }, ctx);
+  };
+  const pi = {
+    on: (name: string, handler: Handler) => handlers.set(name, handler),
+    getThinkingLevel: () => "off",
+    setThinkingLevel: () => undefined,
+    setModel: async (model: Model<Api>) => { await select(model); return true; },
+    appendEntry: () => undefined,
+    events: { emit: () => undefined, on: () => () => undefined },
+  } as unknown as ExtensionAPI;
+  let calls: string[] = [];
+  let failure: string | undefined;
+  const delegate = ((model: Model<Api>) => {
+    calls.push(model.id);
+    return streamFrom([startEvent(model), failure && model.id !== "top"
+      ? errorEvent(model, failure) : doneEvent(model)]);
+  }) as Parameters<typeof streamWithLimitsRetry>[1];
+  const request = async () => {
+    calls = [];
+    const events = await collect(streamWithLimitsRetry({} as ModelRuntime, delegate, ctx.model!, context));
+    return { trace: calls.join(","), events };
+  };
+  const configure = () => {
+    __configureFallbackModelsForTests([{ model: top }, { model: chosen }], ctx);
+    state.primaryModel = top;
+    failure = undefined;
+  };
+  limitsWaitExtension(pi);
+  try {
+    configure();
+    await select(chosen, "restore");
+    ok("restoring a session model does not create a manual priority override", (await request()).trace === "top");
+    await select(chosen, "cycle");
+    ok("keyboard model cycling also creates a manual priority override", (await request()).trace === "chosen");
+    for (const model of [chosen, outside]) {
+      configure();
+      await select(model);
+      ok(`manual ${model.id} takes precedence over healthy top model`, (await request()).trace === model.id);
+      state.rateLimitMemory.set("manual/top", {
+        reason: "rate-limit", limitedAt: Date.now() - 60_001, deadline: Date.now() + 60_000,
+      });
+      ok(`manual ${model.id} suppresses higher-priority probes across calls`, (await request()).trace === model.id);
+      state.rateLimitMemory.clear();
+      failure = "HTTP 429 retry-after 60";
+      const fallback = await request();
+      ok(`manual ${model.id} failure restores configured priority`, fallback.trace === `${model.id},top`
+        && ctx.model === top && !state.manualModelOverride);
+      failure = undefined;
+      state.rateLimitMemory.clear();
+      ok(`recovered manual ${model.id} does not reclaim priority after failover`, (await request()).trace === "top");
+    }
+
+    configure();
+    await select(chosen);
+    failure = "unknown provider error";
+    __setNonRetryableTuningForTests(1, 0);
+    ok("exhausted unknown error also releases manual priority", (await request()).trace === "chosen,top");
+
+    configure();
+    for (const model of [top, chosen]) state.rateLimitMemory.set(`manual/${model.id}`, {
+      reason: "rate-limit", limitedAt: Date.now(), deadline: Date.now() + 60_000,
+    });
+    calls = [];
+    const controller = new AbortController();
+    const safety = setTimeout(() => controller.abort(), 2_000);
+    try {
+      const pending = collect(streamWithLimitsRetry({} as ModelRuntime, delegate, top, context, { signal: controller.signal }));
+      ok("manual-selection test starts in an all-blocked wait", state.activeWaitSkips.size > 0 && calls.length === 0);
+      await select(chosen);
+      const events = await pending;
+      ok("model selection wakes wait and tries the exact chosen model immediately", calls.join(",") === "chosen"
+        && events.at(-1)?.type === "done" && state.manualModelOverride === chosen);
+    } finally { controller.abort(); clearTimeout(safety); }
+
+    // An old in-flight failure must not overwrite the availability of a newer
+    // explicit selection, including selecting the same model again.
+    for (const staleError of ["HTTP 429 retry-after 60", "unknown provider error"]) {
+      configure();
+      await select(chosen);
+      const delayed = createAssistantMessageEventStream();
+      const retry = createAssistantMessageEventStream();
+      let onRetry!: () => void;
+      const retryStarted = new Promise<void>((resolve) => { onRetry = resolve; });
+      let first = true;
+      const pending = collect(streamWithLimitsRetry({} as ModelRuntime, (() => {
+        if (first) { first = false; return delayed; }
+        onRetry();
+        return retry;
+      }) as typeof delegate, chosen, context));
+      await select(chosen);
+      await request();
+      delayed.push(errorEvent(chosen, staleError));
+      delayed.end();
+      await retryStarted;
+      // Assert before the old request succeeds, which could clear stale memory.
+      const unblocked = !state.rateLimitMemory.has("manual/chosen") && !state.nonRetryableFailureMemory.has("manual/chosen");
+      const concurrent = await request();
+      ok(`stale ${staleError} cannot revoke or block a newer selection`, state.manualModelOverride === chosen
+        && unblocked && concurrent.trace === "chosen");
+      retry.push(doneEvent(chosen));
+      retry.end();
+      await pending;
+    }
+  } finally {
+    await handlers.get("session_shutdown")!({}, ctx);
+    __configureFallbackModelsForTests([]);
+    state.extensionApi = undefined;
+    __setNonRetryableTuningForTests(1_000_000, 5_000);
+  }
 }
 
 section("configured model priority and higher-priority probing");
@@ -1996,7 +2125,7 @@ section("end-to-end HTTP priority recovery");
   try {
     const address = server.address();
     if (!address || typeof address === "string") throw new Error("test server did not bind");
-    const runtime = await ModelRuntime.create({ modelsPath: null, allowModelNetwork: false });
+    const runtime = await ModelRuntime.create({ credentials: new InMemoryCredentialStore(), modelsPath: null, allowModelNetwork: false });
     for (const id of ["top", "spare"] as const) {
       runtime.registerProvider(id, {
         baseUrl: `http://127.0.0.1:${address.port}/${id}/v1`,
@@ -2091,7 +2220,7 @@ section("structured status channel and out-of-band skip");
     json: process.env.PI_LIMITS_WAIT_STATUS_JSON,
     disabled: process.env.PI_LIMITS_WAIT_DISABLE_ALL_WAITING,
   };
-  const root = mkdtempSync(join(tmpdir(), "limits-wait-control-"));
+  const root = mkdtempSync(join(testTmpRoot, "limits-wait-control-"));
   process.env.PI_LIMITS_WAIT_LIVELINESS_INTERVAL = "1";
   delete process.env.PI_LIMITS_WAIT_CONTROL_FILE;
   delete process.env.PI_LIMITS_WAIT_STATUS_JSON;

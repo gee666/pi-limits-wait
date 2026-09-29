@@ -1,3 +1,4 @@
+import { CustomEditor, type ExtensionContext, type SessionStartEvent } from "@earendil-works/pi-coding-agent";
 import { randomUUID } from "node:crypto";
 import { readFile, rename, unlink } from "node:fs/promises";
 import {
@@ -34,6 +35,51 @@ import {
   type WaitTelemetryOptions,
 } from "./telemetry.js";
 import type { RetryReason } from "./types.js";
+
+/**
+ * Install at session_start, never when a wait starts or ends: replacing the
+ * editor also moves focus and would otherwise dismiss an active picker.
+ * Intercept submissions, not terminal keys, so autocomplete and other focused
+ * components get to handle Enter first. Preserve an existing editor factory.
+ */
+export function installWaitRetryEditor(
+  ctx: ExtensionContext,
+  reason: SessionStartEvent["reason"] = "startup",
+): void {
+  if (ctx.mode !== "tui") return;
+  const previous = ctx.ui.getEditorComponent();
+  ctx.ui.setEditorComponent((tui, theme, keybindings) => {
+    const editor = previous?.(tui, theme, keybindings) ?? new CustomEditor(tui, theme, keybindings);
+    // Pi resets custom editors before reload and only transfers their text.
+    // Unlike startup/session switching, reload does not populate history after
+    // session_start. Seed our new default editor from the active branch only
+    // on reload; existing custom editors remain responsible for their history.
+    if (!previous && reason === "reload") {
+      for (const entry of ctx.sessionManager.getBranch()) {
+        if (entry.type !== "message" || entry.message.role !== "user") continue;
+        const content = entry.message.content;
+        const text = typeof content === "string"
+          ? content
+          : content.filter((block) => block.type === "text").map((block) => block.text).join("");
+        if (text) editor.addToHistory?.(text);
+      }
+    }
+    let onSubmit = editor.onSubmit;
+    // Pi assigns its submit callback after the factory returns.
+    Object.defineProperty(editor, "onSubmit", {
+      configurable: true,
+      get: () => (text: string) => {
+        if (!text.trim() && state.activeWaitSkips.size > 0) {
+          for (const skip of [...state.activeWaitSkips]) skip();
+          return;
+        }
+        onSubmit?.call(editor, text);
+      },
+      set: (handler: typeof editor.onSubmit) => { onSubmit = handler; },
+    });
+    return editor;
+  });
+}
 
 export function formatDuration(ms: number): string {
   const totalSecs = Math.max(0, Math.ceil(ms / 1_000));
@@ -452,10 +498,9 @@ export function waitForRetry(
       return;
     }
 
-    // Raw terminal listeners run before whichever component currently owns
-    // focus. Consuming Enter here would steal confirmation from built-in
-    // selectors such as /model. Model changes and the out-of-band control
-    // channel call this skip function directly instead.
+    // The session editor's empty-submit handler, model changes, and the
+    // out-of-band control channel share this skip function. No raw input hook:
+    // it would steal Enter from whichever picker currently owns focus.
     state.activeWaitSkips.add(skipWait);
 
     signal?.addEventListener("abort", onAbort);

@@ -21,6 +21,8 @@ export const state = {
   probeIntervalMs: DEFAULT_PROBE_INTERVAL_MS,
   primaryModel: undefined as Model<Api> | undefined,
   primaryThinkingLevel: undefined as ModelThinkingLevel | undefined,
+  manualModelOverride: undefined as Model<Api> | undefined,
+  manualModelOverrideReleased: false,
   expectedModelSelections: new Map<string, Set<symbol>>(),
   userModelSelectionGeneration: 0,
   activeWaitSkips: new Set<() => void>(),
@@ -62,6 +64,8 @@ export function resetRuntimeStateForTests(models: FallbackModel[], ctx?: Extensi
   state.sharedCtx = ctx;
   state.primaryModel = undefined;
   state.primaryThinkingLevel = undefined;
+  state.manualModelOverride = undefined;
+  state.manualModelOverrideReleased = false;
   state.rateLimitMemory.clear();
   state.nonRetryableFailureMemory.clear();
   state.expectedModelSelections.clear();

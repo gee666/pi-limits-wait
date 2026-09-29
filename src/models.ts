@@ -38,14 +38,16 @@ export function configuredAttempt(model: Model<Api>): FallbackModel {
 }
 
 /**
- * Listed models are authoritative, top to bottom. An explicitly selected
- * model outside the list stays first; the configured list is used only if
- * that selection fails. Unrelated calls are excluded by isFallbackEligibleModel.
+ * A manual choice stays first until it fails. Otherwise use configured priority.
+ * An unlisted startup model stays first until an explicit selection has failed.
+ * Unrelated calls are excluded by isFallbackEligibleModel.
  */
 export function candidateOrder(current: Model<Api>): FallbackModel[] {
   const primary = getPrimaryModel(current);
   const listed = state.fallbackModels.some((entry) => modelKey(entry.model) === modelKey(primary));
-  const order: FallbackModel[] = listed ? [] : [configuredAttempt(primary)];
+  const order: FallbackModel[] = state.manualModelOverride
+    ? [configuredAttempt(state.manualModelOverride)]
+    : listed || state.manualModelOverrideReleased ? [] : [configuredAttempt(primary)];
   const seen = new Set(order.map((entry) => modelKey(entry.model)));
   for (const entry of state.fallbackModels) {
     const key = modelKey(entry.model);

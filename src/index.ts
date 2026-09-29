@@ -1,9 +1,9 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { isInternalSyntheticModel } from "./models.js";
+import { isInternalSyntheticModel, modelKey } from "./models.js";
 import { sanitiseAnthropicPayloadSystem } from "./prompt.js";
 import { RetrySummaryCoordinator } from "./retry-summary.js";
 import { loadFallbackSettings } from "./settings.js";
-import { allWaitingDisabled, loadUnknownErrorRetrySettings } from "./ui.js";
+import { allWaitingDisabled, installWaitRetryEditor, loadUnknownErrorRetrySettings } from "./ui.js";
 import { consumeExpectedModelSelection, state } from "./state.js";
 import { disableModelRuntimeInterception, installModelRuntimeInterception } from "./stream.js";
 
@@ -125,11 +125,23 @@ export default function (pi: ExtensionAPI) {
     on(event: "cache_warming_decision", handler: () => { action: "stop" }): void;
   }).on("cache_warming_decision", () => ({ action: "stop" }));
 
+  pi.on("session_start", (event, ctx) => {
+    state.sharedCtx = ctx;
+    installWaitRetryEditor(ctx, event.reason);
+  });
+
   pi.on("model_select", (event, ctx) => {
     state.sharedCtx = ctx;
     if (consumeExpectedModelSelection(event.model)) return;
     if (isInternalSyntheticModel(event.model)) return;
     state.primaryModel = event.model;
+    state.manualModelOverride = event.source === "restore" ? undefined : event.model;
+    state.manualModelOverrideReleased = false;
+    // An explicit choice deserves a fresh attempt, even if previously blocked.
+    if (state.manualModelOverride) {
+      state.rateLimitMemory.delete(modelKey(event.model));
+      state.nonRetryableFailureMemory.delete(modelKey(event.model));
+    }
     state.primaryThinkingLevel = pi.getThinkingLevel();
     state.userModelSelectionGeneration++;
     // A user-selected model takes precedence over a pending retry. Wake every

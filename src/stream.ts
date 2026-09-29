@@ -64,6 +64,8 @@ export function __configureFallbackModelsForTests(models: FallbackModel[], ctx?:
   state.sharedCtx = ctx;
   state.primaryModel = undefined;
   state.primaryThinkingLevel = undefined;
+  state.manualModelOverride = undefined;
+  state.manualModelOverrideReleased = false;
   state.rateLimitMemory.clear();
   state.nonRetryableFailureMemory.clear();
   state.ambientStatusCleanup?.();
@@ -217,6 +219,15 @@ export function streamWithLimitsRetry(
     const earliestCandidateWakeup = (current: Model<Api>) => findCandidateWakeup(current, exclusions());
     let observedUserModelSelection = state.userModelSelectionGeneration;
     let forceAttemptAfterSkip = false;
+    const releaseManualOverride = () => {
+      // A stale failure must not revoke a newer choice, even of the same model.
+      if (observedUserModelSelection === state.userModelSelectionGeneration
+        && state.manualModelOverride
+        && modelKey(state.manualModelOverride) === modelKey(attempt.model)) {
+        state.manualModelOverride = undefined;
+        state.manualModelOverrideReleased = true;
+      }
+    };
 
     const prepareAttemptForPi = async (): Promise<boolean> => {
       const originalKey = modelKey(model);
@@ -279,9 +290,10 @@ export function streamWithLimitsRetry(
         observedUserModelSelection = state.userModelSelectionGeneration;
         const selected = state.primaryModel ?? state.sharedCtx?.model;
         if (selected) {
-          // New selections supersede the old attempt. Listed selections still
-          // obey configured priority; an out-of-list selection stays first.
-          attempt = allowFallback ? initialAttempt(selected) ?? configuredAttempt(selected) : configuredAttempt(selected);
+          // Try the user's exact choice, not the first configured candidate.
+          attempt = configuredAttempt(selected);
+          forceAttemptAfterSkip = true;
+          nonRetryableAttempts.clear();
           triedModels.clear();
           lastExhaustedFailure = undefined;
         }
@@ -503,7 +515,10 @@ export function streamWithLimitsRetry(
               continue;
             }
 
-            if (event.type === "error") retryPeriod?.recordReason(event.error.errorMessage ?? "Provider stream error");
+            if (event.type === "error") {
+              if (event.reason !== "aborted") releaseManualOverride();
+              retryPeriod?.recordReason(event.error.errorMessage ?? "Provider stream error");
+            }
             if (event.type === "done" || event.type === "error") {
               retryPeriod?.finalize();
               clearLivelinessStatus();
@@ -586,6 +601,10 @@ export function streamWithLimitsRetry(
         pushAbort("Request aborted before retry or fallback handling.");
         return;
       }
+
+      // A superseded attempt cannot freeze or limit the user's newer choice.
+      if (observedUserModelSelection !== state.userModelSelectionGeneration) continue;
+      releaseManualOverride();
 
       if (probe && !committed) {
         // A probe is exactly one request, regardless of HTTP/network/unknown
