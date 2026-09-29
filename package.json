@@ -1,6 +1,6 @@
 {
   "name": "oira666_pi-limits-wait",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "description": "Extension for PI that allows to automatically wait for limits to reset and retry the request",
   "type": "module",
   "exports": {
@@ -40,8 +40,8 @@
   },
   "dependencies": {},
   "peerDependencies": {
-    "@earendil-works/pi-ai": ">=0.80.10",
-    "@earendil-works/pi-coding-agent": ">=0.80.10"
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
   },
   "devDependencies": {
     "@earendil-works/pi-ai": "0.83.0",
