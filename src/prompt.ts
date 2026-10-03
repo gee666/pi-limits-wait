@@ -34,7 +34,8 @@ function isPiClaudeCodeIdentityBlock(block: unknown): block is SystemTextBlock {
  * current pi-ai runtime: the Claude Code identity is the first system block.
  * Looking only at that exact first block avoids treating a later user-authored
  * identity mention as proof of OAuth. The runtime remains solely responsible
- * for inserting the identity and selecting OAuth headers.
+ * for inserting the initial identity and selecting OAuth headers. Later system
+ * updates are sanitised too and repeat the identity alongside their instructions.
  */
 export function sanitiseAnthropicPayloadSystem(payload: unknown): unknown {
   if (!payload || typeof payload !== "object") return payload;
@@ -60,5 +61,50 @@ export function sanitiseAnthropicPayloadSystem(payload: unknown): unknown {
     }
   }
 
-  return changed ? { ...payload, system: newSystem } : payload;
+  // Pi 0.86+ can send prompt updates as system messages in the transcript.
+  // Only transform their text; tool additions/removals and conversation content
+  // must remain unchanged. Keep the OAuth guard above for every transformation.
+  const messages = (payload as { messages?: unknown }).messages;
+  const newMessages = Array.isArray(messages) ? messages.map((message: unknown) => {
+    if (!message || typeof message !== "object") return message;
+    const candidate = message as { role?: unknown; content?: unknown };
+    if (candidate.role !== "system") return message;
+
+    if (typeof candidate.content === "string") {
+      const cleaned = sanitiseSystemPrompt(candidate.content);
+      const content = cleaned ? `${CLAUDE_CODE_IDENTITY}\n\n${cleaned}` : CLAUDE_CODE_IDENTITY;
+      if (content === candidate.content) return message;
+      changed = true;
+      return { ...message, content };
+    }
+    if (!Array.isArray(candidate.content)) return message;
+
+    let messageChanged = false;
+    let hasIdentity = false;
+    const content = candidate.content.map((block: unknown) => {
+      if (!block || typeof block !== "object") return block;
+      const textBlock = block as SystemTextBlock;
+      if (textBlock.type !== "text" || typeof textBlock.text !== "string") return block;
+      const cleaned = sanitiseSystemPrompt(textBlock.text);
+      const text = hasIdentity ? cleaned
+        : cleaned ? `${CLAUDE_CODE_IDENTITY}\n\n${cleaned}` : CLAUDE_CODE_IDENTITY;
+      hasIdentity = true;
+      if (text === textBlock.text) return block;
+      messageChanged = true;
+      return { ...textBlock, text };
+    }).filter((block: unknown) => {
+      if (!block || typeof block !== "object") return true;
+      const candidate = block as SystemTextBlock;
+      return candidate.type !== "text" || candidate.text !== "";
+    });
+    if (!messageChanged) return message;
+    changed = true;
+    return { ...message, content };
+  }) : undefined;
+
+  return changed ? {
+    ...payload,
+    system: newSystem,
+    ...(newMessages ? { messages: newMessages } : {}),
+  } : payload;
 }

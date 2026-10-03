@@ -100,9 +100,9 @@ export type { FallbackModel } from "./types.js";
 
 export default function (pi: ExtensionAPI) {
   // Current pi-ai inserts the Claude Code identity as the first system block
-  // for Anthropic OAuth. Sanitise only that exact payload shape; authentication,
-  // identity insertion, Anthropic headers, and all other request composition
-  // remain owned by ModelRuntime.
+  // for Anthropic OAuth. Use that exact shape to guard sanitisation of the
+  // initial prompt and later system updates, which repeat the identity.
+  // Authentication, initial identity insertion, and headers remain runtime-owned.
   pi.on("before_provider_request", (event) => sanitiseAnthropicPayloadSystem(event.payload));
 
   // Keep prompt sanitisation and the runtime's normal Anthropic header path,

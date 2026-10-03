@@ -152,6 +152,41 @@ section("prompt sanitisation");
   ok("leaves API-key/non-OAuth payload shape untouched", sanitiseAnthropicPayloadSystem(apiKeyShape) === apiKeyShape);
 }
 
+{
+  const identity = { type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude." };
+  const piText = "You are an expert coding assistant operating inside pi, a coding agent harness.\n\nKeep this update.";
+  const user = { role: "user", content: piText };
+  const assistant = { role: "assistant", content: [{ type: "text", text: piText }] };
+  const toolBlock = { type: "tool_addition", tool: { name: "read" } };
+  const toolOnly = { role: "system", content: [toolBlock] };
+  const payload = {
+    system: [identity],
+    messages: [
+      user, assistant, toolOnly,
+      { role: "system", content: piText },
+      { role: "system", content: [
+        toolBlock,
+        { type: "text", text: piText, cache_control: { type: "ephemeral" } },
+        { type: "text", text: "You are pi, a coding agent." },
+      ] },
+      { role: "system", content: [{ type: "text", text: "pi-coding-agent docs" }] },
+    ],
+  };
+  const before = JSON.stringify(payload);
+  const result = sanitiseAnthropicPayloadSystem(payload) as any;
+  ok("later updates preserve the initial identity", result.system[0] === identity);
+  ok("leaves user, assistant, and tool-only messages untouched", result.messages[0] === user && result.messages[1] === assistant && result.messages[2] === toolOnly);
+  ok("sanitises string system updates and adds identity", result.messages[3].content.startsWith(identity.text) && !result.messages[3].content.includes("operating inside pi") && result.messages[3].content.includes("Keep this update."));
+  const blocks = result.messages[4].content;
+  ok("sanitises block updates and removes emptied text blocks", blocks.length === 2 && blocks[1].text.startsWith(identity.text) && !blocks[1].text.includes("operating inside pi"));
+  ok("preserves tool blocks and text block metadata", blocks[0] === toolBlock && blocks[1].cache_control.type === "ephemeral");
+  ok("identity remains when all update instructions are removed", result.messages[5].content[0].text === identity.text);
+  ok("prompt sanitisation does not mutate input", JSON.stringify(payload) === before);
+  ok("later system sanitisation is idempotent", sanitiseAnthropicPayloadSystem(result) === result);
+  const apiKey = { ...payload, system: [{ type: "text", text: "ordinary prompt" }] };
+  ok("later updates without OAuth identity remain untouched", sanitiseAnthropicPayloadSystem(apiKey) === apiKey);
+}
+
 section("retry classification");
 ok("detects 429", isRateLimitError("HTTP 429 Too Many Requests"));
 ok("detects overload", isServerOverloadedError("server_is_overloaded"));
