@@ -1,6 +1,7 @@
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { DEFAULT_NON_RETRYABLE_FREEZE_MS } from "./constants.js";
 import { expectModelSelection, state } from "./state.js";
+import { parseRetryDelayMs } from "./retry-errors.js";
 import type { FallbackModel, RetryableError } from "./types.js";
 import { formatErrorDetail, formatDuration, notifyLiveliness, reasonLabel } from "./ui.js";
 
@@ -82,19 +83,13 @@ export function notifyRetryingAfterError(model: Model<Api>, waitMs: number, erro
   notifyLiveliness(`${formatModel(model)} retrying after error in ${formatDuration(waitMs)}. Error: ${formatErrorDetail(errorMessage, Number.MAX_SAFE_INTEGER)}`);
 }
 
-function notifyProbe(model: Model<Api>, remainingMs: number): void {
-  const ctx = state.sharedCtx;
-  if (!ctx) return;
-  const remaining = remainingMs > 0 ? ` (${formatDuration(remainingMs)} left on its remembered limit)` : "";
-  try {
-    ctx.ui.notify(`Probing higher-priority model ${formatModel(model)}${remaining}.`, "info");
-  } catch { /* UI unavailable */ }
-}
-
-export function rememberRateLimit(model: Model<Api>, retryable: RetryableError, errorMessage?: string): void {
+export function rememberRateLimit(model: Model<Api>, retryable: RetryableError, errorMessage?: string, silent = false): void {
   const deadline = Date.now() + retryable.waitMs;
-  state.rateLimitMemory.set(modelKey(model), { reason: retryable.reason, limitedAt: Date.now(), deadline });
-  notifyRetryableError(model, retryable, errorMessage);
+  state.rateLimitMemory.set(modelKey(model), {
+    reason: retryable.reason, limitedAt: Date.now(), deadline,
+    explicitDeadline: errorMessage !== undefined && parseRetryDelayMs(errorMessage) !== undefined,
+  });
+  if (!silent) notifyRetryableError(model, retryable, errorMessage);
   ensureRateLimitedModelsStatus();
 }
 
@@ -118,9 +113,8 @@ export function probeIntervalMs(): number {
 /**
  * Remembered unusability of a model, merged across the rate-limit and frozen
  * memories, plus the moment it becomes worth re-probing. Remembered deadlines
- * are estimates (`retry-after` is often pessimistic, or absent and defaulted),
- * so a blocked model is re-probed periodically instead of being trusted until
- * its deadline.
+ * without provider timing are estimates and may be re-probed periodically.
+ * Explicit provider retry/reset deadlines must expire before any early probe.
  */
 export function blockedState(model: Model<Api>): { deadline: number; probeAt: number } | undefined {
   const limit = activeLimit(model);
@@ -134,7 +128,8 @@ export function blockedState(model: Model<Api>): { deadline: number; probeAt: nu
     frozen ? frozen.lastProbeAt ?? frozen.failedAt : 0,
   );
   const interval = probeIntervalMs();
-  const probeAt = interval > 0 ? Math.min(lastEvidence + interval, deadline) : deadline;
+  const estimatedProbeAt = interval > 0 ? Math.min(lastEvidence + interval, deadline) : deadline;
+  const probeAt = Math.max(limit?.explicitDeadline ? limit.deadline : 0, estimatedProbeAt);
   return { deadline, probeAt };
 }
 
@@ -158,9 +153,7 @@ export function clearUnavailability(model: Model<Api>, snapshot: ReturnType<type
 
 /** Record that a blocked model was just re-probed, so probes stay rate-limited. */
 export function markProbeAttempt(model: Model<Api>, now = Date.now()): void {
-  const remainingMs = (blockedState(model)?.deadline ?? now) - now;
   postponeProbe(model, now);
-  notifyProbe(model, remainingMs);
 }
 
 /** Postpone probing existing evidence without creating or extending a freeze. */
@@ -198,10 +191,10 @@ export function nextAvailableCandidate(current: Model<Api>, excluded?: ReadonlyS
   return nextAttemptCandidate(current, excluded)?.entry;
 }
 
-export function rememberNonRetryableFailure(model: Model<Api>, errorMessage: string): void {
+export function rememberNonRetryableFailure(model: Model<Api>, errorMessage: string, silent = false): void {
   const deadline = Date.now() + DEFAULT_NON_RETRYABLE_FREEZE_MS;
   state.nonRetryableFailureMemory.set(modelKey(model), { failedAt: Date.now(), deadline, errorMessage });
-  notifyLiveliness(`${formatModel(model)} failed (${formatErrorDetail(errorMessage)}); freezing it for ${formatDuration(DEFAULT_NON_RETRYABLE_FREEZE_MS)} and trying another configured model if available.`);
+  if (!silent) notifyLiveliness(`${formatModel(model)} failed (${formatErrorDetail(errorMessage)}); freezing it for ${formatDuration(DEFAULT_NON_RETRYABLE_FREEZE_MS)} and trying another configured model if available.`);
   ensureRateLimitedModelsStatus();
 }
 

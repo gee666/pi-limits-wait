@@ -25,8 +25,8 @@ export const DEFAULT_OVERLOADED_WAIT_MS = 5 * 60 * 1_000; // 5 minutes
 export const DEFAULT_NETWORK_WAIT_MS = 15 * 1_000; // 15 seconds
 export const DEFAULT_NON_RETRYABLE_FREEZE_MS = 10 * 60 * 1_000; // 10 minutes
 
-// A model that is currently limited/frozen is re-probed this often, so a
-// higher-priority model can be reclaimed long before its remembered deadline.
+// Estimated limits/freezes may be silently re-probed this often. Explicit
+// provider retry/reset deadlines always prevent early probes.
 export const DEFAULT_PROBE_INTERVAL_MS = 60 * 1_000; // 1 minute
 
 // Unknown provider errors are retried separately from rate-limit, overload,
@@ -43,7 +43,7 @@ export const DEFAULT_LIVELINESS_INTERVAL_MS = 15 * 1_000; // 15 seconds
 export const LIVELINESS_JSON_STATUS_KEY = "oira666.pi-limits-wait.json";
 /** Payload schema version for LIVELINESS_JSON_STATUS_KEY. Bump only on a breaking change. */
 export const LIVELINESS_JSON_VERSION = 1;
-export const EXTENSION_VERSION = "0.6.5";
+export const EXTENSION_VERSION = "0.6.6";
 
 export const SETTINGS_FILE_NAME = "limits-wait.json";
 export const FALLBACK_MODELS_KEY = "fallback-models";

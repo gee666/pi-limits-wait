@@ -30,6 +30,8 @@ export type RateLimitMemory = {
   reason: RetryReason;
   limitedAt: number;
   deadline: number;
+  /** Provider supplied retry/reset timing; never probe before this deadline. */
+  explicitDeadline?: boolean;
   /** Last time this model was re-probed while still remembered as limited. */
   lastProbeAt?: number;
 };

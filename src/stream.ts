@@ -611,8 +611,8 @@ export function streamWithLimitsRetry(
         // classification. Abort and context overflow have already terminated.
         const failure = retryableErrorMessage || nonRetryableError?.message || "Provider stream ended without a terminal event.";
         if (retryable || freezingEnabled()) {
-          if (retryable) rememberRateLimit(attempt.model, retryable, failure);
-          else rememberNonRetryableFailure(attempt.model, failure);
+          if (retryable) rememberRateLimit(attempt.model, retryable, failure, true);
+          else rememberNonRetryableFailure(attempt.model, failure, true);
           retryPeriod?.recordImmediateRetry(failure);
           attempt = nextAvailableCandidate(attempt.model) ?? attempt;
           continue;

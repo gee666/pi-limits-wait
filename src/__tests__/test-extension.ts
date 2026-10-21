@@ -1472,10 +1472,11 @@ section("configured model priority and higher-priority probing");
   const third = model("third");
   const status: Record<string, "ok" | "limited"> = { primary: "ok", second: "ok", third: "ok" };
   let calls: string[] = [];
+  const probeNotes: string[] = [];
   const mutableCtx = {
     model: primary,
     ui: {
-      notify: () => undefined,
+      notify: (message: string) => { probeNotes.push(message); },
       setWorkingMessage: () => undefined,
       setStatus: () => undefined,
       getEditorText: () => "",
@@ -1487,7 +1488,7 @@ section("configured model priority and higher-priority probing");
     calls.push(requested.id);
     return status[requested.id] === "ok"
       ? streamFrom([startEvent(requested), doneEvent(requested)])
-      : streamFrom([startEvent(requested), errorEvent(requested, "HTTP 429 retry-after 60")]);
+      : streamFrom([startEvent(requested), errorEvent(requested, "HTTP 429 rate_limit_error")]);
   }) as Parameters<typeof streamWithLimitsRetry>[1];
   const request = async (from: Model<Api>) => {
     calls = [];
@@ -1537,8 +1538,32 @@ section("configured model priority and higher-priority probing");
     );
   }
 
+  for (const failure of [
+    "HTTP 429 retry-after-ms 4711000",
+    "HTTP 429 retry-after 76111",
+    "HTTP 429 retry in 2h",
+    "rate_limit_error reset after 1h18m31s",
+  ]) {
+    configure([primary, second], 60_000);
+    const events = await collect(streamWithLimitsRetry({} as ModelRuntime, ((requested: Model<Api>) => {
+      if (requested === primary) throw new Error(failure);
+      return streamFrom([doneEvent(requested)]);
+    }) as typeof delegate, primary, context));
+    const limit = state.rateLimitMemory.get("prio/primary")!;
+    limit.limitedAt = Date.now() - 120_000;
+    const blocked = blockedState(primary)!;
+    const continued = await request(second);
+    ok(`explicit timing blocks probes until reset: ${failure}`,
+      events.at(-1)?.type === "done" && limit.explicitDeadline === true
+        && blocked.probeAt === limit.deadline && earliestCandidateWakeup(primary) === limit.deadline
+        && continued.trace === "second");
+    limit.deadline = Date.now() - 1;
+    status.primary = "ok";
+    ok(`explicit deadline expiry restores normal priority: ${failure}`, (await request(second)).trace === "primary");
+  }
+
   {
-    // The remembered deadline is only an estimate, so a still-limited primary
+    // Without provider timing the deadline is only an estimate, so a still-limited primary
     // is re-probed and reclaimed as soon as it actually answers.
     configure([second], 60_000);
     status.primary = "limited";
@@ -1563,8 +1588,10 @@ section("configured model priority and higher-priority probing");
     status.primary = "limited";
     await request(primary);
     makeProbesDue();
+    probeNotes.length = 0;
     const failedProbe = await request(mutableCtx.model!);
     const postponed = await request(mutableCtx.model!);
+    ok("failed rate-limit probes are invisible", probeNotes.length === 0, probeNotes.join("\n"));
     ok(
       "a failed probe falls back again and postpones the next probe",
       failedProbe.trace === "primary,second" && postponed.trace === "second"
@@ -1608,23 +1635,27 @@ section("configured model priority and higher-priority probing");
     } finally { clearTimeout(timeout); controller.abort(); }
   }
 
-  {
+  for (const explicitDeadline of [false, true]) {
     configure([primary, second], 60_000);
     const controller = new AbortController();
     const safety = setTimeout(() => controller.abort(), 2_000);
     mock.timers.enable({ apis: ["Date", "setTimeout", "setInterval"], now: Date.now() });
     try {
       for (const entry of [primary, second]) state.rateLimitMemory.set(`prio/${entry.id}`, {
-        reason: "rate-limit", limitedAt: Date.now(), deadline: Date.now() + 3_600_000,
+        reason: "rate-limit", limitedAt: Date.now(), deadline: Date.now() + 3_600_000, explicitDeadline,
       });
       status.primary = "ok";
       calls = [];
       const pending = collect(streamWithLimitsRetry({} as ModelRuntime, delegate, primary, context, { signal: controller.signal }));
       mock.timers.tick(59_999);
-      ok("all-blocked initial wait does not invoke a provider before the probe is due", calls.length === 0);
+      ok(`all-blocked wait invokes no provider before the probe interval (explicit=${explicitDeadline})`, calls.length === 0);
+      if (explicitDeadline) {
+        mock.timers.tick(3_540_000);
+        ok("all-blocked explicit deadlines prevent probes until one millisecond before reset", calls.length === 0);
+      }
       mock.timers.tick(1);
       const events = await pending;
-      ok("all-blocked wait wakes exactly at the early probe, not Retry-After", calls.join(",") === "primary" && events.at(-1)?.type === "done");
+      ok(`all-blocked wait wakes at ${explicitDeadline ? "the provider deadline" : "the early probe"}`, calls.join(",") === "primary" && events.at(-1)?.type === "done");
     } finally { controller.abort(); mock.timers.reset(); clearTimeout(safety); }
   }
 
@@ -1692,6 +1723,7 @@ section("configured model priority and higher-priority probing");
 
   for (const failure of ["HTTP 403 Forbidden", "fetch failed", "unclassified provider failure"]) {
     configure([primary, second], 60_000);
+    probeNotes.length = 0;
     state.rateLimitMemory.set("prio/primary", { reason: "rate-limit", limitedAt: Date.now() - 60_001, deadline: Date.now() + 3_600_000 });
     calls = [];
     const controller = new AbortController();
@@ -1702,6 +1734,7 @@ section("configured model priority and higher-priority probing");
         if (requested === primary) throw new Error(failure);
         return streamFrom([doneEvent(requested)]);
       }) as typeof delegate, second, context, { signal: controller.signal }));
+      ok(`failed probe is invisible: ${failure}`, probeNotes.length === 0, probeNotes.join("\n"));
       ok(`failed probe bypasses normal retry loops: ${failure}`, calls.join(",") === "primary,second" && events.at(-1)?.type === "done"
         && nextAttemptCandidate(primary)?.entry.model === second);
     } finally { clearTimeout(timeout); controller.abort(); }
@@ -2145,7 +2178,7 @@ section("end-to-end HTTP priority recovery");
     const id = request.url?.includes("/top/") ? "top" : "spare";
     requests.push(id);
     if (limited.has(id)) {
-      // A pessimistic one-hour reset: only probing can reclaim this model.
+      // An explicit one-hour reset must suppress early probes.
       response.writeHead(429, { "content-type": "application/json", "retry-after": "3600" });
       response.end(JSON.stringify({ error: { message: "limited", type: "rate_limit_error" } }));
       return;
@@ -2196,10 +2229,14 @@ section("end-to-end HTTP priority recovery");
     const second = await ask("two");
     for (const limit of state.rateLimitMemory.values()) limit.limitedAt = Date.now() - 60_001;
     limited.delete("top");
+    const stillBlocked = await ask("before reset");
+    ok("real HTTP Retry-After prevents early probes even after the probe interval",
+      stillBlocked.trace === "spare" && state.rateLimitMemory.get("top/top-model")?.explicitDeadline === true);
+    state.rateLimitMemory.get("top/top-model")!.deadline = Date.now() - 1;
     const third = await ask("three");
     const fourth = await ask("four");
     ok(
-      "over real HTTP a 429'd top model hands over, is probed, and takes traffic back",
+      "over real HTTP a 429'd top model hands over and takes traffic back after reset",
       first.trace === "top,spare" && first.model === "spare-model"
         && second.trace === "spare" && second.model === "spare-model"
         && third.trace === "top" && third.model === "top-model"
