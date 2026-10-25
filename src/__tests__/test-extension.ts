@@ -58,7 +58,7 @@ import limitsWaitExtension, {
 } from "../index.js";
 import { DEFAULT_UNKNOWN_ERROR_MAX_RETRIES } from "../constants.js";
 import { isSkipToken } from "../status-json.js";
-import type { RateLimitMemory } from "../types.js";
+import type { RateLimitMemory, RuntimeStreamSimpleFn } from "../types.js";
 import { withAttemptResponseObserver } from "../response-observer.js";
 import { loadFallbackSettings } from "../settings.js";
 import { consumeExpectedModelSelection, expectModelSelection, state } from "../state.js";
@@ -851,6 +851,36 @@ for (const status of [400, 403] as const) {
 }
 __setNonRetryableTuningForTests(1_000_000, 5_000);
 
+section("ChatGPT Business workspace limits");
+for (const waiting of [false, true]) {
+  for (const thrown of [false, true]) {
+    for (const detail of [
+      "subscription_sharing_workplace_individual_usage_limit_exceeded",
+      "You've reached your ChatGPT workspace's usage limit. Ask your workspace admin to increase it at admin.openai.com → Workspace → Usage limits.",
+    ]) {
+      let attempts = 0;
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 500);
+      const failure = `HTTP 429 retry-after-ms 60000; ${detail}`;
+      state.unknownErrorWaitingEnabled = waiting;
+      __setNonRetryableTuningForTests(2, 0);
+      try {
+        const events = await collect(streamWithLimitsRetry({} as ModelRuntime, ((requested: Model<Api>) => {
+          attempts++;
+          if (thrown) throw new Error(failure);
+          return streamFrom([startEvent(requested), errorEvent(requested, failure)]);
+        }) as RuntimeStreamSimpleFn, { provider: "openai", id: "workspace", api: "openai-responses" } as Model<Api>, context, { signal: controller.signal }));
+        const terminal = events.at(-1);
+        ok(`workspace limit uses bounded retry-all policy (waiting=${waiting}, thrown=${thrown}, hint=${detail.startsWith("You've")})`,
+          attempts === (waiting ? 2 : 1) && terminal?.type === "error"
+            && terminal.reason === "error" && terminal.error.errorMessage?.includes(detail) === true);
+      } finally { clearTimeout(timeout); controller.abort(); }
+    }
+  }
+}
+state.unknownErrorWaitingEnabled = true;
+__setNonRetryableTuningForTests(1_000_000, 5_000);
+
 section("RPC-mode liveliness and terminal errors");
 {
   type Notification = { message: string; type?: string };
@@ -1145,6 +1175,34 @@ section("authentication and network retry semantics");
   __configureFallbackModelsForTests([]);
 }
 
+section("synthetic runtime calls stay outside fallback routing");
+{
+  const calls: Record<string, ProviderCall[]> = {};
+  const runtime = await createRuntime({
+    "pi-sentinel": (model) => streamFrom([doneEvent(model)]),
+    ordinary: (model) => streamFrom([doneEvent(model)]),
+    fallback: (model) => streamFrom([doneEvent(model)]),
+  }, calls);
+  const fallback = runtime.getModel("fallback", "fallback-model")!;
+  const syntheticProvider = runtime.getModel("pi-sentinel", "pi-sentinel-model")!;
+  const ordinary = runtime.getModel("ordinary", "ordinary-model")!;
+  const syntheticId = { ...ordinary, id: "synthetic-sentinel" };
+  __configureFallbackModelsForTests([{ model: fallback }]);
+  const release = installModelRuntimeInterception();
+  try {
+    const providerEvents = await collect(runtime.streamSimple(syntheticProvider, context));
+    // The ordinary provider implementation accepts the dispatched model; only
+    // its ID changes, matching Pi's internal synthetic-model naming convention.
+    const idEvents = await collect(runtime.streamSimple(syntheticId, context));
+    ok("synthetic provider and model prefixes bypass configured fallback dispatch",
+      providerEvents.at(-1)?.type === "done" && idEvents.at(-1)?.type === "done"
+      && calls["pi-sentinel"]?.length === 1 && calls.ordinary?.length === 1 && !calls.fallback);
+  } finally {
+    release();
+    __configureFallbackModelsForTests([]);
+  }
+}
+
 section("installed OpenAI provider HTTP integration");
 {
   let requests = 0;
@@ -1188,9 +1246,12 @@ section("installed OpenAI provider HTTP integration");
     const release = installModelRuntimeInterception();
     const started = Date.now();
     const formalResponses: number[] = [];
+    // The first installed-provider call lazily imports its SDK. Give cold startup
+    // room without allowing the unrelated fetch's 120-second delay to pass.
+    const coldProviderBudgetMs = 10_000;
     const events = await collect(runtime.streamSimple(model, { messages: [{ role: "user", content: "hello", timestamp: Date.now() }] }, {
       maxRetries: 2,
-      signal: AbortSignal.timeout(2_000),
+      signal: AbortSignal.timeout(coldProviderBudgetMs),
       onPayload: async () => {
         // This failed nested fetch shares the attempt's async chain but is not
         // a provider URL and must not overwrite provider response metadata.
@@ -1199,7 +1260,7 @@ section("installed OpenAI provider HTTP integration");
       },
       onResponse: (response) => { formalResponses.push(response.status); },
     }));
-    ok("real installed provider preserves Retry-After from SDK-hidden failures", requests === 3 && events.at(-1)?.type === "done" && Date.now() - started < 2_000, `requests=${requests}, elapsed=${Date.now() - started}`);
+    ok("real installed provider preserves Retry-After from SDK-hidden failures", requests === 3 && events.at(-1)?.type === "done" && Date.now() - started < coldProviderBudgetMs, `requests=${requests}, elapsed=${Date.now() - started}, terminal=${JSON.stringify(events.at(-1))}`);
     ok("observer delivers mixed failed and successful formal responses exactly once", formalResponses.join(",") === "429,500,200", `responses=${formalResponses.join(",")}`);
 
     requests = 0;

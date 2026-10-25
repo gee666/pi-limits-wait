@@ -1,6 +1,6 @@
 {
   "name": "oira666_pi-limits-wait",
-  "version": "0.6.6",
+  "version": "0.6.7",
   "description": "Extension for PI that allows to automatically wait for limits to reset and retry the request",
   "type": "module",
   "exports": {
@@ -29,8 +29,9 @@
   },
   "scripts": {
     "check": "tsc -p tsconfig.json --noEmit",
-    "pretest": "npm install @earendil-works/pi-ai@latest @earendil-works/pi-coding-agent@latest --save-dev --ignore-scripts && npm run check",
+    "pretest": "npm run check",
     "test": "tsx src/__tests__/test-extension.ts && tsx src/__tests__/test-wait-ui.ts",
+    "test:e2e": "node scripts/test-e2e.mjs",
     "pack:check": "npm pack --dry-run",
     "prepublishOnly": "npm run check && npm test && npm run pack:check"
   },
@@ -44,8 +45,8 @@
     "@earendil-works/pi-coding-agent": ">=1.4.0"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "^1.4.0",
-    "@earendil-works/pi-coding-agent": "^1.4.0",
+    "@earendil-works/pi-ai": "1.4.0",
+    "@earendil-works/pi-coding-agent": "1.4.0",
     "tsx": "^4.20.6",
     "typescript": "^5.9.3"
   }

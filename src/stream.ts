@@ -34,6 +34,7 @@ import {
   switchPiModel,
 } from "./models.js";
 import { withAttemptResponseObserver } from "./response-observer.js";
+import { fallbackHeaderTransform, installHeaderDispatch } from "./header-dispatch.js";
 import { errorMessageWithCauses, getRetryableError, isAbortMessage, parseRetryDelayMs, retryAfterHeaderMs } from "./retry-errors.js";
 import type { RetryPeriodTracker } from "./retry-summary.js";
 import { loadFallbackSettings } from "./settings.js";
@@ -166,6 +167,11 @@ function attemptOptions(
     signal,
     onPayload,
     onResponse,
+    // Dispatch the host's hooks on freshly resolved TARGET headers. Do not
+    // replay options.transformHeaders: arbitrary SDK callers may bind secrets.
+    transformHeaders: fallbackHeaderTransform(),
+    identity: options?.identity,
+    onProviderStreamEvent: options?.onProviderStreamEvent,
     cacheRetention: options?.cacheRetention,
     sessionId: options?.sessionId,
     timeoutMs: options?.timeoutMs,
@@ -815,6 +821,7 @@ export function disableModelRuntimeInterception(): void {
 export function installModelRuntimeInterception(
   createRetryPeriod?: () => RetryPeriodTracker,
 ): () => boolean {
+  installHeaderDispatch();
   const prototype = ModelRuntime.prototype as InterceptablePrototype;
   const owner = {};
   const controller = new AbortController();
