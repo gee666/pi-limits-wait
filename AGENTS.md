@@ -1,5 +1,10 @@
 # Repository instructions
 
+## Repository synchronization
+
+- Before starting any work, pull the latest changes from `origin` with `git pull --ff-only`. Preserve local edits; stop and resolve safely if the pull is blocked.
+- After each completed, validated piece of work, commit your changes and push to `origin` immediately. Work happens on multiple machines; do not leave finished work unsynchronized.
+
 ## Release checks
 
 - Test only against the latest npm Pi release. `npm test` first installs this repository's direct Pi development dependencies at `@latest` with `--save-dev --ignore-scripts`, then runs the existing typecheck. Keep installation scripts disabled to avoid lifecycle recursion. Do not add an older-version test matrix.
