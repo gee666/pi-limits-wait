@@ -32,6 +32,9 @@
     "pretest": "npm run check",
     "test": "tsx src/__tests__/test-extension.ts && tsx src/__tests__/test-wait-ui.ts",
     "test:e2e": "node scripts/test-e2e.mjs",
+    "test:integration": "tsx src/__tests__/test-integration.ts",
+    "test:e2e:evergreen": "node scripts/test-evergreen-e2e.mjs",
+    "test:evergreen": "npm test && npm run test:integration && npm run test:e2e:evergreen",
     "pack:check": "npm pack --dry-run",
     "prepublishOnly": "npm run check && npm test && npm run pack:check"
   },

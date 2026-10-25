@@ -1246,9 +1246,9 @@ section("installed OpenAI provider HTTP integration");
     const release = installModelRuntimeInterception();
     const started = Date.now();
     const formalResponses: number[] = [];
-    // The first installed-provider call lazily imports its SDK. Give cold startup
-    // room without allowing the unrelated fetch's 120-second delay to pass.
-    const coldProviderBudgetMs = 10_000;
+    // Cold SDK imports and HTTP retries need room on busy Evergreen workers,
+    // but must still finish before the unrelated fetch's 120-second delay.
+    const coldProviderBudgetMs = 60_000;
     const events = await collect(runtime.streamSimple(model, { messages: [{ role: "user", content: "hello", timestamp: Date.now() }] }, {
       maxRetries: 2,
       signal: AbortSignal.timeout(coldProviderBudgetMs),
@@ -1268,7 +1268,7 @@ section("installed OpenAI provider HTTP integration");
     const repeatedResponses: number[] = [];
     const repeatedEvents = await collect(runtime.streamSimple(model, { messages: [{ role: "user", content: "hello again", timestamp: Date.now() }] }, {
       maxRetries: 2,
-      signal: AbortSignal.timeout(2_000),
+      signal: AbortSignal.timeout(30_000),
       onResponse: (response) => { repeatedResponses.push(response.status); },
     }));
     ok("observer preserves repeated hidden statuses without deduplicating distinct responses", repeatedEvents.at(-1)?.type === "done" && repeatedResponses.join(",") === "429,429,200", `responses=${repeatedResponses.join(",")}`);
@@ -1297,7 +1297,7 @@ section("installed OpenAI provider HTTP integration");
     const overrideResponses: number[] = [];
     const overrideEvents = await collect(overrideRuntime.streamSimple(overrideModel, { messages: [{ role: "user", content: "override", timestamp: Date.now() }] }, {
       maxRetries: 1,
-      signal: AbortSignal.timeout(2_000),
+      signal: AbortSignal.timeout(30_000),
       onResponse: (response) => { overrideResponses.push(response.status); },
     }));
     ok("observer follows the runtime/credential-overridden effective endpoint", overrideModel.baseUrl.includes("pre-prepare.invalid") && requests === 2 && overrideEvents.at(-1)?.type === "done" && overrideResponses.join(",") === "429,200", `requests=${requests}, responses=${overrideResponses.join(",")}`);

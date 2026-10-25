@@ -42,7 +42,11 @@ Pi 1.4.0 has no public stream middleware that can intercept a failed provider st
 
 ## Compatibility tests
 
-Run `npm test`, `npm run test:e2e`, and `npm run pack:check`. There is no separate build or lint task; `npm test` includes the strict TypeScript check.
+Run `npm run test:evergreen` for the strict TypeScript check, unit tests, integration tests, and required global-CLI e2e tests. Also run `npm run pack:check` before release. There is no separate build or lint task.
+
+Evergreen e2e uses `$EVERGREEN_PI_BIN` (or `pi` on PATH) with stdin ignored. Set `$EVERGREEN_E2E_MODEL` to the live model, e.g. `openai-codex/gpt-6-luna:low`. It exercises a real rate-limit/retry transport, OAuth prompt cleaning, the kill switch, durable retry summaries outside model context, session resume, and a live two-turn conversation using normal Pi authentication. Missing CLI or model access fails rather than skips. Temporary sessions are removed afterward. See [EVERGREEN.md](EVERGREEN.md) for the intent and compatibility risks.
+
+The separate `npm run test:e2e` suite is a legacy RPC diagnostic; unlike Evergreen's print-mode tests it requires a command pipe on stdin.
 
 `test:e2e` requires `PI_EVERGREEN_PI_BIN` pointing to the installed global Pi executable. It explicitly loads this checkout and never installs a CLI. Loopback HTTP tests use dummy OAuth-shaped credentials in an isolated agent directory and exercise retries, tools, prompt changes, manual/overflow compaction, abort, session replacement, and reload. They also verify real cross-provider fallback headers (target insertion/deletion, native attribution, source-secret exclusion and parsed-stream events) across multiple turns and lifecycle transitions, plus OpenAI Responses workspace limits with retry-all enabled/disabled and Pi auto-retry enabled. A negative control without the extension proves the transport assertions detect prompt leaks.
 
@@ -286,9 +290,9 @@ TMPDIR="$PWD/tmp" npm test
 npm run pack:check
 ```
 
-`npm test` installs the direct Pi development dependencies at `@latest` with install scripts disabled, then runs `npm run check` and the tests. Tests target only the latest npm Pi release. Before each release, update the tested version above and the Pi peer dependency baseline after all checks pass. No lint command is configured.
+`npm test` runs `npm run check` and the tests against the installed development dependencies. Tests target only the latest npm Pi release; update the pinned Pi development dependencies before testing a newer release. Before each release, update the tested version above and the Pi peer dependency baseline after all checks pass. No lint command is configured.
 
-Tests cover retries against a local HTTP server and editor focus/key routing. They do not call live model providers or separately execute README snippets.
+`npm test` covers retries against a local HTTP server and editor focus/key routing without live model calls. `npm run test:evergreen` adds integration and live global-CLI e2e coverage; README snippets are not separately executed.
 
 ## License
 
