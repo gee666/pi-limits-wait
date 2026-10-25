@@ -14,3 +14,4 @@
 - Keep functions and classes focused. Split files by responsibility before they exceed 350 lines. Exceed this limit only when splitting would clearly hurt readability or cohesion, and explain why.
 - Remove stale or irrelevant comments and docs. Keep useful ones accurate, short, clear, and human-friendly. Explain non-obvious decisions rather than restating code. Apply the unslop and write-prompts skills when available.
 - Add or update tests for changed behavior. Run the project's available type checks, lint checks, and relevant tests before considering work complete.
+- Make it as simple as possible without losing reliability and quality. Ask yourself: is there a simpler, more natural solution?
