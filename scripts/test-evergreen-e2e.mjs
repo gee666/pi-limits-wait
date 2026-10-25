@@ -11,6 +11,8 @@ await mkdir('tmp', { recursive: true });
 const root = await mkdtemp(resolve('tmp/evergreen-print-'));
 const requests = [];
 let failNext = false;
+let websocketCloseNext = false;
+const websocketClose = 'WebSocket closed 1006 Connection ended';
 const server = createServer(async (req, res) => {
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
@@ -23,6 +25,12 @@ const server = createServer(async (req, res) => {
   }
   res.writeHead(200, { 'content-type': 'text/event-stream' });
   const emit = (type, fields = {}) => res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...fields })}\n\n`);
+  if (websocketCloseNext) {
+    websocketCloseNext = false;
+    emit('error', { error: { type: 'api_error', message: websocketClose } });
+    res.end();
+    return;
+  }
   emit('message_start', { message: { id: 'msg_evergreen', type: 'message', role: 'assistant', model: 'sentinel',
     content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 10, output_tokens: 0 } } });
   emit('content_block_start', { index: 0, content_block: { type: 'text', text: '' } });
@@ -35,8 +43,8 @@ const server = createServer(async (req, res) => {
 await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
 const endpoint = `http://127.0.0.1:${server.address().port}`;
 
-async function run({ agentDir, session, prompt, live = false, disabled = false, extension = true }) {
-  const args = ['--offline', '--mode', 'json', '--no-extensions', '--no-skills', '--no-prompt-templates',
+async function run({ agentDir, session, prompt, live = false, disabled = false, extension = true, print = false }) {
+  const args = ['--offline', ...(print ? ['-p'] : ['--mode', 'json']), '--no-extensions', '--no-skills', '--no-prompt-templates',
     '--no-themes', '--no-context-files', '--no-mcp', '--no-tools', '--session', session,
     '--model', live ? model : 'limits-wait-fixture/sentinel', '-e', resolve('scripts/e2e-fixture.ts')];
   if (extension) args.push('-e', resolve('src/index.ts'));
@@ -57,8 +65,8 @@ async function run({ agentDir, session, prompt, live = false, disabled = false, 
       child.once('error', reject);
       child.once('close', resolve);
     });
-    const events = stdout.trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
-    return { code, events, stderr };
+    const events = print ? [] : stdout.trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
+    return { code, events, stdout, stderr };
   } finally { clearTimeout(timer); }
 }
 const entries = async session => (await readFile(session, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
@@ -99,6 +107,20 @@ try {
   assert.equal(assistants(disk).length, 2, 'real CLI session resumes after retry');
   assert.equal(disk.filter(e => e.customType === 'limits-wait').length, 1, 'summary is not duplicated on resume');
   console.log('PASS global CLI retry, OAuth cleaning, durable metadata outside context, and session resume');
+
+  requests.length = 0;
+  websocketCloseNext = true;
+  const printSession = join(root, 'websocket-close-print.jsonl');
+  const recovered = await run({ agentDir, session: printSession, prompt: 'Reply OK after the transport reconnects.', print: true });
+  assert.equal(recovered.code, 0, `${recovered.stderr}\n${recovered.stdout}`);
+  assert.match(recovered.stdout, /OK evergreen\./);
+  assert.equal(requests.length, 2, 'print mode must retry the transport failure with native and unknown-error retries disabled');
+  const recoveredEntries = await entries(printSession);
+  assert.equal(assistants(recoveredEntries).length, 1, 'failed transport attempts must not become assistant turns');
+  const recoveredSummary = recoveredEntries.find(e => e.type === 'custom' && e.customType === 'limits-wait');
+  assert.equal(recoveredSummary?.data.retries_total, 1);
+  assert.match(recoveredSummary.data.reasons.join(' '), /WebSocket closed 1006 Connection ended/);
+  console.log('PASS global CLI print retries Codex WebSocket 1006 with native and unknown-error retries disabled');
 
   requests.length = 0;
   failNext = true;

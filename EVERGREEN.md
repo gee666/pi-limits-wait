@@ -42,6 +42,8 @@ primary rate limit -> fallback unknown error -> retry success; asserts model com
 no failed assistant turns, next-turn continuity, and exclusion of summary metadata from model context.
 `npm run test:e2e:evergreen` uses `scripts/test-evergreen-e2e.mjs`, real global Pi print/JSON mode,
 ignored stdin, local retry/kill-switch cases, and a live model with persisted-session checks.
+The print-mode regression injects the Codex `WebSocket closed 1006 Connection ended` provider error
+with native and unknown-error retries disabled, then verifies one retry, a successful exit, and durable retry metadata.
 CLI selection is `EVERGREEN_PI_BIN` or `pi` on PATH; live model selection is `EVERGREEN_E2E_MODEL`.
 Existing `npm run test:e2e` remains a separate optional RPC suite requiring piped stdin;
 it covers broader transport hooks, tools, compaction, abort, replacement, reload, and fallback headers.

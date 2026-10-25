@@ -193,6 +193,10 @@ ok("detects overload", isServerOverloadedError("server_is_overloaded"));
 ok("detects refresh-style 401", isAuthenticationRefreshError('401 {"type":"authentication_error","message":"Invalid authentication credentials"}'));
 ok("detects network timeout", isTransientNetworkError("UND_ERR_HEADERS_TIMEOUT"));
 ok("classifies explicit network retry", getRetryableError("fetch failed retry-after 0.01")?.reason === "network");
+ok("classifies Codex abnormal WebSocket closure as network", getRetryableError("WebSocket closed 1006 Connection ended")?.reason === "network");
+ok("classifies abnormal WebSocket closure without a reason as network", getRetryableError("WebSocket closed 1006")?.reason === "network");
+ok("classifies connection-ended transport failures as network", getRetryableError("Connection ended")?.reason === "network");
+ok("does not classify WebSocket policy rejection as transient", !isTransientNetworkError("WebSocket closed 1008 Policy violation"));
 {
   const headers = new Headers({ "retry-after": "0.01" });
   ok("reads retry-after response header", retryAfterHeaderMs(headers) === 10);

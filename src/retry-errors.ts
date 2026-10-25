@@ -51,6 +51,8 @@ export function isTransientNetworkError(msg: string): boolean {
     lower.includes("terminated") ||
     lower.includes("socket hang up") ||
     lower.includes("other side closed") ||
+    /websocket closed 1006\b/.test(lower) ||
+    lower.includes("connection ended") ||
     lower.includes("network_error") ||
     lower.includes("network error") ||
     lower.includes("econnreset") ||
