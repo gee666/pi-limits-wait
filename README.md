@@ -12,11 +12,13 @@ pi install npm:oira666_pi-limits-wait
 
 Restart Pi or run `/reload` after installing.
 
+Tested against Pi 1.4.0.
+
 ## What it does
 
-- Targets Pi 0.80.10+ (developed and tested against Pi 0.83.0) and works with model providers that use `ModelRuntime.streamSimple`.
+- Works with model providers that use `ModelRuntime.streamSimple`.
 - Intercepts the current runtime without registering synthetic providers; every retry and fallback re-enters Pi's normal provider/auth/base URL/configured-header composition, including OAuth refresh checks.
-- On Pi 0.86+, stops background cache warming via `cache_warming_decision` while retry interception is enabled, preventing background refreshes from triggering foreground retries or fallbacks. Normal request caching is unchanged. With `PI_LIMITS_WAIT_DISABLE_ALL_WAITING=true`, Pi's cache-warming policy is left untouched. As with any handler for this event, a later extension can override the decision.
+- Stops background cache warming via `cache_warming_decision` while retry interception is enabled, preventing background refreshes from triggering foreground retries or fallbacks. Normal request caching is unchanged. With `PI_LIMITS_WAIT_DISABLE_ALL_WAITING=true`, Pi's cache-warming policy is left untouched. As with any handler for this event, a later extension can override the decision.
 - Reload-safe ownership ensures `/reload` transfers interception cleanly and aborts waits still owned by the previous extension instance. The interception has one process-global active extension owner, matching the interactive Pi CLI's single active session runtime lifecycle; SDK processes running multiple concurrent Pi sessions are not supported.
 - On rate-limit errors (`429`, `rate_limit`, `too many requests`, quota/reset messages), waits and retries in a loop.
 - Remembers provider retry timing exposed through response callbacks or provider errors (`retry-after`, `retry-after-ms`, `retry in ...`, reset messages). Explicit provider retry/reset deadlines are always honored: no early probes occur during that period (unless a wait is manually skipped).
@@ -266,6 +268,19 @@ The extension rereads these files before every LLM call, so changes made during 
 | `PI_LIMITS_WAIT_PROBE_INTERVAL` | `60` | Seconds between silent re-probes of a higher-priority model with an estimated rate limit or freeze. Explicit provider retry/reset deadlines always block early probes. Lower values return to the preferred model sooner when no provider timing is known, at the cost of more rejected probe requests; `0` disables probing, so a model is only reconsidered when its remembered deadline expires. Overrides the `probe-interval-seconds` settings key. Must be a safe non-negative integer; fractions, Infinity and unsafe values are rejected. Both file and environment values above 2147483 seconds are capped to Node's reliable timeout range. Invalid environment values use the file setting (or default). |
 | `PI_LIMITS_WAIT_RETRY_INTERVAL` | `5` | Seconds to wait between unclassified/unknown provider-error retries. Must be a non-negative integer (values above 2147483 are capped to Node's maximum reliable timer delay). This does not affect model-limit wait intervals. |
 | `PI_LIMITS_WAIT_FREEZING_ENABLED` | `true` | When a model keeps failing with a non-retryable error, it is normally "frozen" for 10 minutes and skipped in favour of other configured models. Set this to `false` (also accepts `0`, `no`, `off`) to disable freezing entirely: the extension will instead try each configured candidate once (after the bounded retries) and then surface the error, never blocking on a long "model-frozen" wait. Useful for non-interactive / subagent runs where no one can press Enter to skip. |
+
+## Development
+
+```sh
+npm ci
+mkdir -p tmp
+TMPDIR="$PWD/tmp" npm test
+npm run pack:check
+```
+
+`npm test` installs the direct Pi development dependencies at `@latest` with install scripts disabled, then runs `npm run check` and the tests. Tests target only the latest npm Pi release. Before each release, update the tested version above and the Pi peer dependency baseline after all checks pass. No lint command is configured.
+
+Tests cover retries against a local HTTP server and editor focus/key routing. They do not call live model providers or separately execute README snippets.
 
 ## License
 

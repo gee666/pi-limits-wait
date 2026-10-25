@@ -6,11 +6,19 @@ import { installWaitRetryEditor, waitForRetry } from "../ui.js";
 
 // Resolve the host's own TUI, rather than a second copy with different keybindings.
 const hostRequire = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
-const { TUI, SelectList } = await import(hostRequire.resolve("@earendil-works/pi-tui"));
+const { TuiMainScreen, SelectList } = await import(hostRequire.resolve("@earendil-works/pi-tui"));
 type Factory = NonNullable<ReturnType<ExtensionContext["ui"]["getEditorComponent"]>>;
-const terminal = { columns: 100, rows: 40, write() {} };
-const tui = new TUI(terminal);
+let input: (data: string) => void = () => { throw new Error("Terminal not started"); };
+const terminal = {
+  columns: 100, rows: 40, kittyProtocolActive: false,
+  start(onInput: (data: string) => void) { input = onInput; },
+  stop() {}, async drainInput() {}, write() {}, moveBy() {},
+  hideCursor() {}, showCursor() {}, clearLine() {}, clearFromCursor() {},
+  clearScreen() {}, setTitle() {}, setProgress() {}, setProgramStatus() {},
+};
+const tui = new TuiMainScreen(terminal);
 tui.requestRender = () => {};
+tui.start();
 const identity = (text: string) => text;
 const selectTheme = {
   selectedPrefix: identity, selectedText: identity, description: identity,
@@ -45,7 +53,6 @@ installWaitRetryEditor(ctx);
 assert.ok(editor! instanceof CustomEditor);
 
 // Use real TUI focus routing and real editor submit/key decoding.
-const input = (data: string) => tui.handleInput(data);
 for (const enter of ["\r", "\x1b[13u"]) {
   const waiting = waitForRetry("rate-limit", 60_000);
   input(enter);
@@ -174,4 +181,5 @@ for (const mode of ["rpc", "json", "print"] as const) {
   installWaitRetryEditor({ ...ctx, mode, ui: {} } as ExtensionContext);
 }
 state.sharedCtx = undefined;
+tui.stop();
 console.log("Waiting UI regression tests passed");
