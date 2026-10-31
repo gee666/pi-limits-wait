@@ -3,7 +3,7 @@ import { createServer } from "node:http";
 import { fileURLToPath } from "node:url";
 import { mock } from "node:test";
 import { join } from "node:path";
-import { ModelRuntime, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { ExtensionRunner, ModelRuntime, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   createAssistantMessageEventStream,
   InMemoryCredentialStore,
@@ -63,6 +63,7 @@ import { withAttemptResponseObserver } from "../response-observer.js";
 import { loadFallbackSettings } from "../settings.js";
 import { consumeExpectedModelSelection, expectModelSelection, state } from "../state.js";
 import { claimControlFile, createSerializedAsyncRunner } from "../ui.js";
+import { fallbackHeaderTransform, installHeaderDispatch } from "../header-dispatch.js";
 
 const testTmpRoot = fileURLToPath(new URL("../../tmp/", import.meta.url));
 mkdirSync(testTmpRoot, { recursive: true });
@@ -2705,6 +2706,55 @@ section("structured status channel and out-of-band skip");
     state.sharedCtx = previousCtx;
     state.extensionApi = previousApi;
     state.primaryModel = previousPrimary;
+  }
+}
+
+section("header dispatch tolerates stale extension contexts");
+{
+  const staleError = () => {
+    throw new Error("This extension ctx is stale after session replacement or reload.");
+  };
+  const prototype = ExtensionRunner.prototype as unknown as { createContext: (...args: unknown[]) => unknown };
+  const SLOT = Symbol.for("oira666.pi-limits-wait.header-dispatch.v1");
+  const slotHolder = prototype as unknown as Record<symbol, unknown>;
+  const originalCreate = prototype.createContext;
+  const originalSlot = Object.getOwnPropertyDescriptor(prototype, SLOT);
+  const previousCtx = state.sharedCtx;
+  try {
+    // Base createContext returns a context whose modelRegistry getter throws, like a stale runner.
+    prototype.createContext = function () {
+      return Object.defineProperty({}, "modelRegistry", { get: staleError });
+    };
+    delete slotHolder[SLOT];
+    installHeaderDispatch();
+    let threw: unknown;
+    let context: unknown;
+    try {
+      context = prototype.createContext.call({});
+    } catch (error) {
+      threw = error;
+    }
+    ok("createContext wrapper does not throw for a stale runner", threw === undefined, String(threw));
+    ok("createContext wrapper still returns the context", context !== undefined);
+
+    state.sharedCtx = Object.defineProperty({}, "modelRegistry", { get: staleError }) as ExtensionContext;
+    let transformThrew: unknown;
+    let transform: unknown = "unset";
+    try {
+      transform = fallbackHeaderTransform();
+    } catch (error) {
+      transformThrew = error;
+    }
+    ok(
+      "fallbackHeaderTransform returns undefined for a stale shared ctx",
+      transformThrew === undefined && transform === undefined,
+      String(transformThrew ?? transform),
+    );
+  } finally {
+    prototype.createContext = originalCreate;
+    if (originalSlot) Object.defineProperty(prototype, SLOT, originalSlot);
+    else delete slotHolder[SLOT];
+    state.sharedCtx = previousCtx;
   }
 }
 

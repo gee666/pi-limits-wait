@@ -21,7 +21,13 @@ export function installHeaderDispatch(): void {
   const runners = new WeakMap<ModelRegistry, ExtensionRunner>();
   const wrapper = function (this: ExtensionRunner) {
     const context = previous.call(this);
-    runners.set(context.modelRegistry, this);
+    // modelRegistry is a getter that throws once the runner is stale (after
+    // reload / session replacement). Never let that crash pi.
+    try {
+      runners.set(context.modelRegistry, this);
+    } catch {
+      // stale runner: skip registration
+    }
     return context;
   };
   Object.defineProperty(prototype, SLOT, { configurable: true, value: { runners, wrapper } });
@@ -29,7 +35,12 @@ export function installHeaderDispatch(): void {
 }
 
 export function fallbackHeaderTransform(): ModelsSimpleStreamOptions["transformHeaders"] {
-  const registry = state.sharedCtx?.modelRegistry;
+  let registry: ModelRegistry | undefined;
+  try {
+    registry = state.sharedCtx?.modelRegistry;
+  } catch {
+    return undefined; // stale ctx after reload / session replacement
+  }
   const runner = registry && (ExtensionRunner.prototype as RunnerPrototype)[SLOT]?.runners.get(registry);
   return runner ? (headers) => runner.emitBeforeProviderHeaders(headers) : undefined;
 }
