@@ -466,10 +466,12 @@ section("disable-all-waiting mode");
 }
 
 section("Pi-owned context-overflow handling");
-{
+for (const overflowText of [
+  "Codex error: Your input exceeds the context window of this model. Please adjust your input and try again.",
+  "litellm.ContextWindowExceededError: Context Window exceeded for given call.",
+]) {
   const calls: Record<string, ProviderCall[]> = {};
   let attempts = 0;
-  const overflowText = "Codex error: Your input exceeds the context window of this model. Please adjust your input and try again.";
   const runtime = await createRuntime({
     overflow(model) {
       attempts++;
@@ -856,12 +858,14 @@ for (const status of [400, 403] as const) {
 }
 __setNonRetryableTuningForTests(1_000_000, 5_000);
 
-section("ChatGPT Business workspace limits");
+section("Non-transient provider usage limits");
 for (const waiting of [false, true]) {
   for (const thrown of [false, true]) {
     for (const detail of [
       "subscription_sharing_workplace_individual_usage_limit_exceeded",
       "You've reached your ChatGPT workspace's usage limit. Ask your workspace admin to increase it at admin.openai.com → Workspace → Usage limits.",
+      '{"error":{"code":"1308","message":"Usage limit reached"}}',
+      '{"error":{"code":1308,"message":"Usage limit reached"}}',
     ]) {
       let attempts = 0;
       const controller = new AbortController();
@@ -876,7 +880,7 @@ for (const waiting of [false, true]) {
           return streamFrom([startEvent(requested), errorEvent(requested, failure)]);
         }) as RuntimeStreamSimpleFn, { provider: "openai", id: "workspace", api: "openai-responses" } as Model<Api>, context, { signal: controller.signal }));
         const terminal = events.at(-1);
-        ok(`workspace limit uses bounded retry-all policy (waiting=${waiting}, thrown=${thrown}, hint=${detail.startsWith("You've")})`,
+        ok(`usage limit uses bounded retry-all policy (waiting=${waiting}, thrown=${thrown}, detail=${detail})`,
           attempts === (waiting ? 2 : 1) && terminal?.type === "error"
             && terminal.reason === "error" && terminal.error.errorMessage?.includes(detail) === true);
       } finally { clearTimeout(timeout); controller.abort(); }

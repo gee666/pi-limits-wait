@@ -217,11 +217,12 @@ export function retryAfterHeaderMs(headers: Headers): number | undefined {
 }
 
 export function getRetryableError(msg: string): RetryableError | undefined {
-  // Business workspace limits require an administrator, not a timed reset.
+  // Workspace-admin limits and Z.ai plan exhaustion are not transient throttles.
   // Keep retry-all configurable, but use its bounded unknown-error budget even
   // when transport metadata adds HTTP 429 / Retry-After to the provider text.
   if (msg.includes("subscription_sharing_workplace_individual_usage_limit_exceeded")
-    || msg.includes("You've reached your ChatGPT workspace's usage limit.")) return undefined;
+    || msg.includes("You've reached your ChatGPT workspace's usage limit.")
+    || /"code"\s*:\s*"?1308(?![0-9])/i.test(msg)) return undefined;
   if (isServerOverloadedError(msg)) {
     return { reason: "overloaded", waitMs: parseRetryDelayMs(msg) ?? DEFAULT_OVERLOADED_WAIT_MS };
   }

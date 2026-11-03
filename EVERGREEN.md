@@ -17,7 +17,7 @@ The master kill switch leaves only prompt cleaning enabled.
 `pi.setModel()`, thinking-level controls, `ctx.modelRegistry`, and project trust support fallback selection/settings.
 `pi.appendEntry()` stores retry metadata; `pi.events` emits versioned wait telemetry.
 `ctx.ui` supports notifications, non-interactive status, and the TUI retry editor.
-Provider response/payload callbacks and Pi's `isContextOverflow()` preserve native integration semantics.
+Provider response/payload callbacks and Pi's `isContextOverflow()` preserve native integration semantics, including LiteLLM context-window errors in Pi 1.5.0.
 
 ## Internal Pi APIs
 `src/stream.ts` patches `ModelRuntime.prototype.streamSimple` with a process-global, reload-owned trampoline.
@@ -31,7 +31,7 @@ One active extension/session runtime per process; concurrent SDK sessions are un
 Fallback must discard source-bound secrets/options without dropping target hooks or native attribution.
 Abort, committed output, user selection, probes, and reload race with pending attempts.
 Explicit reset deadlines must prevent early probes; estimated limits permit silent probes.
-Unknown errors deliberately retry broadly, while workspace-admin limits use the bounded retry policy.
+Unknown errors deliberately retry broadly, while workspace-admin limits and Zhipu/Z.ai plan-exhaustion code 1308 use the bounded retry policy, even with HTTP 429 / Retry-After metadata.
 OAuth prompt cleaning depends on Pi's exact identity/payload shape; cache-warming veto is last-override-wins.
 
 ## Tests
