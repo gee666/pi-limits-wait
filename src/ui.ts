@@ -126,7 +126,7 @@ export function freezingEnabled(): boolean {
 
 /** Load unknown-error retry settings once per extension instance/reload. */
 export function loadUnknownErrorRetrySettings(): void {
-  state.unknownErrorWaitingEnabled = envBoolean(process.env[DEFAULT_WAITING_ENV_VAR], true);
+  state.waitingEnabled = envBoolean(process.env[DEFAULT_WAITING_ENV_VAR], true);
   const maxRetries = envNonNegativeInteger(
     process.env[MAX_RETRY_ENV_VAR],
     DEFAULT_UNKNOWN_ERROR_MAX_RETRIES,

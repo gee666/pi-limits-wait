@@ -217,9 +217,10 @@ export function streamWithLimitsRetry(
     const nonRetryableAttempts = new Map<string, number>();
     const triedModels = new Set<string>();
     let lastExhaustedFailure: string | undefined;
-    // Exhaustion is request-local when freezing is disabled. Every selection,
-    // including invocation-time re-selection, must use the same exclusions.
-    const exclusions = () => freezingEnabled() ? undefined : triedModels;
+    let lastFailure: string | undefined;
+    // Exhaustion is request-local when freezing or waiting is disabled. Every
+    // selection, including invocation-time re-selection, must use the same exclusions.
+    const exclusions = () => freezingEnabled() && state.waitingEnabled ? undefined : triedModels;
     const nextAttemptCandidate = (current: Model<Api>) => findAttemptCandidate(current, exclusions());
     const nextAvailableCandidate = (current: Model<Api>) => nextAttemptCandidate(current)?.entry;
     const earliestCandidateWakeup = (current: Model<Api>) => findCandidateWakeup(current, exclusions());
@@ -317,6 +318,7 @@ export function streamWithLimitsRetry(
         const next = nextAttemptCandidate(attempt.model);
         if (!next) {
           if (!freezingEnabled() && lastExhaustedFailure) throw new Error(lastExhaustedFailure);
+          if (!state.waitingEnabled) throw new Error(lastFailure ?? "All configured models are unavailable.");
           const wakeup = earliestCandidateWakeup(attempt.model)!;
           const wait = await managedWait("model-frozen", Math.max(0, wakeup - Date.now()), "All configured models are unavailable.");
           if (wait === "aborted" || signal?.aborted) {
@@ -334,6 +336,7 @@ export function streamWithLimitsRetry(
       const buffer: AssistantMessageEvent[] = [];
       let retryable: RetryableError | undefined;
       let retryableErrorMessage = "";
+      let retryableEvent: AssistantMessageEvent | undefined;
       let nonRetryableError: { message: string; event?: AssistantMessageEvent } | undefined;
       let observedHttpError: string | undefined;
       let providerPayloadReady = false;
@@ -478,8 +481,10 @@ export function streamWithLimitsRetry(
                   return;
                 }
                 retryable = getRetryableError(errMsg);
-                if (retryable) retryableErrorMessage = errMsg;
-                else nonRetryableError = { message: errMsg, event: surfacedEvent };
+                if (retryable) {
+                  retryableErrorMessage = errMsg;
+                  retryableEvent = surfacedEvent;
+                } else nonRetryableError = { message: errMsg, event: surfacedEvent };
                 break;
               }
 
@@ -608,6 +613,8 @@ export function streamWithLimitsRetry(
         return;
       }
 
+      lastFailure = retryableErrorMessage || nonRetryableError?.message || lastFailure;
+
       // A superseded attempt cannot freeze or limit the user's newer choice.
       if (observedUserModelSelection !== state.userModelSelectionGeneration) continue;
       releaseManualOverride();
@@ -628,40 +635,40 @@ export function streamWithLimitsRetry(
         postponeProbe(attempt.model);
       }
 
-      if (!retryable) {
-        const failureEvent = nonRetryableError?.event;
-        const failureMessage = nonRetryableError?.message ?? "Provider stream ended without a terminal event.";
-        const emitFailure = () => {
-          retryPeriod?.recordReason(failureMessage);
-          retryPeriod?.finalize();
-          // No further wait/retry is planned: this is the only error surfaced
-          // to non-interactive hosts for this request.
-          notifyFinalFailure(
-            `${formatModel(attempt.model)} failed and pi-limits-wait is not retrying: ${formatErrorDetail(failureMessage, Number.MAX_SAFE_INTEGER)}`,
-            failureMessage,
-          );
-          if (!committed) {
-            if (buffer.length > 0) flush(buffer);
-            else {
-              output.push({ type: "start", partial: freshMessage(attempt.model) });
-              committed = true;
-            }
-          }
-          if (failureEvent) output.push(failureEvent);
+      const emitFailure = (failureMessage: string, failureEvent?: AssistantMessageEvent) => {
+        retryPeriod?.recordReason(failureMessage);
+        retryPeriod?.finalize();
+        // No further wait/retry is planned: this is the only error surfaced
+        // to non-interactive hosts for this request.
+        notifyFinalFailure(
+          `${formatModel(attempt.model)} failed and pi-limits-wait is not retrying: ${formatErrorDetail(failureMessage, Number.MAX_SAFE_INTEGER)}`,
+          failureMessage,
+        );
+        if (!committed) {
+          if (buffer.length > 0) flush(buffer);
           else {
-            const error = freshMessage(attempt.model);
-            error.stopReason = "error";
-            error.errorMessage = failureMessage;
-            output.push({ type: "error", reason: "error", error });
+            output.push({ type: "start", partial: freshMessage(attempt.model) });
+            committed = true;
           }
-          output.end();
-        };
+        }
+        if (failureEvent) output.push(failureEvent);
+        else {
+          const error = freshMessage(attempt.model);
+          error.stopReason = "error";
+          error.errorMessage = failureMessage;
+          output.push({ type: "error", reason: "error", error });
+        }
+        output.end();
+      };
 
-        if (!committed && (state.unknownErrorWaitingEnabled || probe)) {
+      if (!retryable) {
+        const failureMessage = nonRetryableError?.message ?? "Provider stream ended without a terminal event.";
+
+        if (!committed) {
           const key = modelKey(attempt.model);
           const attempts = (nonRetryableAttempts.get(key) ?? 0) + 1;
           nonRetryableAttempts.set(key, attempts);
-          if (!probe && attempts < state.nonRetryableMaxAttempts) {
+          if (!probe && state.waitingEnabled && attempts < state.nonRetryableMaxAttempts) {
             notifyRetryingAfterError(attempt.model, state.nonRetryableRetryDelayMs, failureMessage);
             retryPeriod?.beginRetry(failureMessage);
             const wait = await managedWait("retry", state.nonRetryableRetryDelayMs, failureMessage, {
@@ -687,7 +694,7 @@ export function streamWithLimitsRetry(
                 attempt = next;
                 continue;
               }
-              const wakeup = earliestCandidateWakeup(attempt.model);
+              const wakeup = state.waitingEnabled ? earliestCandidateWakeup(attempt.model) : undefined;
               if (wakeup) {
                 retryPeriod?.beginRetry(failureMessage);
                 const wait = await managedWait("model-frozen", Math.max(0, wakeup - Date.now()), failureMessage);
@@ -710,7 +717,23 @@ export function streamWithLimitsRetry(
             }
           }
         }
-        emitFailure();
+        emitFailure(failureMessage, nonRetryableError?.event);
+        return;
+      }
+
+      if (!state.waitingEnabled) {
+        // Waiting is off: move on to the next usable model now, or surface the error.
+        if (allowFallback) {
+          if (retryable.reason !== "network") rememberRateLimit(attempt.model, retryable, retryableErrorMessage, true);
+          triedModels.add(modelKey(attempt.model));
+          const next = nextAvailableCandidate(attempt.model);
+          if (next) {
+            retryPeriod?.recordImmediateRetry(retryableErrorMessage);
+            attempt = next;
+            continue;
+          }
+        }
+        emitFailure(retryableErrorMessage, retryableEvent);
         return;
       }
 

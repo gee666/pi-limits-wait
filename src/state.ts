@@ -13,7 +13,7 @@ export const state = {
   ambientStatusCleanup: undefined as (() => void) | undefined,
   modelStatusCleanup: undefined as (() => void) | undefined,
   fallbackModels: [] as FallbackModel[],
-  unknownErrorWaitingEnabled: true,
+  waitingEnabled: true,
   // Includes the initial request, so the default is one more than max retries.
   nonRetryableMaxAttempts: DEFAULT_UNKNOWN_ERROR_MAX_RETRIES + 1,
   nonRetryableRetryDelayMs: DEFAULT_UNKNOWN_ERROR_RETRY_INTERVAL_MS,

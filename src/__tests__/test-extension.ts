@@ -229,7 +229,7 @@ ok("preserves the unknown-error retry default", DEFAULT_UNKNOWN_ERROR_MAX_RETRIE
   process.env.PI_LIMITS_WAIT_MAX_RETRY = "7";
   process.env.PI_LIMITS_WAIT_RETRY_INTERVAL = "2";
   loadUnknownErrorRetrySettings();
-  ok("unknown-error retry environment settings work", !state.unknownErrorWaitingEnabled && state.nonRetryableMaxAttempts === 8 && state.nonRetryableRetryDelayMs === 2_000);
+  ok("unknown-error retry environment settings work", !state.waitingEnabled && state.nonRetryableMaxAttempts === 8 && state.nonRetryableRetryDelayMs === 2_000);
   for (const [key, value] of Object.entries(previous)) {
     if (value === undefined) delete process.env[key === "waiting" ? "PI_LIMITS_WAIT_DEFAULT_WAITING" : key === "maxRetry" ? "PI_LIMITS_WAIT_MAX_RETRY" : "PI_LIMITS_WAIT_RETRY_INTERVAL"];
     else process.env[key === "waiting" ? "PI_LIMITS_WAIT_DEFAULT_WAITING" : key === "maxRetry" ? "PI_LIMITS_WAIT_MAX_RETRY" : "PI_LIMITS_WAIT_RETRY_INTERVAL"] = value;
@@ -479,7 +479,7 @@ for (const overflowText of [
     },
   }, calls);
   const model = runtime.getModel("overflow", "overflow-model")!;
-  state.unknownErrorWaitingEnabled = true;
+  state.waitingEnabled = true;
   __setNonRetryableTuningForTests(2, 0);
   const release = installModelRuntimeInterception();
   const events = await collect(runtime.streamSimple(model, context));
@@ -804,7 +804,7 @@ section("unknown-error retry integration");
     },
   }, calls);
   const model = runtime.getModel("unknown", "unknown-model")!;
-  state.unknownErrorWaitingEnabled = true;
+  state.waitingEnabled = true;
   __setNonRetryableTuningForTests(2, 0);
   const release = installModelRuntimeInterception();
   const events = await collect(runtime.streamSimple(model, context));
@@ -818,12 +818,12 @@ section("unknown-error retry integration");
     unknown(model) { return streamFrom([startEvent(model), errorEvent(model, "Internal server error")]); },
   }, calls);
   const model = runtime.getModel("unknown", "unknown-model")!;
-  state.unknownErrorWaitingEnabled = false;
+  state.waitingEnabled = false;
   const release = installModelRuntimeInterception();
   const events = await collect(runtime.streamSimple(model, context));
   ok("disabled unknown-error waiting surfaces the first failure", calls.unknown?.length === 1 && events.at(-1)?.type === "error");
   release();
-  state.unknownErrorWaitingEnabled = true;
+  state.waitingEnabled = true;
 }
 
 for (const status of [400, 403] as const) {
@@ -849,7 +849,7 @@ for (const status of [400, 403] as const) {
     },
   }, calls);
   const model = runtime.getModel(provider, `${provider}-model`)!;
-  state.unknownErrorWaitingEnabled = true;
+  state.waitingEnabled = true;
   __setNonRetryableTuningForTests(2, 0);
   const release = installModelRuntimeInterception();
   const events = await collect(runtime.streamSimple(model, context));
@@ -871,7 +871,7 @@ for (const waiting of [false, true]) {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 500);
       const failure = `HTTP 429 retry-after-ms 60000; ${detail}`;
-      state.unknownErrorWaitingEnabled = waiting;
+      state.waitingEnabled = waiting;
       __setNonRetryableTuningForTests(2, 0);
       try {
         const events = await collect(streamWithLimitsRetry({} as ModelRuntime, ((requested: Model<Api>) => {
@@ -887,7 +887,7 @@ for (const waiting of [false, true]) {
     }
   }
 }
-state.unknownErrorWaitingEnabled = true;
+state.waitingEnabled = true;
 __setNonRetryableTuningForTests(1_000_000, 5_000);
 
 section("RPC-mode liveliness and terminal errors");
@@ -914,7 +914,7 @@ section("RPC-mode liveliness and terminal errors");
     const statuses: Array<string | undefined> = [];
     state.sharedCtx = makeCtx(notifications, statuses);
     state.primaryModel = rpcModel;
-    state.unknownErrorWaitingEnabled = true;
+    state.waitingEnabled = true;
     __setNonRetryableTuningForTests(2, 50);
     let attempts = 0;
     const delegate = ((model: Model<Api>) => {
@@ -948,7 +948,7 @@ section("RPC-mode liveliness and terminal errors");
     const statuses: Array<string | undefined> = [];
     state.sharedCtx = makeCtx(notifications, statuses);
     state.primaryModel = rpcModel;
-    state.unknownErrorWaitingEnabled = false;
+    state.waitingEnabled = false;
     const delegate = ((model: Model<Api>) =>
       streamFrom([startEvent(model), errorEvent(model, "Internal server error")])
     ) as Parameters<typeof streamWithLimitsRetry>[1];
@@ -962,7 +962,7 @@ section("RPC-mode liveliness and terminal errors");
     );
   }
 
-  state.unknownErrorWaitingEnabled = true;
+  state.waitingEnabled = true;
   __setNonRetryableTuningForTests(1_000_000, 5_000);
   state.sharedCtx = previousCtx;
   state.primaryModel = previousPrimary;
@@ -1005,7 +1005,7 @@ section("retry-period session summary lifecycle");
     ok(`enabled retry interception vetoes cache warming when Pi proposes ${action}`, warmingHandlers.length === 1 && result?.action === "stop");
   }
   ok("cache-warming veto creates no retry summaries or wait telemetry", entries.length === 0 && telemetry.length === 0);
-  state.unknownErrorWaitingEnabled = true;
+  state.waitingEnabled = true;
   __setNonRetryableTuningForTests(3, 10);
   let attempts = 0;
   const calls: Record<string, ProviderCall[]> = {};
@@ -1182,6 +1182,71 @@ section("authentication and network retry semantics");
   ok("network errors retry the same runtime model", calls.network?.length === 2 && !calls.fallback && events.at(-1)?.type === "done");
   release();
   __configureFallbackModelsForTests([]);
+}
+
+section("waiting disabled: fall back without waiting");
+for (const [label, failure] of [
+  ["a rate limit", "HTTP 429 rate_limit_error retry-after 600"],
+  ["an overload", "server_is_overloaded"],
+  ["a network error", "fetch failed"],
+  ["an unknown error", "Internal server error"],
+] as const) {
+  const calls: Record<string, ProviderCall[]> = {};
+  const runtime = await createRuntime({
+    noWaitPrimary(model) { return streamFrom([startEvent(model), errorEvent(model, failure)]); },
+    noWaitSecond(model) { return streamFrom([startEvent(model), errorEvent(model, failure)]); },
+    noWaitThird(model) { return streamFrom([startEvent(model), doneEvent(model)]); },
+  }, calls);
+  const primary = runtime.getModel("noWaitPrimary", "noWaitPrimary-model")!;
+  const second = runtime.getModel("noWaitSecond", "noWaitSecond-model")!;
+  const third = runtime.getModel("noWaitThird", "noWaitThird-model")!;
+  const ctx = { model: primary, ui: { notify: () => undefined } } as unknown as ExtensionContext;
+  const setModel = async (next: Model<Api>) => {
+    (ctx as unknown as { model: Model<Api> }).model = next;
+    return true;
+  };
+  const telemetry: unknown[] = [];
+  const run = async (models: Model<Api>[]) => {
+    __configureFallbackModelsForTests(models.map((model) => ({ model })), ctx);
+    (ctx as unknown as { model: Model<Api> }).model = primary;
+    state.extensionApi = {
+      setModel,
+      setThinkingLevel: () => undefined,
+      events: { emit: (_channel: string, payload: unknown) => telemetry.push(payload) },
+    } as unknown as typeof state.extensionApi;
+    for (const key of Object.keys(calls)) delete calls[key];
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 2_000);
+    const release = installModelRuntimeInterception();
+    try {
+      return await collect(runtime.streamSimple(primary, context, { signal: controller.signal }));
+    } finally {
+      clearTimeout(timeout);
+      release();
+    }
+  };
+  state.waitingEnabled = false;
+  try {
+    const recovered = await run([primary, second, third]);
+    ok(`waiting disabled: ${label} moves down the fallback list at once`,
+      calls.noWaitPrimary?.length === 1 && calls.noWaitSecond?.length === 1 && calls.noWaitThird?.length === 1
+        && recovered.at(-1)?.type === "done" && telemetry.length === 0,
+      `calls=${JSON.stringify(Object.fromEntries(Object.entries(calls).map(([k, v]) => [k, v.length])))}`);
+    const exhausted = await run([primary, second]);
+    const terminal = exhausted.at(-1);
+    ok(`waiting disabled: ${label} on every fallback surfaces the last error without waiting`,
+      calls.noWaitPrimary?.length === 1 && calls.noWaitSecond?.length === 1
+        && terminal?.type === "error" && terminal.reason === "error"
+        && terminal.error.errorMessage?.includes(failure) === true && telemetry.length === 0,
+      `terminal=${terminal?.type === "error" ? terminal.error.errorMessage : terminal?.type}`);
+    const alone = await run([]);
+    ok(`waiting disabled: ${label} without fallbacks surfaces immediately`,
+      calls.noWaitPrimary?.length === 1 && alone.at(-1)?.type === "error" && telemetry.length === 0);
+  } finally {
+    state.waitingEnabled = true;
+    state.extensionApi = undefined;
+    __configureFallbackModelsForTests([]);
+  }
 }
 
 section("synthetic runtime calls stay outside fallback routing");
@@ -1897,9 +1962,9 @@ section("configured model priority and higher-priority probing");
     const previousFreeze = process.env.PI_LIMITS_WAIT_FREEZING_ENABLED;
     const previousAttempts = state.nonRetryableMaxAttempts;
     const previousDelay = state.nonRetryableRetryDelayMs;
-    const previousWaiting = state.unknownErrorWaitingEnabled;
+    const previousWaiting = state.waitingEnabled;
     process.env.PI_LIMITS_WAIT_FREEZING_ENABLED = "false";
-    state.unknownErrorWaitingEnabled = true;
+    state.waitingEnabled = true;
     // Bound even a microtask hot loop: a timer alone cannot interrupt one.
     const boundedRequest = async (provider: typeof delegate, onImmediateRetry?: () => void) => {
       const controller = new AbortController();
@@ -1989,7 +2054,7 @@ section("configured model priority and higher-priority probing");
       if (previousFreeze === undefined) delete process.env.PI_LIMITS_WAIT_FREEZING_ENABLED;
       else process.env.PI_LIMITS_WAIT_FREEZING_ENABLED = previousFreeze;
       __setNonRetryableTuningForTests(previousAttempts, previousDelay);
-      state.unknownErrorWaitingEnabled = previousWaiting;
+      state.waitingEnabled = previousWaiting;
     }
   }
 
@@ -2678,7 +2743,7 @@ section("structured status channel and out-of-band skip");
       state.sharedCtx = makeCtx(entries, []);
       state.extensionApi = undefined;
       state.primaryModel = rpcModel;
-      state.unknownErrorWaitingEnabled = true;
+      state.waitingEnabled = true;
       __setNonRetryableTuningForTests(2, 20);
       let attempts = 0;
       const delegate = ((model: Model<Api>) => {
