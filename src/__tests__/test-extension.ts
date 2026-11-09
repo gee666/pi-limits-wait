@@ -468,7 +468,7 @@ section("disable-all-waiting mode");
 section("Pi-owned context-overflow handling");
 for (const overflowText of [
   "Codex error: Your input exceeds the context window of this model. Please adjust your input and try again.",
-  "litellm.ContextWindowExceededError: Context Window exceeded for given call.",
+  "litellm.ContextWindowExceededError: Requested token count exceeds the model's maximum context length of 131072 tokens.",
 ]) {
   const calls: Record<string, ProviderCall[]> = {};
   let attempts = 0;
@@ -1510,7 +1510,8 @@ section("manual model selection and wait interruption");
   try {
     configure();
     await select(chosen, "restore");
-    ok("restoring a session model does not create a manual priority override", (await request()).trace === "top");
+    ok("a restored startup model stays first without a manual override", (await request()).trace === "chosen"
+      && state.manualModelOverride === undefined);
     await select(chosen, "cycle");
     ok("keyboard model cycling also creates a manual priority override", (await request()).trace === "chosen");
     for (const model of [chosen, outside]) {
@@ -1829,10 +1830,20 @@ section("configured model priority and higher-priority probing");
 
   {
     configure([second, primary, third], 60_000);
+    status.primary = "ok";
     status.second = "ok";
     const preferred = await request(primary);
-    ok("a primary listed lower never jumps ahead of configured priority", preferred.trace === "second"
-      && candidateOrder(primary).map((entry) => entry.model.id).join(",") === "second,primary,third");
+    ok("a startup model listed lower stays first without duplicates", preferred.trace === "primary"
+      && mutableCtx.model === primary
+      && candidateOrder(primary).map((entry) => entry.model.id).join(",") === "primary,second,third");
+    ok("a healthy listed startup model stays first across calls", (await request(primary)).trace === "primary");
+    status.primary = "limited";
+    ok("a listed startup model falls back only after failing", (await request(primary)).trace === "primary,second");
+    ok("a limited listed startup model lets the fallback keep serving", (await request(second)).trace === "second");
+    status.primary = "ok";
+    state.rateLimitMemory.get("prio/primary")!.deadline = Date.now() - 1;
+    ok("a recovered listed startup model reclaims first priority", (await request(second)).trace === "primary"
+      && mutableCtx.model === primary);
     configure([second, third], 60_000);
     status.primary = "ok";
     ok("an explicit out-of-list selection stays first", (await request(primary)).trace === "primary");

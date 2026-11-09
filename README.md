@@ -238,7 +238,7 @@ Example:
 }
 ```
 
-`fallback-models` is an ordered priority list: the entry closest to the top is preferred whenever it is usable.
+The model the chat starts with is always tried first. `fallback-models` is an ordered list of alternatives used only when that model is unavailable; listing the startup model lower does not demote it or try it twice.
 
 Each `fallback-models` entry supports:
 
@@ -252,7 +252,7 @@ Top-level settings keys:
 
 Fallback priority and manual selection:
 
-1. Normally, `fallback-models` sets priority from top to bottom. An unlisted startup model is tried before the list. Unrelated model calls and internal synthetic models are not rerouted.
+1. The startup model comes first, followed by `fallback-models` from top to bottom with duplicates removed. A healthy startup model is never replaced just because another model appears earlier in the configured list. Unrelated model calls and internal synthetic models are not rerouted.
 2. A manual model change overrides that priority, whether the chosen model is listed or not. Calls stay on that model without probing higher-priority models while it works. If it fails, the override ends and normal retry/fallback rules apply. After failover, the configured list controls priority again; recovery of the manually chosen model does not restore its override. Abort and context-overflow recovery do not cancel the override. Without an override, each LLM call starts at the top of the order and uses the highest-priority available model.
 3. If the active model becomes rate-limited, the extension immediately moves down to the next usable model in the order.
 4. As soon as a higher-priority model works again, the next call goes back to it and Pi's active model is switched back automatically. That happens in three ways:

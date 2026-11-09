@@ -26,7 +26,7 @@ try {
   process.env.PI_LIMITS_WAIT_PROBE_INTERVAL = "0";
   mkdirSync(process.env.PI_CODING_AGENT_DIR, { recursive: true });
   writeFileSync(join(process.env.PI_CODING_AGENT_DIR, "limits-wait.json"), JSON.stringify({
-    "fallback-models": ["primary", "fallback"].map((provider) => ({ provider, modelname: "fixture" })),
+    "fallback-models": ["fallback", "primary"].map((provider) => ({ provider, modelname: "fixture" })),
   }));
 
   const runtime = await ModelRuntime.create({
@@ -35,6 +35,7 @@ try {
   const calls: string[] = [];
   const contexts: string[] = [];
   let fallbackAttempts = 0;
+  let primaryLimited = false;
   for (const provider of ["primary", "fallback"]) {
     runtime.registerProvider(provider, {
       api: "openai-completions", baseUrl: "https://fixture.invalid", apiKey: "dummy-key",
@@ -46,7 +47,8 @@ try {
       streamSimple(model, context) {
         calls.push(provider);
         contexts.push(JSON.stringify(context));
-        const failure = provider === "primary" ? "HTTP 429 retry-after 60"
+        const failure = provider === "primary"
+          ? primaryLimited ? "HTTP 429 retry-after 60" : undefined
           : ++fallbackAttempts === 1 ? "integration transient unknown failure" : undefined;
         const message: AssistantMessage = {
           role: "assistant", api: model.api, provider: model.provider, model: model.id,
@@ -86,6 +88,11 @@ try {
     resourceLoader, settingsManager, sessionManager, tools: [],
   }));
   await session.bindExtensions({});
+  await session.prompt("Healthy startup turn");
+  assert.deepEqual(calls, ["primary"], "a healthy startup model wins even when listed after the fallback");
+  assert.equal(session.model?.provider, "primary");
+  calls.length = 0;
+  primaryLimited = true;
   await session.prompt("First integration turn");
   assert.deepEqual(calls, ["primary", "fallback", "fallback"]);
   assert.equal(session.model?.provider, "fallback", "successful fallback becomes the session model");
@@ -110,7 +117,7 @@ try {
   assert.ok(nextContext.includes("integration recovered"), "successful response enters next-turn context");
   assert.ok(!nextContext.includes("integration transient unknown failure"));
   assert.ok(!nextContext.includes("retries_total"), "retry summaries stay outside model context");
-  assert.equal(session.messages.filter((message) => message.role === "assistant").length, 2,
+  assert.equal(session.messages.filter((message) => message.role === "assistant").length, 3,
     "failed attempts never become extra assistant turns");
   console.log("✅ SDK session fallback, retry, summary lifecycle and next-turn context");
 } finally {

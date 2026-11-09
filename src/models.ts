@@ -39,16 +39,15 @@ export function configuredAttempt(model: Model<Api>): FallbackModel {
 }
 
 /**
- * A manual choice stays first until it fails. Otherwise use configured priority.
- * An unlisted startup model stays first until an explicit selection has failed.
+ * The startup model stays ahead of configured fallbacks, even if listed lower.
+ * A manual choice stays first until it fails, then releases priority to the list.
  * Unrelated calls are excluded by isFallbackEligibleModel.
  */
 export function candidateOrder(current: Model<Api>): FallbackModel[] {
   const primary = getPrimaryModel(current);
-  const listed = state.fallbackModels.some((entry) => modelKey(entry.model) === modelKey(primary));
   const order: FallbackModel[] = state.manualModelOverride
     ? [configuredAttempt(state.manualModelOverride)]
-    : listed || state.manualModelOverrideReleased ? [] : [configuredAttempt(primary)];
+    : state.manualModelOverrideReleased ? [] : [configuredAttempt(primary)];
   const seen = new Set(order.map((entry) => modelKey(entry.model)));
   for (const entry of state.fallbackModels) {
     const key = modelKey(entry.model);
