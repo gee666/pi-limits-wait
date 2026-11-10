@@ -43,7 +43,7 @@ const server = createServer(async (req, res) => {
 await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
 const endpoint = `http://127.0.0.1:${server.address().port}`;
 
-async function run({ agentDir, session, prompt, live = false, disabled = false, extension = true, print = false }) {
+async function run({ agentDir, session, prompt, live = false, disabled = false, waiting = true, extension = true, print = false }) {
   const args = ['--offline', ...(print ? ['-p'] : ['--mode', 'json']), '--no-extensions', '--no-skills', '--no-prompt-templates',
     '--no-themes', '--no-context-files', '--no-mcp', '--no-tools', '--session', session,
     '--model', live ? model : 'limits-wait-fixture/sentinel', '-e', resolve('scripts/e2e-fixture.ts')];
@@ -52,7 +52,7 @@ async function run({ agentDir, session, prompt, live = false, disabled = false, 
   const child = spawn(bin, args, { cwd: root, stdio: ['ignore', 'pipe', 'pipe'], env: {
     ...process.env, ...(agentDir ? { PI_CODING_AGENT_DIR: agentDir } : {}),
     LIMITS_WAIT_E2E_ENDPOINT: live ? '' : endpoint,
-    PI_LIMITS_WAIT_DISABLE_ALL_WAITING: String(disabled), PI_LIMITS_WAIT_DEFAULT_WAITING: 'false',
+    PI_LIMITS_WAIT_DISABLE_ALL_WAITING: String(disabled), PI_LIMITS_WAIT_DEFAULT_WAITING: String(waiting),
     PI_LIMITS_WAIT_FREEZING_ENABLED: 'false', PI_LIMITS_WAIT_MAX_RETRY: '0',
   } });
   let stdout = '';
@@ -132,6 +132,17 @@ try {
   assert.equal(assistants(disabledEntries).at(-1).stopReason, 'error');
   assert.equal(disabledEntries.filter(e => e.customType === 'limits-wait').length, 0);
   console.log('PASS global CLI kill switch surfaces failure while retaining OAuth cleaning');
+
+  requests.length = 0;
+  failNext = true;
+  const noWaitSession = join(root, 'no-wait.jsonl');
+  await run({ agentDir, session: noWaitSession, prompt: 'Reply OK.', waiting: false });
+  assert.equal(requests.length, 1, 'waiting=false must not retry even classified rate limits');
+  assertClean(requests);
+  const noWaitEntries = await entries(noWaitSession);
+  assert.equal(assistants(noWaitEntries).at(-1).stopReason, 'error');
+  assert.equal(noWaitEntries.filter(e => e.customType === 'limits-wait').length, 0);
+  console.log('PASS global CLI waiting=false surfaces rate limits without retrying');
 
   // Normal Pi auth is resolved by the installed CLI; never read credential files.
   const liveSession = join(root, 'live.jsonl');

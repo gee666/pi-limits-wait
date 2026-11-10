@@ -41,7 +41,8 @@ OAuth prompt cleaning depends on Pi's exact identity/payload shape; cache-warmin
 primary rate limit -> fallback unknown error -> retry success; asserts model commitment, one accurate summary,
 no failed assistant turns, next-turn continuity, and exclusion of summary metadata from model context.
 `npm run test:e2e:evergreen` uses `scripts/test-evergreen-e2e.mjs`, real global Pi print/JSON mode,
-ignored stdin, local retry/kill-switch cases, and a live model with persisted-session checks.
+ignored stdin, local retry/kill-switch/waiting-disabled cases, and a live model with persisted-session checks.
+Retry cases explicitly enable waiting; `PI_LIMITS_WAIT_DEFAULT_WAITING=false` must surface even classified rate limits without retrying.
 The print-mode regression injects the Codex `WebSocket closed 1006 Connection ended` provider error
 with native and unknown-error retries disabled, then verifies one retry, a successful exit, and durable retry metadata.
 CLI selection is `EVERGREEN_PI_BIN` or `pi` on PATH; live model selection is `EVERGREEN_E2E_MODEL`.
@@ -53,4 +54,6 @@ No lint task is configured. Test only the latest Pi release; live access is requ
 ## Relevant changelog topics
 Watch ModelRuntime streaming/auth/header composition, ExtensionRunner context/header dispatch, and reload lifecycle.
 Watch provider callbacks/stream events, context-overflow recovery, OAuth identity/system updates, and cache warming.
+Pi 1.5.1 retry/provider changes pass the evergreen suite: dropped-stream native retries, Anthropic message threads/full-request fallback,
+idle cache warming, lazy-loading/auth cancellation, OAuth-save shutdown, Responses session affinity, and omitted disabled tools need no extension changes.
 Watch model selection/thinking levels, project trust, custom-entry persistence, and JSON/RPC UI protocols.

@@ -12,7 +12,7 @@ pi install npm:oira666_pi-limits-wait
 
 Restart Pi or run `/reload` after installing.
 
-Tested against Pi 1.5.0.
+Tested against Pi 1.5.1.
 
 ## What it does
 
