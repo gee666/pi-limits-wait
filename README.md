@@ -208,16 +208,20 @@ By default, if you do not configure fallback models, the extension behaves exact
 
 To enable automatic model fallback, add `fallback-models` to a `limits-wait.json` file.
 
-The extension reads these files in order; later files override earlier ones:
+For trusted projects, the extension searches the current working directory, then its parent, and continues up to the filesystem root. It stops at the first directory containing `.limits-wait.json` or `.pi/limits-wait.json`. Only that directory supplies project settings; more distant ancestors are ignored. If no project settings exist anywhere in that chain, only global and agent settings apply.
+
+The extension reads the following files in order; later files override earlier ones. Global and agent settings remain defaults even when a project file is found:
 
 | Location | Scope | Trust behavior |
 |----------|-------|----------------|
 | `~/.config/.pi/limits-wait.json` | Global defaults | Always loaded |
 | `<Pi agent dir>/limits-wait.json` (for example `~/.pi/agent/limits-wait.json`, or `PI_CODING_AGENT_DIR/limits-wait.json`) | Pi agent directory | Always loaded |
-| `.limits-wait.json` | Project root override | Loaded only when `ctx.isProjectTrusted()` is `true` |
-| `.pi/limits-wait.json` | Pi project override | Loaded only when `ctx.isProjectTrusted()` is `true` |
+| `<nearest settings directory>/.limits-wait.json` | Project override | Loaded only when `ctx.isProjectTrusted()` is `true` |
+| `<nearest settings directory>/.pi/limits-wait.json` | Pi project override | Loaded only when `ctx.isProjectTrusted()` is `true` |
 
-For an untrusted project, both project-local paths are ignored completely (including malformed-file warnings); global and agent settings still apply. The trust decision is Pi's effective session trust, including temporary/CLI trust decisions. The same rule is applied every time settings are reread before an LLM call.
+An empty or malformed file still selects its directory and stops ancestor lookup. Malformed files produce warnings rather than silently selecting another ancestor.
+
+For an untrusted project, both project-local paths and all ancestor settings are ignored completely, including malformed-file warnings; global and agent settings still apply. The trust decision is Pi's effective session trust, including temporary/CLI trust decisions. The same rule is applied every time settings are reread before an LLM call.
 
 Example:
 

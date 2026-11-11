@@ -314,7 +314,37 @@ ok("preserves the unknown-error retry default", DEFAULT_UNKNOWN_ERROR_MAX_RETRIE
     writeFileSync(join(project, ".pi", "limits-wait.json"), JSON.stringify({ keep: "project" }));
     const resolved = __readFallbackSettingsForTests(project, agent, home, true);
     ok("loads settings in documented precedence for trusted projects", resolved.loadedPaths.length === 4 && resolved.config.keep === "project");
+    const child = join(project, "child");
+    const nested = join(child, "nested");
+    mkdirSync(nested, { recursive: true });
+    const inherited = __readFallbackSettingsForTests(nested, agent, home, true);
+    ok("nested projects inherit the nearest ancestor settings", inherited.config.keep === "project" && inherited.loadedPaths.join() === resolved.loadedPaths.join());
+
+    const childSettings = join(child, ".limits-wait.json");
+    writeFileSync(childSettings, JSON.stringify({ keep: "child" }));
+    const nearest = __readFallbackSettingsForTests(nested, agent, home, true);
+    ok("nearer ancestor root settings beat a farther ancestor Pi file", nearest.config.keep === "child" && nearest.loadedPaths.length === 3 && nearest.loadedPaths.at(-1) === childSettings);
+
+    const localSettings = join(nested, ".limits-wait.json");
+    writeFileSync(localSettings, JSON.stringify({ local: true }));
+    const local = __readFallbackSettingsForTests(nested, agent, home, true);
+    ok("current project settings exclude all ancestor settings but retain global defaults", local.config.local === true && local.config.keep === "agent" && local.loadedPaths.length === 3);
+    writeFileSync(localSettings, "{}");
+    ok("empty current project settings still stop ancestor lookup", __readFallbackSettingsForTests(nested, agent, home, true).config.keep === "agent");
+    writeFileSync(localSettings, "not json");
+    const malformed = __readFallbackSettingsForTests(nested, agent, home, true);
+    ok("malformed nearest settings warn without selecting a farther ancestor", malformed.warnings.length === 1 && malformed.config.keep === "agent");
+
+    rmSync(localSettings);
+    rmSync(childSettings);
+    rmSync(join(project, ".limits-wait.json"));
+    rmSync(join(project, ".pi", "limits-wait.json"));
+    const global = __readFallbackSettingsForTests(nested, agent, home, true);
+    ok("missing project and ancestor settings fall back to global settings", global.loadedPaths.length === 2 && global.config.keep === "agent");
+
     writeFileSync(join(project, ".limits-wait.json"), "not json");
+    const untrustedAncestor = __readFallbackSettingsForTests(nested, agent, home, false);
+    ok("untrusted projects ignore ancestor settings and warnings", untrustedAncestor.loadedPaths.length === 2 && untrustedAncestor.warnings.length === 0);
     const untrusted = __readFallbackSettingsForTests(project, agent, home, false);
     ok("untrusted projects load only global and agent settings", untrusted.loadedPaths.length === 2 && untrusted.config.keep === "agent" && untrusted.warnings.length === 0);
   } finally {

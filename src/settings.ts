@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from "fs";
 import { homedir } from "os";
-import { join, resolve } from "path";
+import { dirname, join, resolve } from "path";
 import { getAgentDir, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { FALLBACK_MODELS_KEY, PROBE_INTERVAL_KEY, SETTINGS_FILE_NAME } from "./constants.js";
@@ -53,9 +53,20 @@ export function configFileCandidates(
     join(homeDir, ".config", ".pi", SETTINGS_FILE_NAME),
     join(agentDir, SETTINGS_FILE_NAME),
   ];
-  return isProjectTrusted
-    ? [...alwaysLoaded, resolve(cwd, `.${SETTINGS_FILE_NAME}`), resolve(cwd, ".pi", SETTINGS_FILE_NAME)]
-    : alwaysLoaded;
+  if (!isProjectTrusted) return alwaysLoaded;
+
+  let directory = resolve(cwd);
+  while (true) {
+    const projectFiles = [
+      join(directory, `.${SETTINGS_FILE_NAME}`),
+      join(directory, ".pi", SETTINGS_FILE_NAME),
+    ];
+    // Use one project scope, not a merge of every ancestor's settings.
+    if (projectFiles.some((path) => existsSync(path))) return [...alwaysLoaded, ...projectFiles];
+    const parent = dirname(directory);
+    if (parent === directory) return alwaysLoaded;
+    directory = parent;
+  }
 }
 
 function mergeConfig(base: Record<string, unknown>, override: Record<string, unknown>): Record<string, unknown> {
