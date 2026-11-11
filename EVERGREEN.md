@@ -56,4 +56,6 @@ Watch ModelRuntime streaming/auth/header composition, ExtensionRunner context/he
 Watch provider callbacks/stream events, context-overflow recovery, OAuth identity/system updates, and cache warming.
 Pi 1.5.1 retry/provider changes pass the evergreen suite: dropped-stream native retries, Anthropic message threads/full-request fallback,
 idle cache warming, lazy-loading/auth cancellation, OAuth-save shutdown, Responses session affinity, and omitted disabled tools need no extension changes.
+Pi 1.5.2 compatibility: Anthropic OAuth's Claude Code version header remains runtime-owned; prompt cleaning and fallback header dispatch do not override it.
+Missing-cwd Continue/Fork/Cancel and failed-import cleanup remain host-owned: this extension does not switch/import sessions or persist cwd choices, and refreshes its context on `session_start` after replacement.
 Watch model selection/thinking levels, project trust, custom-entry persistence, and JSON/RPC UI protocols.
