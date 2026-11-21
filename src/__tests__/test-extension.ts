@@ -194,6 +194,9 @@ ok("detects overload", isServerOverloadedError("server_is_overloaded"));
 ok("detects refresh-style 401", isAuthenticationRefreshError('401 {"type":"authentication_error","message":"Invalid authentication credentials"}'));
 ok("detects network timeout", isTransientNetworkError("UND_ERR_HEADERS_TIMEOUT"));
 ok("classifies explicit network retry", getRetryableError("fetch failed retry-after 0.01")?.reason === "network");
+for (const message of ["Connection closed", "read ECONNRESET", "write EPIPE", "socket ETIMEDOUT"]) {
+  ok(`classifies Pi 1.6 transport failure as network: ${message}`, getRetryableError(message)?.reason === "network");
+}
 ok("classifies Codex abnormal WebSocket closure as network", getRetryableError("WebSocket closed 1006 Connection ended")?.reason === "network");
 ok("classifies abnormal WebSocket closure without a reason as network", getRetryableError("WebSocket closed 1006")?.reason === "network");
 ok("classifies connection-ended transport failures as network", getRetryableError("Connection ended")?.reason === "network");

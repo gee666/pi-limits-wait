@@ -58,4 +58,6 @@ Pi 1.5.1 retry/provider changes pass the evergreen suite: dropped-stream native 
 idle cache warming, lazy-loading/auth cancellation, OAuth-save shutdown, Responses session affinity, and omitted disabled tools need no extension changes.
 Pi 1.5.2 compatibility: Anthropic OAuth's Claude Code version header remains runtime-owned; prompt cleaning and fallback header dispatch do not override it.
 Missing-cwd Continue/Fork/Cancel and failed-import cleanup remain host-owned: this extension does not switch/import sessions or persist cwd choices, and refreshes its context on `session_start` after replacement.
+Pi 1.6.0 compatibility: classify `Connection closed` and socket-only `EPIPE` as network failures, alongside ECONNRESET/ETIMEDOUT, so exhausted native retries still use the network wait policy even with unknown-error retries disabled.
+Codex connection renewal/maxTokens, model defaults/reasoning validation, and Anthropic thread routing remain provider-owned; this extension does not rewrite them. SDK reload's `session_start` refreshes the context/editor through the existing handler; single RPC lifecycle dispatch needs no workaround.
 Watch model selection/thinking levels, project trust, custom-entry persistence, and JSON/RPC UI protocols.

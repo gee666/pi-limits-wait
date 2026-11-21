@@ -53,9 +53,11 @@ export function isTransientNetworkError(msg: string): boolean {
     lower.includes("other side closed") ||
     /websocket closed 1006\b/.test(lower) ||
     lower.includes("connection ended") ||
+    lower.includes("connection closed") ||
     lower.includes("network_error") ||
     lower.includes("network error") ||
     lower.includes("econnreset") ||
+    lower.includes("epipe") ||
     lower.includes("econnrefused") ||
     lower.includes("etimedout") ||
     lower.includes("enetunreach") ||
