@@ -20,6 +20,7 @@ export type ConfiguredModel = {
   modelname: string;
   reasoningEffort?: ModelThinkingLevel;
   weeklyLimitReserve?: number;
+  releaseReserveBeforeResetMs?: number;
 };
 
 export type FallbackModel = {
@@ -27,6 +28,14 @@ export type FallbackModel = {
   reasoningEffort?: ModelThinkingLevel;
   /** Percentage of the weekly limit to keep unused; reaching it blocks the model. */
   weeklyLimitReserve?: number;
+  /** The reserve no longer applies this close to the weekly reset. */
+  releaseReserveBeforeResetMs?: number;
+};
+
+export type WeeklyUsage = {
+  usedPercent: number;
+  /** Epoch ms of the weekly window reset, when the provider reports it. */
+  resetAt?: number;
 };
 
 export type RateLimitMemory = {
@@ -40,7 +49,7 @@ export type RateLimitMemory = {
   /** Human explanation shown when every candidate is unavailable. */
   detail?: string;
   /** Weekly usage that caused a "weekly-budget" block, for re-evaluation on settings changes. */
-  weeklyUsedPercent?: number;
+  weeklyUsage?: WeeklyUsage;
 };
 
 export type NonRetryableFailureMemory = {

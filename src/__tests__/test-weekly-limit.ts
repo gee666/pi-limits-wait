@@ -14,8 +14,10 @@ import { unavailableCandidatesSummary } from "../models.js";
 import { parseConfiguredModels } from "../settings.js";
 import { state } from "../state.js";
 import {
+  parseHoursMs,
   parseWeeklyLimitPercent,
   pruneWeeklyBudgetMemory,
+  recordWeeklyUsage,
   weeklyUsageFromHeaders,
   weeklyUsageFromStreamEvent,
 } from "../weekly-limit.js";
@@ -48,6 +50,65 @@ ok("rejects bare numbers and out-of-range values",
   ok("reads the setting per fallback entry",
     models[0]?.weeklyLimitReserve === 40 && models[1]?.weeklyLimitReserve === undefined && models[2]?.weeklyLimitReserve === undefined);
   ok("warns about a non-percentage value", warnings.length === 1 && warnings[0]!.includes("openai-codex/gpt: weekly-limit-reserve"), warnings.join("; "));
+}
+
+section("release-reserve-before-reset parsing");
+ok("accepts hours", parseHoursMs("5h") === 5 * 3_600_000 && parseHoursMs(" 1.5 H ") === 1.5 * 3_600_000);
+ok("rejects other units and bare numbers",
+  [5, "5", "300m", "1d", "0h", "-2h", "169h", undefined].every((value) => parseHoursMs(value) === undefined));
+{
+  const warnings: string[] = [];
+  const models = parseConfiguredModels({
+    "fallback-models": [
+      { provider: "a", modelname: "m", "weekly-limit-reserve": "40%", "release-reserve-before-reset": "5h" },
+      { provider: "b", modelname: "m", "weekly-limit-reserve": "40%", "release-reserve-before-reset": "300m" },
+      { provider: "c", modelname: "m", "release-reserve-before-reset": "5h" },
+    ],
+  }, warnings);
+  ok("reads the release window per fallback entry",
+    models[0]?.releaseReserveBeforeResetMs === 5 * 3_600_000 && models[1]?.releaseReserveBeforeResetMs === undefined);
+  ok("warns about non-hour values and a release without a reserve",
+    warnings.length === 2 && warnings[0]!.includes("b/m: release-reserve-before-reset must be hours")
+      && warnings[1]!.includes("c/m: release-reserve-before-reset has no effect without weekly-limit-reserve"),
+    warnings.join("; "));
+}
+
+section("release window before the weekly reset");
+{
+  const now = 1_800_000_000_000;
+  const hour = 3_600_000;
+  const model = { provider: "rel", id: "model" } as Model<Api>;
+  const key = "rel/model";
+  const configure = (releaseReserveBeforeResetMs?: number) => {
+    state.fallbackModels = [{ model, weeklyLimitReserve: 40, ...(releaseReserveBeforeResetMs ? { releaseReserveBeforeResetMs } : {}) }];
+  };
+  configure(5 * hour);
+  state.rateLimitMemory.clear();
+  recordWeeklyUsage(model, { usedPercent: 80, resetAt: now + 24 * hour }, now);
+  const record = state.rateLimitMemory.get(key);
+  ok("outside the window the reserve blocks only until reset minus the release time",
+    record?.reason === "weekly-budget" && record.deadline === now + 19 * hour && record.detail?.includes("5h before the weekly limit resets") === true,
+    record?.detail);
+
+  state.rateLimitMemory.clear();
+  recordWeeklyUsage(model, { usedPercent: 80, resetAt: now + 4 * hour }, now);
+  ok("inside the window the release wins over the reserve", !state.rateLimitMemory.has(key));
+
+  state.rateLimitMemory.clear();
+  recordWeeklyUsage(model, { usedPercent: 80 }, now);
+  ok("an unknown reset time cannot be released and is re-checked hourly", state.rateLimitMemory.get(key)?.deadline === now + hour);
+
+  configure();
+  state.rateLimitMemory.clear();
+  recordWeeklyUsage(model, { usedPercent: 80, resetAt: now + 24 * hour }, now);
+  configure(5 * hour);
+  pruneWeeklyBudgetMemory(now);
+  ok("adding a release window shortens an existing block", state.rateLimitMemory.get(key)?.deadline === now + 19 * hour);
+  configure(30 * hour);
+  pruneWeeklyBudgetMemory(now);
+  ok("a release window that already started lifts an existing block", !state.rateLimitMemory.has(key));
+  state.fallbackModels = [];
+  state.rateLimitMemory.clear();
 }
 
 section("weekly usage sources");

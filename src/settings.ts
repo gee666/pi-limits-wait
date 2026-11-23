@@ -8,7 +8,7 @@ import { formatModel, modelKey } from "./models.js";
 import { state } from "./state.js";
 import type { ConfiguredModel } from "./types.js";
 import { configuredProbeIntervalMs } from "./ui.js";
-import { pruneWeeklyBudgetMemory, readWeeklyLimitReserve } from "./weekly-limit.js";
+import { pruneWeeklyBudgetMemory, readReleaseReserveBeforeReset, readWeeklyLimitReserve } from "./weekly-limit.js";
 
 export function parseProbeIntervalSeconds(raw: unknown): number | undefined {
   const record = raw && typeof raw === "object" ? raw as Record<string, unknown> : undefined;
@@ -39,12 +39,15 @@ export function parseConfiguredModels(raw: unknown, warnings: string[] = []): Co
       : "";
     const reasoning = record["reasoning effort"] ?? record.reasoningEffort ?? record.reasoning_effort;
     if (!provider || !modelname) continue;
-    const weeklyLimitReserve = readWeeklyLimitReserve(record, `${provider}/${modelname}`, warnings);
+    const label = `${provider}/${modelname}`;
+    const weeklyLimitReserve = readWeeklyLimitReserve(record, label, warnings);
+    const releaseReserveBeforeResetMs = readReleaseReserveBeforeReset(record, label, weeklyLimitReserve !== undefined, warnings);
     models.push({
       provider,
       modelname,
       reasoningEffort: isThinkingLevel(reasoning) ? reasoning : undefined,
       ...(weeklyLimitReserve === undefined ? {} : { weeklyLimitReserve }),
+      ...(releaseReserveBeforeResetMs === undefined ? {} : { releaseReserveBeforeResetMs }),
     });
   }
   return models;
@@ -161,13 +164,19 @@ export function loadFallbackSettings(ctx: ExtensionContext): void {
       const key = modelKey(model);
       if (seen.has(key)) continue;
       seen.add(key);
-      state.fallbackModels.push({ model, reasoningEffort: entry.reasoningEffort, weeklyLimitReserve: entry.weeklyLimitReserve });
+      state.fallbackModels.push({
+        model,
+        reasoningEffort: entry.reasoningEffort,
+        weeklyLimitReserve: entry.weeklyLimitReserve,
+        releaseReserveBeforeResetMs: entry.releaseReserveBeforeResetMs,
+      });
     }
     pruneWeeklyBudgetMemory();
 
     const lines = state.fallbackModels.map((entry, index) =>
       `${index + 1}. ${formatModel(entry.model)}${entry.reasoningEffort ? ` (${entry.reasoningEffort})` : ""}`
-        + (entry.weeklyLimitReserve === undefined ? "" : `, weekly limit reserve ${entry.weeklyLimitReserve}%`),
+        + (entry.weeklyLimitReserve === undefined ? "" : `, weekly limit reserve ${entry.weeklyLimitReserve}%`)
+        + (entry.releaseReserveBeforeResetMs === undefined ? "" : ` released ${entry.releaseReserveBeforeResetMs / 3_600_000}h before reset`),
     );
     const source = loadedPaths.length > 0 ? ` from ${loadedPaths.join(", ")}` : "";
     const message = lines.length > 0

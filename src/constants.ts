@@ -60,6 +60,8 @@ export const FALLBACK_MODELS_KEY = "fallback-models";
 export const PROBE_INTERVAL_KEY = "probe-interval-seconds";
 /** Per fallback-models entry: share of the weekly limit to keep unused, e.g. "40%". */
 export const WEEKLY_LIMIT_RESERVE_KEY = "weekly-limit-reserve";
+/** Per fallback-models entry: stop honoring the reserve this long before the weekly reset, e.g. "5h". */
+export const RELEASE_RESERVE_BEFORE_RESET_KEY = "release-reserve-before-reset";
 // Re-check a weekly-reserve block this often when the provider reports no reset time.
 export const WEEKLY_BUDGET_UNKNOWN_RESET_RECHECK_MS = 60 * 60 * 1_000; // 1 hour
 export const DISABLE_ALL_WAITING_ENV_VAR = "PI_LIMITS_WAIT_DISABLE_ALL_WAITING";
