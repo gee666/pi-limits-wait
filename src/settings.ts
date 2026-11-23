@@ -8,7 +8,7 @@ import { formatModel, modelKey } from "./models.js";
 import { state } from "./state.js";
 import type { ConfiguredModel } from "./types.js";
 import { configuredProbeIntervalMs } from "./ui.js";
-import { pruneWeeklyBudgetMemory, readWeeklyLimitKeep } from "./weekly-limit.js";
+import { pruneWeeklyBudgetMemory, readWeeklyLimitReserve } from "./weekly-limit.js";
 
 export function parseProbeIntervalSeconds(raw: unknown): number | undefined {
   const record = raw && typeof raw === "object" ? raw as Record<string, unknown> : undefined;
@@ -39,12 +39,12 @@ export function parseConfiguredModels(raw: unknown, warnings: string[] = []): Co
       : "";
     const reasoning = record["reasoning effort"] ?? record.reasoningEffort ?? record.reasoning_effort;
     if (!provider || !modelname) continue;
-    const minWeeklyLimitKeep = readWeeklyLimitKeep(record, `${provider}/${modelname}`, warnings);
+    const weeklyLimitReserve = readWeeklyLimitReserve(record, `${provider}/${modelname}`, warnings);
     models.push({
       provider,
       modelname,
       reasoningEffort: isThinkingLevel(reasoning) ? reasoning : undefined,
-      ...(minWeeklyLimitKeep === undefined ? {} : { minWeeklyLimitKeep }),
+      ...(weeklyLimitReserve === undefined ? {} : { weeklyLimitReserve }),
     });
   }
   return models;
@@ -161,13 +161,13 @@ export function loadFallbackSettings(ctx: ExtensionContext): void {
       const key = modelKey(model);
       if (seen.has(key)) continue;
       seen.add(key);
-      state.fallbackModels.push({ model, reasoningEffort: entry.reasoningEffort, minWeeklyLimitKeep: entry.minWeeklyLimitKeep });
+      state.fallbackModels.push({ model, reasoningEffort: entry.reasoningEffort, weeklyLimitReserve: entry.weeklyLimitReserve });
     }
     pruneWeeklyBudgetMemory();
 
     const lines = state.fallbackModels.map((entry, index) =>
       `${index + 1}. ${formatModel(entry.model)}${entry.reasoningEffort ? ` (${entry.reasoningEffort})` : ""}`
-        + (entry.minWeeklyLimitKeep === undefined ? "" : `, keeps ${entry.minWeeklyLimitKeep}% of the weekly limit`),
+        + (entry.weeklyLimitReserve === undefined ? "" : `, weekly limit reserve ${entry.weeklyLimitReserve}%`),
     );
     const source = loadedPaths.length > 0 ? ` from ${loadedPaths.join(", ")}` : "";
     const message = lines.length > 0

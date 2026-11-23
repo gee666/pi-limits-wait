@@ -19,14 +19,14 @@ export type ConfiguredModel = {
   provider: string;
   modelname: string;
   reasoningEffort?: ModelThinkingLevel;
-  minWeeklyLimitKeep?: number;
+  weeklyLimitReserve?: number;
 };
 
 export type FallbackModel = {
   model: Model<Api>;
   reasoningEffort?: ModelThinkingLevel;
   /** Percentage of the weekly limit to keep unused; reaching it blocks the model. */
-  minWeeklyLimitKeep?: number;
+  weeklyLimitReserve?: number;
 };
 
 export type RateLimitMemory = {

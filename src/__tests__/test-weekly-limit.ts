@@ -32,7 +32,7 @@ function ok(label: string, condition: boolean, detail?: string): void {
   }
 }
 
-section("min-weekly-limit-keep parsing");
+section("weekly-limit-reserve parsing");
 ok("accepts percentages", parseWeeklyLimitPercent("40%") === 40 && parseWeeklyLimitPercent(" 12.5 % ") === 12.5);
 ok("rejects bare numbers and out-of-range values",
   [40, "40", "0.4", "100%", "-5%", "abc%", undefined].every((value) => parseWeeklyLimitPercent(value) === undefined));
@@ -40,14 +40,14 @@ ok("rejects bare numbers and out-of-range values",
   const warnings: string[] = [];
   const models = parseConfiguredModels({
     "fallback-models": [
-      { provider: "anthropic", modelname: "claude", "min-weekly-limit-keep": "40%" },
-      { provider: "openai-codex", modelname: "gpt", "min-weekly-limit-keep": 40 },
+      { provider: "anthropic", modelname: "claude", "weekly-limit-reserve": "40%" },
+      { provider: "openai-codex", modelname: "gpt", "weekly-limit-reserve": 40 },
       { provider: "other", modelname: "plain" },
     ],
   }, warnings);
   ok("reads the setting per fallback entry",
-    models[0]?.minWeeklyLimitKeep === 40 && models[1]?.minWeeklyLimitKeep === undefined && models[2]?.minWeeklyLimitKeep === undefined);
-  ok("warns about a non-percentage value", warnings.length === 1 && warnings[0]!.includes("openai-codex/gpt: min-weekly-limit-keep"), warnings.join("; "));
+    models[0]?.weeklyLimitReserve === 40 && models[1]?.weeklyLimitReserve === undefined && models[2]?.weeklyLimitReserve === undefined);
+  ok("warns about a non-percentage value", warnings.length === 1 && warnings[0]!.includes("openai-codex/gpt: weekly-limit-reserve"), warnings.join("; "));
 }
 
 section("weekly usage sources");
@@ -131,7 +131,7 @@ function section(title: string): void {
     setModel: async (next: Model<Api>) => { (ctx as unknown as { model: Model<Api> }).model = next; return true; },
     setThinkingLevel: () => undefined,
   } as unknown as typeof state.extensionApi;
-  __configureFallbackModelsForTests([{ model: primary, minWeeklyLimitKeep: 40 }, { model: backup }], ctx);
+  __configureFallbackModelsForTests([{ model: primary, weeklyLimitReserve: 40 }, { model: backup }], ctx);
   const context: Context = { messages: [] };
   const release = installModelRuntimeInterception();
   try {
@@ -146,14 +146,14 @@ function section(title: string): void {
     ok("the model is blocked until the reported weekly reset with a distinct reason",
       record?.reason === "weekly-budget" && record.explicitDeadline === true && record.deadline > Date.now() + 86_000_000);
     ok("the user is told why the model stopped being used",
-      notices.some((text) => text.includes("Weekly limit reserve reached on primary/primary-model") && text.includes("35% of the weekly limit left") && text.includes("min-weekly-limit-keep is 40%")),
+      notices.some((text) => text.includes("Weekly limit reserve reached on primary/primary-model") && text.includes("35% of the weekly limit left") && text.includes("weekly-limit-reserve is 40%")),
       notices.join(" | "));
 
     const next = await collect(runtime.streamSimple(primary, context));
     ok("later requests go to the next fallback model", calls.primary === 2 && calls.backup === 1 && next.at(-1)?.type === "done");
 
     state.waitingEnabled = false;
-    __configureFallbackModelsForTests([{ model: primary, minWeeklyLimitKeep: 40 }], ctx);
+    __configureFallbackModelsForTests([{ model: primary, weeklyLimitReserve: 40 }], ctx);
     state.rateLimitMemory.set("primary/primary-model", record!);
     const exhausted = await collect(runtime.streamSimple(primary, context));
     const terminal = exhausted.at(-1);
@@ -163,7 +163,7 @@ function section(title: string): void {
 
     ok("waiting for every reserved model uses the weekly-budget reason", unavailableCandidatesSummary(primary).reason === "weekly-budget");
 
-    state.fallbackModels = [{ model: primary, minWeeklyLimitKeep: 30 }];
+    state.fallbackModels = [{ model: primary, weeklyLimitReserve: 30 }];
     pruneWeeklyBudgetMemory();
     ok("lowering the reserve below the remaining share unblocks the model", !state.rateLimitMemory.has("primary/primary-model"));
   } finally {

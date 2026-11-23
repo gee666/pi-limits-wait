@@ -1,5 +1,5 @@
 import type { Api, Model } from "@earendil-works/pi-ai";
-import { MIN_WEEKLY_LIMIT_KEEP_KEY, WEEKLY_BUDGET_UNKNOWN_RESET_RECHECK_MS } from "./constants.js";
+import { WEEKLY_LIMIT_RESERVE_KEY, WEEKLY_BUDGET_UNKNOWN_RESET_RECHECK_MS } from "./constants.js";
 import { formatModel, modelKey } from "./models.js";
 import { state } from "./state.js";
 import type { RateLimitMemory } from "./types.js";
@@ -21,12 +21,12 @@ export function parseWeeklyLimitPercent(value: unknown): number | undefined {
 }
 
 /** Parse one optional fallback-entry setting, reporting present-but-invalid values. */
-export function readWeeklyLimitKeep(record: Record<string, unknown>, label: string, warnings: string[]): number | undefined {
-  const value = record[MIN_WEEKLY_LIMIT_KEEP_KEY];
+export function readWeeklyLimitReserve(record: Record<string, unknown>, label: string, warnings: string[]): number | undefined {
+  const value = record[WEEKLY_LIMIT_RESERVE_KEY];
   if (value === undefined) return undefined;
   const percent = parseWeeklyLimitPercent(value);
   if (percent === undefined) {
-    warnings.push(`${label}: ${MIN_WEEKLY_LIMIT_KEEP_KEY} must be a percentage from 0% to below 100%, e.g. "40%" (got ${JSON.stringify(value)})`);
+    warnings.push(`${label}: ${WEEKLY_LIMIT_RESERVE_KEY} must be a percentage from 0% to below 100%, e.g. "40%" (got ${JSON.stringify(value)})`);
   }
   return percent;
 }
@@ -99,12 +99,12 @@ export function weeklyUsageFromStreamEvent(data: unknown, now = Date.now()): Wee
 }
 
 /** Percentage of the weekly limit a configured model must keep unused. */
-export function weeklyLimitKeep(model: Pick<Model<Api>, "provider" | "id">): number | undefined {
-  return keepForKey(modelKey(model));
+export function weeklyLimitReservePercent(model: Pick<Model<Api>, "provider" | "id">): number | undefined {
+  return reserveForKey(modelKey(model));
 }
 
-function keepForKey(key: string): number | undefined {
-  return state.fallbackModels.find((candidate) => modelKey(candidate.model) === key)?.minWeeklyLimitKeep;
+function reserveForKey(key: string): number | undefined {
+  return state.fallbackModels.find((candidate) => modelKey(candidate.model) === key)?.weeklyLimitReserve;
 }
 
 function formatPercent(value: number): string {
@@ -118,8 +118,8 @@ function formatPercent(value: number): string {
  */
 export function recordWeeklyUsage(model: Model<Api>, usage: WeeklyUsage | undefined, now = Date.now()): void {
   if (!usage) return;
-  const keep = weeklyLimitKeep(model);
-  if (keep === undefined || 100 - usage.usedPercent > keep) return;
+  const reserve = weeklyLimitReservePercent(model);
+  if (reserve === undefined || 100 - usage.usedPercent > reserve) return;
 
   const resetKnown = usage.resetAt !== undefined && usage.resetAt > now;
   // Without a reset time, re-check once per interval: each check spends a request.
@@ -129,7 +129,7 @@ export function recordWeeklyUsage(model: Model<Api>, usage: WeeklyUsage | undefi
     : `${new Date(deadline).toLocaleString()} (the provider did not report the weekly reset time)`;
   const left = Math.max(0, 100 - usage.usedPercent);
   const detail = `Weekly limit reserve reached on ${formatModel(model)}: ${formatPercent(left)} of the weekly limit left, `
-    + `${MIN_WEEKLY_LIMIT_KEEP_KEY} is ${formatPercent(keep)}. Not using this model until ${until}.`;
+    + `${WEEKLY_LIMIT_RESERVE_KEY} is ${formatPercent(reserve)}. Not using this model until ${until}.`;
 
   const key = modelKey(model);
   const previous = state.rateLimitMemory.get(key);
@@ -153,7 +153,7 @@ export function recordWeeklyUsage(model: Model<Api>, usage: WeeklyUsage | undefi
 export function pruneWeeklyBudgetMemory(): void {
   for (const [key, record] of state.rateLimitMemory) {
     if (record.reason !== "weekly-budget") continue;
-    const keep = keepForKey(key);
-    if (keep === undefined || 100 - (record.weeklyUsedPercent ?? 0) > keep) state.rateLimitMemory.delete(key);
+    const reserve = reserveForKey(key);
+    if (reserve === undefined || 100 - (record.weeklyUsedPercent ?? 0) > reserve) state.rateLimitMemory.delete(key);
   }
 }

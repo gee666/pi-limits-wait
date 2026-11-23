@@ -233,7 +233,7 @@ Example:
       "provider": "anthropic",
       "modelname": "claude-sonnet-4-5",
       "reasoning effort": "medium",
-      "min-weekly-limit-keep": "40%"
+      "weekly-limit-reserve": "40%"
     },
     {
       "provider": "openai",
@@ -250,7 +250,7 @@ Each `fallback-models` entry supports:
 - `provider` — required. The Pi provider name, for example `anthropic`, `openai`, `google`, etc.
 - `modelname` — required. The model id/name as Pi knows it.
 - `reasoning effort` — optional. One of `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. If omitted, Pi's current/default reasoning level is used.
-- `min-weekly-limit-keep` — optional. The share of this model's weekly subscription limit to keep unused, as a percentage string such as `"40%"` (bare numbers are rejected with a warning). With `"40%"` the model is used until only 40% of its weekly limit is left (60% used). The extension then treats it as unavailable until the weekly limit resets and more than 40% is left again. The request that reported the usage still completes; later requests move to the next fallback. If no other model is usable, the extension waits for the reset like a rate limit, using reason `weekly-budget`. A `⛔ Weekly limit reserve reached on …` warning, and the final error if it gives up, show the usage, the setting and the reset time, so this is never confused with a provider rate limit. To apply it to the startup model, list that model in `fallback-models`.
+- `weekly-limit-reserve` — optional. The share of this model's weekly subscription limit to keep unused, as a percentage string such as `"40%"` (bare numbers are rejected with a warning). With `"40%"` the model is used until only 40% of its weekly limit is left (60% used). The extension then treats it as unavailable until the weekly limit resets and more than 40% is left again. The request that reported the usage still completes; later requests move to the next fallback. If no other model is usable, the extension waits for the reset like a rate limit, using reason `weekly-budget`. A `⛔ Weekly limit reserve reached on …` warning, and the final error if it gives up, show the usage, the setting and the reset time, so this is never confused with a provider rate limit. To apply it to the startup model, list that model in `fallback-models`.
 
   Weekly usage is read from successful responses: Anthropic `anthropic-ratelimit-unified-7d-utilization`/`-reset` headers (Claude subscriptions), and OpenAI Codex `x-codex-{primary,secondary}-*` headers or `codex.rate_limits` WebSocket events (ChatGPT subscriptions; the window lasting 7 days or more is used). The setting has no effect on providers that do not report weekly usage. If the reset time is missing, the model is re-checked once an hour.
 
