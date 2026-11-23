@@ -57,6 +57,7 @@ import limitsWaitExtension, {
   type LimitsWaitStatusPayload,
 } from "../index.js";
 import { DEFAULT_UNKNOWN_ERROR_MAX_RETRIES } from "../constants.js";
+const packageVersion = (JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf-8")) as { version: string }).version;
 import { isSkipToken } from "../status-json.js";
 import type { RateLimitMemory, RuntimeStreamSimpleFn } from "../types.js";
 import { withAttemptResponseObserver } from "../response-observer.js";
@@ -2502,7 +2503,7 @@ section("structured status channel and out-of-band skip");
       ok(
         "structured status publishes v:1 JSON under its own key",
         entries.length === 1 && entries[0]!.key === LIVELINESS_JSON_STATUS_KEY
-          && payload?.v === 1 && payload.ext === EXTENSION_VERSION && payload.event === "wait"
+          && payload?.v === 1 && payload.ext === EXTENSION_VERSION && EXTENSION_VERSION === packageVersion && payload.event === "wait"
           && payload.waitId === "wait-sample" && payload.periodId === "period-1"
           && payload.reason === "rate-limit" && payload.remainingMs === 724_000
           && payload.model?.id === "claude-sonnet-4-5" && payload.controlFile === "/tmp/limits-wait.control",

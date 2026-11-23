@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+
 export const CLAUDE_CODE_IDENTITY =
   "You are Claude Code, Anthropic's official CLI for Claude.";
 
@@ -43,7 +45,15 @@ export const DEFAULT_LIVELINESS_INTERVAL_MS = 15 * 1_000; // 15 seconds
 export const LIVELINESS_JSON_STATUS_KEY = "oira666.pi-limits-wait.json";
 /** Payload schema version for LIVELINESS_JSON_STATUS_KEY. Bump only on a breaking change. */
 export const LIVELINESS_JSON_VERSION = 1;
-export const EXTENSION_VERSION = "0.6.13";
+/** Read from package.json so the release version is defined in one place. */
+export const EXTENSION_VERSION = readPackageVersion();
+
+function readPackageVersion(): string {
+  const manifest: unknown = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf-8"));
+  const version = manifest && typeof manifest === "object" ? (manifest as { version?: unknown }).version : undefined;
+  if (typeof version !== "string" || !version) throw new Error("pi-limits-wait: package.json has no version");
+  return version;
+}
 
 export const SETTINGS_FILE_NAME = "limits-wait.json";
 export const FALLBACK_MODELS_KEY = "fallback-models";
