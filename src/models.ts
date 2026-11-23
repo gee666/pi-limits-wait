@@ -2,7 +2,7 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 import { DEFAULT_NON_RETRYABLE_FREEZE_MS } from "./constants.js";
 import { expectModelSelection, state } from "./state.js";
 import { parseRetryDelayMs } from "./retry-errors.js";
-import type { FallbackModel, RetryableError } from "./types.js";
+import type { FallbackModel, RetryableError, RetryReason } from "./types.js";
 import { formatErrorDetail, formatDuration, notifyLiveliness, reasonLabel } from "./ui.js";
 
 export function modelKey(model: Pick<Model<Api>, "provider" | "id">): string {
@@ -202,6 +202,24 @@ export function earliestCandidateDeadline(current: Model<Api>): number | undefin
     .map((entry) => activeLimit(entry.model)?.deadline ?? activeNonRetryableFailure(entry.model)?.deadline)
     .filter((deadline): deadline is number => typeof deadline === "number");
   return deadlines.length > 0 ? Math.min(...deadlines) : undefined;
+}
+
+/**
+ * Why every candidate is unavailable. Weekly-reserve blocks get their own
+ * reason and explanation so they are not mistaken for provider rate limits.
+ */
+export function unavailableCandidatesSummary(
+  current: Model<Api>,
+  excluded?: ReadonlySet<string>,
+): { reason: RetryReason; message: string } {
+  const candidates = candidateOrder(current).filter((entry) => !excluded?.has(modelKey(entry.model)));
+  const limits = candidates.map((entry) => activeNonRetryableFailure(entry.model) ? undefined : activeLimit(entry.model));
+  const weeklyOnly = candidates.length > 0 && limits.every((limit) => limit?.reason === "weekly-budget");
+  const details = limits.map((limit) => limit?.detail).filter((detail): detail is string => Boolean(detail));
+  return {
+    reason: weeklyOnly ? "weekly-budget" : "model-frozen",
+    message: ["All configured models are unavailable.", ...details].join(" "),
+  };
 }
 
 /**

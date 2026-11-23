@@ -30,7 +30,7 @@
   "scripts": {
     "check": "tsc -p tsconfig.json --noEmit",
     "pretest": "npm run check",
-    "test": "tsx src/__tests__/test-extension.ts && tsx src/__tests__/test-wait-ui.ts",
+    "test": "tsx src/__tests__/test-extension.ts && tsx src/__tests__/test-wait-ui.ts && tsx src/__tests__/test-weekly-limit.ts",
     "test:e2e": "node scripts/test-e2e.mjs",
     "test:integration": "tsx src/__tests__/test-integration.ts",
     "test:e2e:evergreen": "node scripts/test-evergreen-e2e.mjs",

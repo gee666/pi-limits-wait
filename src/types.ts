@@ -8,7 +8,7 @@ import type {
   ModelThinkingLevel,
 } from "@earendil-works/pi-ai";
 
-export type RetryReason = "rate-limit" | "overloaded" | "authentication" | "model-frozen" | "network" | "retry";
+export type RetryReason = "rate-limit" | "overloaded" | "authentication" | "model-frozen" | "network" | "retry" | "weekly-budget";
 
 export type RetryableError = {
   reason: RetryReason;
@@ -19,11 +19,14 @@ export type ConfiguredModel = {
   provider: string;
   modelname: string;
   reasoningEffort?: ModelThinkingLevel;
+  minWeeklyLimitKeep?: number;
 };
 
 export type FallbackModel = {
   model: Model<Api>;
   reasoningEffort?: ModelThinkingLevel;
+  /** Percentage of the weekly limit to keep unused; reaching it blocks the model. */
+  minWeeklyLimitKeep?: number;
 };
 
 export type RateLimitMemory = {
@@ -34,6 +37,10 @@ export type RateLimitMemory = {
   explicitDeadline?: boolean;
   /** Last time this model was re-probed while still remembered as limited. */
   lastProbeAt?: number;
+  /** Human explanation shown when every candidate is unavailable. */
+  detail?: string;
+  /** Weekly usage that caused a "weekly-budget" block, for re-evaluation on settings changes. */
+  weeklyUsedPercent?: number;
 };
 
 export type NonRetryableFailureMemory = {

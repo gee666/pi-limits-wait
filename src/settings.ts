@@ -8,6 +8,7 @@ import { formatModel, modelKey } from "./models.js";
 import { state } from "./state.js";
 import type { ConfiguredModel } from "./types.js";
 import { configuredProbeIntervalMs } from "./ui.js";
+import { pruneWeeklyBudgetMemory, readWeeklyLimitKeep } from "./weekly-limit.js";
 
 export function parseProbeIntervalSeconds(raw: unknown): number | undefined {
   const record = raw && typeof raw === "object" ? raw as Record<string, unknown> : undefined;
@@ -21,7 +22,7 @@ function isThinkingLevel(value: unknown): value is ModelThinkingLevel {
   return ["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(String(value));
 }
 
-export function parseConfiguredModels(raw: unknown): ConfiguredModel[] {
+export function parseConfiguredModels(raw: unknown, warnings: string[] = []): ConfiguredModel[] {
   const source = raw && typeof raw === "object" && Array.isArray((raw as { [FALLBACK_MODELS_KEY]?: unknown })[FALLBACK_MODELS_KEY])
     ? (raw as { [FALLBACK_MODELS_KEY]: unknown[] })[FALLBACK_MODELS_KEY]
     : [];
@@ -38,7 +39,13 @@ export function parseConfiguredModels(raw: unknown): ConfiguredModel[] {
       : "";
     const reasoning = record["reasoning effort"] ?? record.reasoningEffort ?? record.reasoning_effort;
     if (!provider || !modelname) continue;
-    models.push({ provider, modelname, reasoningEffort: isThinkingLevel(reasoning) ? reasoning : undefined });
+    const minWeeklyLimitKeep = readWeeklyLimitKeep(record, `${provider}/${modelname}`, warnings);
+    models.push({
+      provider,
+      modelname,
+      reasoningEffort: isThinkingLevel(reasoning) ? reasoning : undefined,
+      ...(minWeeklyLimitKeep === undefined ? {} : { minWeeklyLimitKeep }),
+    });
   }
   return models;
 }
@@ -131,8 +138,9 @@ export function loadFallbackSettings(ctx: ExtensionContext): void {
 
     state.probeIntervalMs = configuredProbeIntervalMs(parseProbeIntervalSeconds(config));
 
-    const configured = parseConfiguredModels(config);
+    const configured = parseConfiguredModels(config, warnings);
     if (configured.length === 0) {
+      pruneWeeklyBudgetMemory();
       if (shouldNotify && warnings.length > 0) ctx.ui.notify(`Could not fully load ${SETTINGS_FILE_NAME}: ${warnings.join(", ")}`, "warning");
       return;
     }
@@ -153,11 +161,13 @@ export function loadFallbackSettings(ctx: ExtensionContext): void {
       const key = modelKey(model);
       if (seen.has(key)) continue;
       seen.add(key);
-      state.fallbackModels.push({ model, reasoningEffort: entry.reasoningEffort });
+      state.fallbackModels.push({ model, reasoningEffort: entry.reasoningEffort, minWeeklyLimitKeep: entry.minWeeklyLimitKeep });
     }
+    pruneWeeklyBudgetMemory();
 
     const lines = state.fallbackModels.map((entry, index) =>
-      `${index + 1}. ${formatModel(entry.model)}${entry.reasoningEffort ? ` (${entry.reasoningEffort})` : ""}`,
+      `${index + 1}. ${formatModel(entry.model)}${entry.reasoningEffort ? ` (${entry.reasoningEffort})` : ""}`
+        + (entry.minWeeklyLimitKeep === undefined ? "" : `, keeps ${entry.minWeeklyLimitKeep}% of the weekly limit`),
     );
     const source = loadedPaths.length > 0 ? ` from ${loadedPaths.join(", ")}` : "";
     const message = lines.length > 0

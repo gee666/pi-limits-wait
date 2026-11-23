@@ -101,6 +101,7 @@ export function reasonLabel(reason: RetryReason): string {
   if (reason === "model-frozen") return "Model frozen after error";
   if (reason === "network") return "Network/timeout error";
   if (reason === "retry") return "Retrying after error";
+  if (reason === "weekly-budget") return "Weekly limit reserve reached";
   return "Rate limited";
 }
 

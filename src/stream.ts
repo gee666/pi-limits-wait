@@ -32,6 +32,7 @@ import {
   rememberNonRetryableFailure,
   rememberRateLimit,
   switchPiModel,
+  unavailableCandidatesSummary,
 } from "./models.js";
 import { withAttemptResponseObserver } from "./response-observer.js";
 import { fallbackHeaderTransform, installHeaderDispatch } from "./header-dispatch.js";
@@ -49,6 +50,7 @@ import {
   reasonLabel,
   waitForRetry,
 } from "./ui.js";
+import { recordWeeklyUsage, weeklyUsageFromHeaders, weeklyUsageFromStreamEvent } from "./weekly-limit.js";
 
 export function __setNonRetryableTuningForTests(maxAttempts: number, retryDelayMs: number): void {
   state.nonRetryableMaxAttempts = maxAttempts;
@@ -139,17 +141,18 @@ function errorHttpMetadata(error: unknown): string | undefined {
   return undefined;
 }
 
+type AttemptHooks = Required<Pick<ModelsSimpleStreamOptions, "onPayload" | "onResponse" | "onProviderStreamEvent">>;
+
 function attemptOptions(
   originalModel: Model<Api>,
   target: FallbackModel,
   options: ModelsSimpleStreamOptions | undefined,
   signal: AbortSignal | undefined,
-  onPayload: ModelsSimpleStreamOptions["onPayload"],
-  onResponse: ModelsSimpleStreamOptions["onResponse"],
+  hooks: AttemptHooks,
 ): ModelsSimpleStreamOptions | undefined {
   const reasoningLevel = target.reasoningEffort ?? state.primaryThinkingLevel;
   const reasoning = reasoningLevel && reasoningLevel !== "off" ? reasoningLevel : undefined;
-  const common = { ...(signal ? { signal } : {}), onPayload, onResponse };
+  const common = { ...(signal ? { signal } : {}), ...hooks };
 
   // Exact-model retries preserve every option. Any different model, including
   // one on the same provider, must resolve its own request-owned configuration.
@@ -165,13 +168,11 @@ function attemptOptions(
   // cannot leak to a fallback model.
   const neutral: ModelsSimpleStreamOptions = {
     signal,
-    onPayload,
-    onResponse,
+    ...hooks,
     // Dispatch the host's hooks on freshly resolved TARGET headers. Do not
     // replay options.transformHeaders: arbitrary SDK callers may bind secrets.
     transformHeaders: fallbackHeaderTransform(),
     identity: options?.identity,
-    onProviderStreamEvent: options?.onProviderStreamEvent,
     cacheRetention: options?.cacheRetention,
     sessionId: options?.sessionId,
     timeoutMs: options?.timeoutMs,
@@ -318,9 +319,10 @@ export function streamWithLimitsRetry(
         const next = nextAttemptCandidate(attempt.model);
         if (!next) {
           if (!freezingEnabled() && lastExhaustedFailure) throw new Error(lastExhaustedFailure);
-          if (!state.waitingEnabled) throw new Error(lastFailure ?? "All configured models are unavailable.");
+          const unavailable = unavailableCandidatesSummary(attempt.model, exclusions());
+          if (!state.waitingEnabled) throw new Error(lastFailure ?? unavailable.message);
           const wakeup = earliestCandidateWakeup(attempt.model)!;
-          const wait = await managedWait("model-frozen", Math.max(0, wakeup - Date.now()), "All configured models are unavailable.");
+          const wait = await managedWait(unavailable.reason, Math.max(0, wakeup - Date.now()), unavailable.message);
           if (wait === "aborted" || signal?.aborted) {
             pushAbort("Request aborted while all fallback models were unavailable.");
             return;
@@ -350,6 +352,11 @@ export function streamWithLimitsRetry(
       }> = [];
       const priorOnPayload = options?.onPayload;
       const priorOnResponse = options?.onResponse;
+      const priorOnProviderStreamEvent = options?.onProviderStreamEvent;
+      const onProviderStreamEvent: AttemptHooks["onProviderStreamEvent"] = async (data, eventModel) => {
+        recordWeeklyUsage(attempt.model, weeklyUsageFromStreamEvent(data));
+        await priorOnProviderStreamEvent?.(data, eventModel);
+      };
       const onPayload: ModelsSimpleStreamOptions["onPayload"] = async (payload, payloadModel) => {
         if (signal?.aborted) return undefined;
         const nextPayload = await priorOnPayload?.(payload, payloadModel);
@@ -397,6 +404,7 @@ export function streamWithLimitsRetry(
           // A later canonical success supersedes hidden retry failures; never
           // use stale status metadata to classify a stream/parsing error.
           observedHttpError = undefined;
+          recordWeeklyUsage(attempt.model, weeklyUsageFromHeaders(response.headers));
         }
         if (signal?.aborted) return;
         await priorOnResponse?.(response, responseModel);
@@ -431,7 +439,7 @@ export function streamWithLimitsRetry(
             pushAbort("Operation aborted before provider invocation.");
             return;
           }
-          const currentOptions = attemptOptions(model, attempt, options, signal, onPayload, onResponse);
+          const currentOptions = attemptOptions(model, attempt, options, signal, { onPayload, onResponse, onProviderStreamEvent });
           if (probe) markProbeAttempt(attempt.model);
           const inner = delegate.call(runtime, attempt.model, context, currentOptions);
           for await (const event of inner) {

@@ -48,6 +48,10 @@ export const EXTENSION_VERSION = "0.6.13";
 export const SETTINGS_FILE_NAME = "limits-wait.json";
 export const FALLBACK_MODELS_KEY = "fallback-models";
 export const PROBE_INTERVAL_KEY = "probe-interval-seconds";
+/** Per fallback-models entry: share of the weekly limit to keep unused, e.g. "40%". */
+export const MIN_WEEKLY_LIMIT_KEEP_KEY = "min-weekly-limit-keep";
+// Re-check a weekly-reserve block this often when the provider reports no reset time.
+export const WEEKLY_BUDGET_UNKNOWN_RESET_RECHECK_MS = 60 * 60 * 1_000; // 1 hour
 export const DISABLE_ALL_WAITING_ENV_VAR = "PI_LIMITS_WAIT_DISABLE_ALL_WAITING";
 export const FREEZING_ENV_VAR = "PI_LIMITS_WAIT_FREEZING_ENABLED";
 export const DEFAULT_WAITING_ENV_VAR = "PI_LIMITS_WAIT_DEFAULT_WAITING";
