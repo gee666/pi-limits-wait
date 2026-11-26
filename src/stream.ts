@@ -409,11 +409,9 @@ export function streamWithLimitsRetry(
         if (signal?.aborted) return;
         await priorOnResponse?.(response, responseModel);
         if (signal?.aborted) return;
-        // Throw only after the canonical callback, so after_provider_response
-        // still sees every HTTP failure. All statuses remain retry eligible:
-        // classified failures use their normal policy and 400/403 deliberately
-        // enter the configured unknown-error retry loop.
-        if (response.status >= 400) throw new Error(observedHttpError);
+        // Observe only: Pi retries temporary HTTP failures natively and parses
+        // error bodies for overflow, abort, and provider-specific diagnostics.
+        // Our retry policy applies only after the provider's terminal failure.
       };
 
       try {

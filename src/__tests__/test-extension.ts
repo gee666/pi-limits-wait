@@ -872,7 +872,7 @@ for (const status of [400, 403] as const) {
         try {
           await options?.onResponse?.({ status: attempts === 1 ? status : 200, headers: {} }, model);
           stream.push(startEvent(model));
-          stream.push(doneEvent(model));
+          stream.push(attempts === 1 ? errorEvent(model, `HTTP ${status} persistent`) : doneEvent(model));
         } catch (error) {
           stream.push(startEvent(model));
           stream.push(errorEvent(model, error instanceof Error ? error.message : String(error)));
@@ -1095,7 +1095,7 @@ section("real ModelRuntime retry integration");
         try {
           await options?.onResponse?.({ status: attempts === 1 ? 429 : 200, headers: attempts === 1 ? { "retry-after": "0.001" } : {} }, model);
           stream.push(startEvent(model));
-          stream.push(doneEvent(model));
+          stream.push(attempts === 1 ? errorEvent(model, "limited") : doneEvent(model));
         } catch (error) {
           stream.push(startEvent(model));
           stream.push(errorEvent(model, error instanceof Error ? error.message : String(error)));
@@ -1325,7 +1325,7 @@ section("installed OpenAI provider HTTP integration");
     const status = providerStatuses[requests - 1] ?? 200;
     if (status >= 400) {
       response.writeHead(status, { "content-type": "application/json", "retry-after": "0.001" });
-      response.end(JSON.stringify({ error: { message: status === 429 ? "limited" : "overloaded", type: status === 429 ? "rate_limit_error" : "server_error" } }));
+      response.end(JSON.stringify({ error: { message: status === 400 ? "context_length_exceeded" : status === 429 ? "limited" : "overloaded", type: status === 429 ? "rate_limit_error" : "server_error" } }));
       return;
     }
     response.writeHead(200, { "content-type": "text/event-stream" });
@@ -1354,6 +1354,7 @@ section("installed OpenAI provider HTTP integration");
     const release = installModelRuntimeInterception();
     const started = Date.now();
     const formalResponses: number[] = [];
+    let payloadCalls = 0;
     // Cold SDK imports and HTTP retries need room on busy Evergreen workers,
     // but must still finish before the unrelated fetch's 120-second delay.
     const coldProviderBudgetMs = 60_000;
@@ -1361,6 +1362,7 @@ section("installed OpenAI provider HTTP integration");
       maxRetries: 2,
       signal: AbortSignal.timeout(coldProviderBudgetMs),
       onPayload: async () => {
+        payloadCalls++;
         // This failed nested fetch shares the attempt's async chain but is not
         // a provider URL and must not overwrite provider response metadata.
         await fetch(`http://127.0.0.1:${address.port}/unrelated`);
@@ -1370,6 +1372,7 @@ section("installed OpenAI provider HTTP integration");
     }));
     ok("real installed provider preserves Retry-After from SDK-hidden failures", requests === 3 && events.at(-1)?.type === "done" && Date.now() - started < coldProviderBudgetMs, `requests=${requests}, elapsed=${Date.now() - started}, terminal=${JSON.stringify(events.at(-1))}`);
     ok("observer delivers mixed failed and successful formal responses exactly once", formalResponses.join(",") === "429,500,200", `responses=${formalResponses.join(",")}`);
+    ok("HTTP response observation preserves native retries within one provider invocation", payloadCalls === 1, `payloadCalls=${payloadCalls}`);
 
     requests = 0;
     providerStatuses = [429, 429, 200];
@@ -1380,6 +1383,20 @@ section("installed OpenAI provider HTTP integration");
       onResponse: (response) => { repeatedResponses.push(response.status); },
     }));
     ok("observer preserves repeated hidden statuses without deduplicating distinct responses", repeatedEvents.at(-1)?.type === "done" && repeatedResponses.join(",") === "429,429,200", `responses=${repeatedResponses.join(",")}`);
+
+    requests = 0;
+    providerStatuses = [400];
+    const overflowResponses: number[] = [];
+    const overflowEvents = await collect(runtime.streamSimple(model, context, {
+      maxRetries: 0,
+      signal: AbortSignal.timeout(5_000),
+      onResponse: (response) => { overflowResponses.push(response.status); },
+    }));
+    const overflowTerminal = overflowEvents.at(-1);
+    ok("HTTP error bodies retain Pi-owned overflow recovery without retrying",
+      requests === 1 && overflowResponses.join(",") === "400"
+      && overflowTerminal?.type === "error" && Boolean(overflowTerminal.error.errorMessage?.includes("context_length_exceeded")),
+      `requests=${requests}, terminal=${JSON.stringify(overflowTerminal)}`);
 
     requests = 0;
     providerStatuses = [429, 200];
@@ -1433,6 +1450,7 @@ section("real ModelRuntime fallback and option isolation");
       queueMicrotask(async () => {
         try {
           await options?.onResponse?.({ status: 429, headers: { "retry-after": "60" } }, model);
+          stream.push(errorEvent(model, "limited"));
         } catch (error) {
           stream.push(errorEvent(model, error instanceof Error ? error.message : String(error)));
         }
@@ -1936,7 +1954,10 @@ section("configured model priority and higher-priority probing");
         if (requested === third) return streamFrom([doneEvent(requested)]);
         const stream = createAssistantMessageEventStream();
         void (async () => {
-          try { await options?.onResponse?.({ status: 403, headers: {} }, requested); }
+          try {
+            await options?.onResponse?.({ status: 403, headers: {} }, requested);
+            stream.push(errorEvent(requested, "HTTP 403 persistent"));
+          }
           catch (error) { stream.push(errorEvent(requested, String(error))); }
           finally { stream.end(); }
         })();
@@ -2332,6 +2353,8 @@ section("abort and commitment semantics");
     if (providerCalls === 2) setTimeout(() => controller.abort(), 5);
     return streamFrom([startEvent(model), errorEvent(model, "HTTP 400 persistent")]);
   };
+  const previousFreezing = process.env.PI_LIMITS_WAIT_FREEZING_ENABLED;
+  process.env.PI_LIMITS_WAIT_FREEZING_ENABLED = "true";
   const runtime = await createRuntime({ frozenA: fail, frozenB: fail }, calls);
   const primary = runtime.getModel("frozenA", "frozenA-model")!;
   const fallback = runtime.getModel("frozenB", "frozenB-model")!;
@@ -2339,6 +2362,8 @@ section("abort and commitment semantics");
   const release = installModelRuntimeInterception();
   const events = await collect(runtime.streamSimple(primary, context, { signal: controller.signal }));
   ok("abort while all candidates are frozen emits aborted", providerCalls === 2 && endsAborted(events), `calls=${providerCalls}`);
+  if (previousFreezing === undefined) delete process.env.PI_LIMITS_WAIT_FREEZING_ENABLED;
+  else process.env.PI_LIMITS_WAIT_FREEZING_ENABLED = previousFreezing;
   release();
   __configureFallbackModelsForTests([]);
   __setNonRetryableTuningForTests(3, 2);

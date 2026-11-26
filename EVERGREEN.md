@@ -18,6 +18,7 @@ The master kill switch leaves only prompt cleaning enabled.
 `pi.appendEntry()` stores retry metadata; `pi.events` emits versioned wait telemetry.
 `ctx.ui` supports notifications, non-interactive status, and the TUI retry editor.
 Provider response/payload callbacks and Pi's `isContextOverflow()` preserve native integration semantics, including LiteLLM context-window errors in Pi 1.5.0.
+Response callbacks are observational: HTTP error bodies and native retry decisions remain provider-owned; only terminal failures enter this extension's retry policy.
 
 ## Internal Pi APIs
 `src/stream.ts` patches `ModelRuntime.prototype.streamSimple` with a process-global, reload-owned trampoline.
@@ -60,4 +61,7 @@ Pi 1.5.2 compatibility: Anthropic OAuth's Claude Code version header remains run
 Missing-cwd Continue/Fork/Cancel and failed-import cleanup remain host-owned: this extension does not switch/import sessions or persist cwd choices, and refreshes its context on `session_start` after replacement.
 Pi 1.6.0 compatibility: classify `Connection closed` and socket-only `EPIPE` as network failures, alongside ECONNRESET/ETIMEDOUT, so exhausted native retries still use the network wait policy even with unknown-error retries disabled.
 Codex connection renewal/maxTokens, model defaults/reasoning validation, and Anthropic thread routing remain provider-owned; this extension does not rewrite them. SDK reload's `session_start` refreshes the context/editor through the existing handler; single RPC lifecycle dispatch needs no workaround.
+Pi 1.6.1 compatibility: `after_provider_response` now covers HTTP failures and native retry attempts. Do not throw from response observation: that preempts native retries and discards error-body diagnostics (including context overflow). HTTP tests verify one provider invocation across native retries, exactly-once response callbacks, and overflow body preservation.
+The all-models-frozen abort test explicitly enables freezing rather than inheriting the user's environment switch.
+Broader native temporary-failure retries, Google prompt-block diagnostics, plugin_request_too_large compaction exclusion, and catalog/default changes remain Pi-owned; no model IDs or compaction policy are overridden here.
 Watch model selection/thinking levels, project trust, custom-entry persistence, and JSON/RPC UI protocols.
