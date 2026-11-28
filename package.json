@@ -48,8 +48,8 @@
     "@earendil-works/pi-coding-agent": ">=1.4.0"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "1.6.1",
-    "@earendil-works/pi-coding-agent": "1.6.1",
+    "@earendil-works/pi-ai": "1.7.0",
+    "@earendil-works/pi-coding-agent": "1.7.0",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2"
   }
